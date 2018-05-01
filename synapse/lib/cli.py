@@ -1,4 +1,6 @@
+import os
 import json
+import atexit
 import traceback
 import collections
 
@@ -289,9 +291,18 @@ class Cli(s_eventbus.EventBus):
             # want to ignore the exception.
             pass
 
+        if readline.get_current_history_length() == 0:  # pragma: no cover
+            fp = s_common.gendir(os.path.expanduser('~'), '.syn',)
+            history = os.path.join(fp, '.cmdr_history')
+            try:
+                readline.read_history_file(history)
+            except IOError:
+                pass
+            atexit.register(readline.write_history_file, history)
+
         while not self.isfini:
 
-            # FIXME history / completion
+            # FIXME completion
 
             try:
 
