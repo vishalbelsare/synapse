@@ -33,7 +33,7 @@ class Xact(s_eventbus.EventBus):
     A Layer transaction which encapsulates the storage implementation.
     '''
 
-    def __init__(self, layr, write=False):
+    def __init__(self, layr):
 
         s_eventbus.EventBus.__init__(self)
 
@@ -51,7 +51,9 @@ class Xact(s_eventbus.EventBus):
 
         self.splices = []
         self.layr = layr
-        self.write = write
+
+        self.write = False
+
         # our constructor gets a ref!
         self.refs = 1
 
@@ -64,6 +66,11 @@ class Xact(s_eventbus.EventBus):
 
             yield from func(oper)
 
+    def writeable(self):
+        pass
+
+    def ceedwrite(self):
+        pass
 
     @contextlib.contextmanager
     def incxref(self):

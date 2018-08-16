@@ -23,16 +23,90 @@ import synapse.lib.threads as s_threads
 
 logger = logging.getLogger(__name__)
 
+class Scan:
+
+    '''
+    An LMDB cursor wrapper which can have transactions close beneath.
+    '''
+
+    def __init__(self, xact):
+
+        self.xact = xact
+        self.cursfini = False
+
+        def ceed(mesg):
+            self.cursfini = True
+
+        self.xact.on('ceed:xact', ceed)
+
+    def _getXactCurs(self, db):
+        self.cursfini = False
+        return self.xact.xact.cursor(db=db)
+
+    def _iterCursFrom(self, byts, db):
+
+        lastkey = None
+        lastval = None
+
+        curs = self._getXactCursor(db)
+
+        if not curs.set_range(byts):
+            curs.close()
+            return
+
+        cursiter = curs.iternext()
+
+        while True:
+
+            try:
+
+                if self.cursfini:
+
+                    curs = self._getXactCursor()
+
+                    if not curs.set_range_dup(lastkey, lastval):
+                        return
+
+                    cursiter = curs.iternext()
+
+                    # skip the one we already yielded...
+                    next(cursiter)
+
+                lastkey, lastval = next(cursiter)
+
+                yield lastkey, lastval
+
+            except StopIteration as e:
+                return
+
+    def bypref(self, byts, db):
+
+        size = len(byts)
+        for key, val in self._iterCursFrom(byts, db):
+
+            if not key[:size] == byts:
+                return
+
+            yield key, val
+
+    def byrange(self, kmin, kmax, db):
+
+        for key, val in self._iterCursFrom(kmin, db):
+
+            if key[:size] > kmax:
+                return
+
+            yield key, val
+
 class LmdbXact(s_layer.Xact):
     '''
     A Layer transaction which encapsulates the storage implementation.
     '''
-    def __init__(self, layr, write=False):
+    def __init__(self, layr):
 
-        s_layer.Xact.__init__(self, layr, write)
+        s_layer.Xact.__init__(self, layr)
 
         self.layr = layr
-        self.write = write
 
         self.indxfunc = {
             'eq': self._rowsByEq,
@@ -52,6 +126,20 @@ class LmdbXact(s_layer.Xact):
         self.buidcurs = self.xact.cursor(db=layr.bybuid)
         self.buidcache = s_cache.FixedCache(self._getBuidProps, size=10000)
         self.tid = s_threads.iden()
+
+    def _ceedLmdbXact(self):
+        self.fire('xact:ceed')
+        self.xact.commit()
+        del self.xact
+
+    def ceedwrite(self):
+        self._ceedLmdbXact()
+        self.xact = self.layr.lenv.begin(write=False)
+
+    def writeable(self):
+        # checking for "already writeable" is in the snap
+        self._ceedLmdbXact()
+        self.xact = self.layr.lenv.begin(write=True)
 
     def setOffset(self, iden, offs):
         return self.layr.offs.xset(self.xact, iden, offs)
@@ -220,6 +308,7 @@ class LmdbXact(s_layer.Xact):
             yield s_msgpack.un(byts)
 
     def _rowsByPref(self, curs, pref, valu):
+
         pref = pref + valu
         if not curs.set_range(pref):
             return
@@ -405,4 +494,3 @@ class LmdbLayer(s_layer.Layer):
         Return a transaction object for the layer.
         '''
         return LmdbXact(self, write=write)
-

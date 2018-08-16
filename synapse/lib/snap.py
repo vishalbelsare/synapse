@@ -28,7 +28,7 @@ class Snap(s_eventbus.EventBus):
     ('print', {}),
     '''
 
-    def __init__(self, core, layers, write=False):
+    def __init__(self, core, layers):
 
         s_eventbus.EventBus.__init__(self)
 
@@ -61,6 +61,8 @@ class Snap(s_eventbus.EventBus):
 
         self.xact = None
         self.xacts = [l.xact() for l in layers]
+
+        self.xacts.
 
         self.tagcache = s_cache.FixedCache(self._addTagNode, size=10000)
         self.buidcache = s_cache.FixedCache(self._getNodeByBuid, size=100000)
@@ -123,12 +125,17 @@ class Snap(s_eventbus.EventBus):
         if self.write:
             return True
 
-        self.xacts[-1].decref()
-
-        self.xact = self.layers[-1].xact(write=True)
-
+        self.xacts[-1].writeable()
         self.write = True
-        self.xacts[-1] = self.xact
+
+    def ceedwrite(self, force=False):
+
+        if not force:
+            tick = s_common.now()
+            if tick - self.wtick < 10:
+                return
+
+        self.xacts[-1].ceedwrite()
 
     def setOffset(self, iden, offs):
         self.writeable()
