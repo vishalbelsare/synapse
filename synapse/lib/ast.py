@@ -215,6 +215,7 @@ class VarSetOper(Oper):
 
         for node, path in genr:
             valu = self.kids[1].compute(runt, node, path)
+            print(f'Valu: [{valu}]')
             path.set(name, valu)
             runt.vars[name] = valu
             yield node, path
@@ -930,6 +931,7 @@ class EditNodeAdd(Edit):
         kval = self.kids[1].runtval(runt)
 
         for valu in formtype.getTypeVals(kval):
+            print(f'addNode valu: {valu}]')
             node = runt.snap.addNode(name, valu)
             yield node, runt.initPath(node)
 
