@@ -14,6 +14,12 @@ import lmdb
 if tuple([int(x) for x in lmdb.__version__.split('.')]) < (0, 94): # pragma: no cover
     raise Exception('synapse is only supported on version 0.94 of the lmdb python module')
 
+import os
+if os.getenv('SYN_ASYNCIO_UVLOOP', None):
+    import asyncio
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+
 import multiprocessing
 
 import msgpack
