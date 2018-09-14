@@ -162,7 +162,7 @@ jobs:
 
     <<: *test_steps
 
-  python37:
+  python37-uv:
     parallelism: 7
     docker:
       - image: circleci/python:3.7
