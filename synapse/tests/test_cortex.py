@@ -1709,3 +1709,26 @@ class CortexTest(s_test.SynTest):
             nodes = list(core.eval('##baz.faz'))
             self.len(1, nodes)
             self.eq(nodes[0].ndef[1], 'visi')
+
+    def test_tag_globbing(self):
+        with self.getTestCore() as core:
+            with core.snap() as snap:
+                node = snap.addNode('teststr', 'n1')
+                node.addTag('foo.bar.baz', (None, None))
+
+                node = snap.addNode('teststr', 'n2')
+                node.addTag('foo.bad.baz', (None, None))
+
+                node = snap.addNode('teststr', 'n3')  # No tags on him
+
+            # Setup worked correct
+            self.len(3, core.eval('teststr'))
+            self.len(2, core.eval('teststr +#foo'))
+
+            # XXX This is not allowed because * is a tag terminator!?!?!?
+            # Now test globbing - exact match for *
+            self.len(2, core.eval('teststr +#*'))
+            self.len(1, core.eval('teststr -#*'))
+
+            # Now test globbing - re matches!
+            self.len(2, core.eval('teststr +#foo.*.baz'))

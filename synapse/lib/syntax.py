@@ -1510,6 +1510,7 @@ class Parser:
         #if self.nextchar() == '"':
 
         text = self.noms(until=tagterm)
+        print(text)
 
         return s_ast.Tag(text)
 
