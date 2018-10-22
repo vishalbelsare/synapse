@@ -9,26 +9,27 @@ import synapse.lib.cmdr as s_cmdr
 
 logger = logging.getLogger(__name__)
 
-async def main(argv):  # pragma: no cover
+def main(argv):  # pragma: no cover
 
     if len(argv) != 2:
         print('usage: python -m synapse.tools.cmdr <url>')
         return -1
 
-    async with await s_telepath.openurl(argv[1]) as item:
+    with s_telepath.openurl(argv[1]) as item:
 
-        cmdr = await s_cmdr.getItemCmdr(item)
+        cmdr = s_glob.sync(s_cmdr.getItemCmdr(item))
         # This causes a dropped connection to the cmdr'd item to
         # cause cmdr to exit. We can't safely test this in CI since
         # the fini handler sends a SIGINT to mainthread; which can
         # be problematic for test runners.
         cmdr.finikill = True
-        await cmdr.runCmdLoop()
+        s_glob.sync(cmdr.runCmdLoop())
         cmdr.finikill = False
+        return 0
 
-async def _main():  # pragma: no cover
+def _main():  # pragma: no cover
     s_common.setlogging(logger, 'DEBUG')
-    return await main(sys.argv)
+    return main(sys.argv)
 
 if __name__ == '__main__':  # pragma: no cover
-    sys.exit(s_glob.sync(_main()))
+    sys.exit(_main())
