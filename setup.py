@@ -23,6 +23,7 @@ setup(
         'tornado>=5.1,<6.0.0',
         'regex>=2017.9.23',
         'PyYAML>=3.13,<4.0',
+        'lark-parser>=0.6.5'
     ],
 
     extras_require={
