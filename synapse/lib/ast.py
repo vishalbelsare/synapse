@@ -20,8 +20,11 @@ class StormCtrlFlow(Exception):
     def __init__(self, item=None):
         self.item = item
 
-class StormBreak(StormCtrlFlow): pass
-class StormContinue(StormCtrlFlow): pass
+class StormBreak(StormCtrlFlow):
+    pass
+
+class StormContinue(StormCtrlFlow):
+    pass
 
 class AstNode:
     '''
@@ -31,6 +34,12 @@ class AstNode:
     def __init__(self, kids=()):
         self.kids = []
         [self.addKid(k) for k in kids]
+
+    def repr(self):
+        return f'{self.__class__.__name__}: {self.kids}'
+
+    def __repr__(self):
+        return self.repr()
 
     def addKid(self, astn):
 
@@ -85,9 +94,6 @@ class AstNode:
         for kid in self.kids:
             for item in kid.format(depth=depth + 1):
                 yield item
-
-    def repr(self):
-        return self.__class__.__name__
 
     def init(self, core):
         self.core = core
@@ -1401,6 +1407,12 @@ class Value(RunValue):
         RunValue.__init__(self, kids=kids)
         self.valu = valu
 
+    def __repr__(self):
+        return f'{self.__class__.__name__}: {self.valu}'
+
+    def repr(self):
+        return f'{self.__class__.__name__}: {self.valu}'
+
     def runtval(self, runt):
         return self.value()
 
@@ -1546,19 +1558,12 @@ class TagMatch(Value):
     pass
 
 class Cmpr(Value):
-
-    def repr(self):
-        return 'Cmpr: %r' % (self.text,)
+    pass
 
 class Const(Value):
-
-    def repr(self):
-        return 'Const: %s' % (self.valu,)
+    pass
 
 class List(Value):
-
-    def repr(self):
-        return 'List: %s' % (self.valu,)
 
     def runtval(self, runt):
         return [k.runtval(runt) for k in self.kids]
@@ -1570,19 +1575,13 @@ class List(Value):
         return [k.value() for k in self.kids]
 
 class RelProp(Value):
-
-    def repr(self):
-        return 'RelProp: %r' % (self.valu,)
+    pass
 
 class UnivProp(Value):
-
-    def repr(self):
-        return 'UnivProp: %r' % (self.valu,)
+    pass
 
 class AbsProp(Value):
-
-    def repr(self):
-        return f'AbsProp: {self.valu}'
+    pass
 
 class Edit(Oper):
     pass

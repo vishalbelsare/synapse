@@ -21,7 +21,7 @@ import synapse.lib.snap as s_snap
 import synapse.lib.cache as s_cache
 import synapse.lib.storm as s_storm
 import synapse.lib.layer as s_layer
-import synapse.lib.syntax as s_syntax
+import synapse.lib.syntax2 as s_syntax2
 import synapse.lib.agenda as s_agenda
 import synapse.lib.trigger as s_trigger
 import synapse.lib.modules as s_modules
@@ -1167,7 +1167,7 @@ class Cortex(s_cell.Cell):
             'stormcmds': {cmd: {} for cmd in self.stormcmds.keys()},
             'modelinfo': self.model.getModelInfo(),
         }
-        query = s_syntax.Parser(parseinfo, text).query()
+        query = s_syntax2.Parser(parseinfo, text).query()
         query.init(self)
         return query
 
