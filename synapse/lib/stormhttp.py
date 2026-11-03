@@ -1,6 +1,6 @@
-import json
 import asyncio
 import logging
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -11,7 +11,10 @@ import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.lib.base as s_base
+import synapse.lib.json as s_json
+import synapse.lib.const as s_const
 import synapse.lib.msgpack as s_msgpack
+import synapse.lib.version as s_version
 import synapse.lib.stormtypes as s_stormtypes
 
 @s_stormtypes.registry.registerType
@@ -19,7 +22,7 @@ class WebSocket(s_base.Base, s_stormtypes.StormType):
     '''
     Implements the Storm API for a Websocket.
     '''
-    _storm_typename = 'storm:http:socket'
+    _storm_typename = 'inet:http:socket'
 
     _storm_locals = (
 
@@ -54,7 +57,7 @@ class WebSocket(s_base.Base, s_stormtypes.StormType):
         try:
 
             mesg = await s_stormtypes.toprim(mesg)
-            await self.resp.send_bytes(json.dumps(mesg).encode())
+            await self.resp.send_bytes(s_json.dumps(mesg))
             return (True, None)
 
         except asyncio.CancelledError:  # pragma: no cover
@@ -66,11 +69,9 @@ class WebSocket(s_base.Base, s_stormtypes.StormType):
     async def rx(self, timeout=None):
 
         try:
-            _type, data, extra = await asyncio.wait_for(self.resp.receive(), timeout=timeout)
-            if _type == aiohttp.WSMsgType.BINARY:
-                return (True, json.loads(data))
-            if _type == aiohttp.WSMsgType.TEXT:
-                return (True, json.loads(data.encode()))
+            _type, data, extra = await s_common.wait_for(self.resp.receive(), timeout=timeout)
+            if _type in (aiohttp.WSMsgType.BINARY, aiohttp.WSMsgType.TEXT):
+                return (True, s_json.loads(data))
             if _type == aiohttp.WSMsgType.CLOSED:  # pragma: no cover
                 return (True, None)
             return (False, ('BadMesgFormat', {'mesg': f'WebSocket RX unhandled type: {_type.name}'}))  # pragma: no cover
@@ -86,6 +87,22 @@ class WebSocket(s_base.Base, s_stormtypes.StormType):
 class LibHttp(s_stormtypes.Lib):
     '''
     A Storm Library exposing an HTTP client API.
+
+    For APIs that accept an ssl_opts argument, the dictionary may contain the following values::
+
+        ({
+            'verify': <boolean> - Perform SSL/TLS verification. Is overridden by the ssl_verify argument.
+            'client_cert': <str> - PEM encoded full chain certificate for use in mTLS.
+            'client_key': <str> - PEM encoded key for use in mTLS. Alternatively, can be included in client_cert.
+            'ca_cert': <str> - A PEM encoded full chain CA certificate for use when verifying the request.
+        })
+
+    For APIs that accept a proxy argument, the following values are supported::
+
+        (null): Deprecated - Use the proxy defined by the http:proxy configuration option if set.
+        (true): Use the proxy defined by the http:proxy configuration option if set.
+        (false): Do not use the proxy defined by the http:proxy configuration option if set.
+        <str>: A proxy URL string.
     '''
     _storm_locals = (
         {'name': 'get', 'desc': 'Get the contents of a given URL.',
@@ -93,107 +110,181 @@ class LibHttp(s_stormtypes.Lib):
                   'args': (
                       {'name': 'url', 'type': 'str', 'desc': 'The URL to retrieve.', },
                       {'name': 'headers', 'type': 'dict', 'desc': 'HTTP headers to send with the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'ssl_verify', 'type': 'boolean', 'desc': 'Perform SSL/TLS verification.',
-                       'default': True, },
+                       'default': True},
                       {'name': 'params', 'type': 'dict', 'desc': 'Optional parameters which may be passed to the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'timeout', 'type': 'int', 'desc': 'Total timeout for the request in seconds.',
-                       'default': 300, },
-                      {'name': 'allow_redirects', 'type': 'bool', 'desc': 'If set to false, do not follow redirects.',
-                       'default': True, },
+                       'default': 300},
+                      {'name': 'allow_redirects', 'type': 'boolean', 'desc': 'If set to false, do not follow redirects.',
+                       'default': True},
+                      {'name': 'proxy', 'type': ['boolean', 'str'],
+                       'desc': 'Configure proxy usage. See $lib.inet.http help for additional details.', 'default': True},
+                      {'name': 'ssl_opts', 'type': 'dict',
+                       'desc': 'Optional SSL/TLS options. See $lib.inet.http help for additional details.',
+                       'default': None},
                   ),
-                  'returns': {'type': 'storm:http:resp', 'desc': 'The response object.', }}},
+                  'returns': {'type': 'inet:http:resp', 'desc': 'The response object.'}}},
         {'name': 'post', 'desc': 'Post data to a given URL.',
          'type': {'type': 'function', '_funcname': '_httpPost',
                   'args': (
                       {'name': 'url', 'type': 'str', 'desc': 'The URL to post to.', },
                       {'name': 'headers', 'type': 'dict', 'desc': 'HTTP headers to send with the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'json', 'type': 'prim', 'desc': 'The data to post, as JSON object.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'body', 'type': 'bytes', 'desc': 'The data to post, as binary object.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'ssl_verify', 'type': 'boolean', 'desc': 'Perform SSL/TLS verification.',
-                       'default': True, },
+                       'default': True},
                       {'name': 'params', 'type': 'dict', 'desc': 'Optional parameters which may be passed to the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'timeout', 'type': 'int', 'desc': 'Total timeout for the request in seconds.',
-                       'default': 300, },
-                      {'name': 'allow_redirects', 'type': 'bool', 'desc': 'If set to false, do not follow redirects.',
-                       'default': True, },
+                       'default': 300},
+                      {'name': 'allow_redirects', 'type': 'boolean', 'desc': 'If set to false, do not follow redirects.',
+                       'default': True},
                       {'name': 'fields', 'type': 'list',
                        'desc': 'A list of info dictionaries containing the name, value or sha256, '
                                'and additional parameters for fields to post, as multipart/form-data. '
                                'If a sha256 is specified, the request will be sent from the axon '
                                'and the corresponding file will be uploaded as the value for '
                                'the field.',
-                       'default': None, },
+                       'default': None},
+                      {'name': 'proxy', 'type': ['boolean', 'str'],
+                       'desc': 'Configure proxy usage. See $lib.inet.http help for additional details.', 'default': True},
+                      {'name': 'ssl_opts', 'type': 'dict',
+                       'desc': 'Optional SSL/TLS options. See $lib.inet.http help for additional details.',
+                       'default': None},
                   ),
-                  'returns': {'type': 'storm:http:resp', 'desc': 'The response object.', }}},
+                  'returns': {'type': 'inet:http:resp', 'desc': 'The response object.'}}},
         {'name': 'head', 'desc': 'Get the HEAD response for a URL.',
          'type': {'type': 'function', '_funcname': '_httpEasyHead',
                   'args': (
-                      {'name': 'url', 'type': 'str', 'desc': 'The URL to retrieve.', },
+                      {'name': 'url', 'type': 'str', 'desc': 'The URL to retrieve.'},
                       {'name': 'headers', 'type': 'dict', 'desc': 'HTTP headers to send with the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'ssl_verify', 'type': 'boolean', 'desc': 'Perform SSL/TLS verification.',
-                       'default': True, },
+                       'default': True},
                       {'name': 'params', 'type': 'dict',
                        'desc': 'Optional parameters which may be passed to the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'timeout', 'type': 'int', 'desc': 'Total timeout for the request in seconds.',
                        'default': 300, },
-                      {'name': 'allow_redirects', 'type': 'bool', 'desc': 'If set to true, follow redirects.',
-                       'default': False, },
+                      {'name': 'allow_redirects', 'type': 'boolean', 'desc': 'If set to true, follow redirects.',
+                       'default': False},
+                      {'name': 'proxy', 'type': ['boolean', 'str'],
+                       'desc': 'Configure proxy usage. See $lib.inet.http help for additional details.', 'default': True},
+                      {'name': 'ssl_opts', 'type': 'dict',
+                       'desc': 'Optional SSL/TLS options. See $lib.inet.http help for additional details.',
+                       'default': None},
                   ),
-                  'returns': {'type': 'storm:http:resp', 'desc': 'The response object.', }}},
+                  'returns': {'type': 'inet:http:resp', 'desc': 'The response object.'}}},
         {'name': 'request', 'desc': 'Make an HTTP request using the given HTTP method to the url.',
          'type': {'type': 'function', '_funcname': '_httpRequest',
                    'args': (
-                      {'name': 'meth', 'type': 'str', 'desc': 'The HTTP method. (ex. PUT)', },
-                      {'name': 'url', 'type': 'str', 'desc': 'The URL to send the request to.', },
+                      {'name': 'meth', 'type': 'str', 'desc': 'The HTTP method. (ex. PUT)'},
+                      {'name': 'url', 'type': 'str', 'desc': 'The URL to send the request to.'},
                       {'name': 'headers', 'type': 'dict', 'desc': 'HTTP headers to send with the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'json', 'type': 'prim', 'desc': 'The data to include in the body, as JSON object.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'body', 'type': 'bytes', 'desc': 'The data to include in the body, as binary object.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'ssl_verify', 'type': 'boolean', 'desc': 'Perform SSL/TLS verification.',
-                       'default': True, },
+                       'default': True},
                       {'name': 'params', 'type': 'dict', 'desc': 'Optional parameters which may be passed to the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'timeout', 'type': 'int', 'desc': 'Total timeout for the request in seconds.',
-                       'default': 300, },
-                      {'name': 'allow_redirects', 'type': 'bool', 'desc': 'If set to false, do not follow redirects.',
-                       'default': True, },
+                       'default': 300},
+                      {'name': 'allow_redirects', 'type': 'boolean', 'desc': 'If set to false, do not follow redirects.',
+                       'default': True},
                       {'name': 'fields', 'type': 'list',
                        'desc': 'A list of info dictionaries containing the name, value or sha256, '
                                'and additional parameters for fields to post, as multipart/form-data. '
                                'If a sha256 is specified, the request will be sent from the axon '
                                'and the corresponding file will be uploaded as the value for '
                                'the field.',
-                       'default': None, },
+                       'default': None},
+                      {'name': 'proxy', 'type': ['boolean', 'str'],
+                       'desc': 'Configure proxy usage. See $lib.inet.http help for additional details.', 'default': True},
+                      {'name': 'ssl_opts', 'type': 'dict',
+                       'desc': 'Optional SSL/TLS options. See $lib.inet.http help for additional details.',
+                       'default': None},
                    ),
-                  'returns': {'type': 'storm:http:resp', 'desc': 'The response object.', }
+                  'returns': {'type': 'inet:http:resp', 'desc': 'The response object.'}
                   }
          },
         {'name': 'connect', 'desc': 'Connect a web socket to tx/rx JSON messages.',
          'type': {'type': 'function', '_funcname': 'inetHttpConnect',
                   'args': (
-                      {'name': 'url', 'type': 'str', 'desc': 'The URL to retrieve.', },
+                      {'name': 'url', 'type': 'str', 'desc': 'The URL to retrieve.'},
                       {'name': 'headers', 'type': 'dict', 'desc': 'HTTP headers to send with the request.',
-                       'default': None, },
+                       'default': None},
                       {'name': 'ssl_verify', 'type': 'boolean', 'desc': 'Perform SSL/TLS verification.',
-                       'default': True, },
+                       'default': True},
                       {'name': 'timeout', 'type': 'int', 'desc': 'Total timeout for the request in seconds.',
-                       'default': 300, },
+                       'default': 300},
                       {'name': 'params', 'type': 'dict', 'desc': 'Optional parameters which may be passed to the connection request.',
-                       'default': None, },
+                       'default': None},
+                      {'name': 'proxy', 'type': ['boolean', 'str'],
+                       'desc': 'Configure proxy usage. See $lib.inet.http help for additional details.', 'default': True},
+                      {'name': 'ssl_opts', 'type': 'dict',
+                       'desc': 'Optional SSL/TLS options. See $lib.inet.http help for additional details.',
+                       'default': None},
                   ),
-                  'returns': {'type': 'storm:http:socket', 'desc': 'A websocket object.'}}},
+                  'returns': {'type': 'inet:http:socket', 'desc': 'A websocket object.'}}},
+        {'name': 'urlencode', 'desc': '''
+            Urlencode a text string.
+
+            This will replace special characters in a string using the %xx escape and
+            replace spaces with plus signs.
+
+            Examples:
+                Urlencode a string::
+
+                    $str=$lib.inet.http.urlencode("http://google.com")
+         ''',
+         'type': {'type': 'function', '_funcname': 'urlencode',
+                  'args': (
+                      {'name': 'text', 'type': 'str', 'desc': 'The text string.', },
+                  ),
+                  'returns': {'type': 'str', 'desc': 'The urlencoded string.', }}},
+        {'name': 'urldecode', 'desc': '''
+            Urldecode a text string.
+
+            This will replace %xx escape characters with the special characters they represent
+            and replace plus signs with spaces.
+
+            Examples:
+                Urlencode a string::
+
+                    $str=$lib.inet.http.urldecode("http%3A%2F%2Fgo+ogle.com")
+         ''',
+         'type': {'type': 'function', '_funcname': 'urldecode',
+                  'args': (
+                      {'name': 'text', 'type': 'str', 'desc': 'The text string.', },
+                  ),
+                  'returns': {'type': 'str', 'desc': 'The urldecoded string.', }}},
+        {'name': 'codereason', 'desc': '''
+            Get the reason phrase for an HTTP status code.
+
+            Examples:
+                Get the reason for a 404 status code::
+
+                    $str=$lib.inet.http.codereason(404)
+         ''',
+         'type': {'type': 'function', '_funcname': 'codereason',
+                  'args': (
+                      {'name': 'code', 'type': 'int', 'desc': 'The HTTP status code.', },
+                  ),
+                  'returns': {'type': 'str', 'desc': 'The reason phrase for the status code.', }}},
     )
     _storm_lib_path = ('inet', 'http')
+    _storm_lib_perms = (
+        {'perm': ('storm', 'lib', 'inet', 'http', 'proxy'), 'gate': 'cortex',
+         'desc': 'Permits a user to specify the proxy used with `$lib.inet.http` APIs.'},
+    )
 
     def getObjLocals(self):
         return {
@@ -202,53 +293,73 @@ class LibHttp(s_stormtypes.Lib):
             'head': self._httpEasyHead,
             'request': self._httpRequest,
             'connect': self.inetHttpConnect,
+            'urlencode': self.urlencode,
+            'urldecode': self.urldecode,
+            'codereason': self.codereason,
         }
 
-    def strify(self, item):
-        if isinstance(item, (list, tuple)):
-            return [(str(k), str(v)) for (k, v) in item]
-        elif isinstance(item, dict):
-            return {str(k): str(v) for k, v in item.items()}
-        return item
+    @s_stormtypes.stormfunc(readonly=True)
+    async def urlencode(self, text):
+        text = await s_stormtypes.tostr(text)
+        return urllib.parse.quote_plus(text)
+
+    @s_stormtypes.stormfunc(readonly=True)
+    async def urldecode(self, text):
+        text = await s_stormtypes.tostr(text)
+        return urllib.parse.unquote_plus(text)
+
+    @s_stormtypes.stormfunc(readonly=True)
+    async def codereason(self, code):
+        code = await s_stormtypes.toint(code)
+        return s_common.httpcodereason(code)
 
     async def _httpEasyHead(self, url, headers=None, ssl_verify=True, params=None, timeout=300,
-                            allow_redirects=False):
+                            allow_redirects=False, proxy=True, ssl_opts=None):
         return await self._httpRequest('HEAD', url, headers=headers, ssl_verify=ssl_verify, params=params,
-                                       timeout=timeout, allow_redirects=allow_redirects, )
+                                       timeout=timeout, allow_redirects=allow_redirects, proxy=proxy, ssl_opts=ssl_opts)
 
     async def _httpEasyGet(self, url, headers=None, ssl_verify=True, params=None, timeout=300,
-                           allow_redirects=True):
+                           allow_redirects=True, proxy=True, ssl_opts=None):
         return await self._httpRequest('GET', url, headers=headers, ssl_verify=ssl_verify, params=params,
-                                       timeout=timeout, allow_redirects=allow_redirects, )
+                                       timeout=timeout, allow_redirects=allow_redirects, proxy=proxy, ssl_opts=ssl_opts)
 
     async def _httpPost(self, url, headers=None, json=None, body=None, ssl_verify=True,
-                        params=None, timeout=300, allow_redirects=True, fields=None):
+                        params=None, timeout=300, allow_redirects=True, fields=None, proxy=True, ssl_opts=None):
         return await self._httpRequest('POST', url, headers=headers, json=json, body=body,
                                        ssl_verify=ssl_verify, params=params, timeout=timeout,
-                                       allow_redirects=allow_redirects, fields=fields, )
+                                       allow_redirects=allow_redirects, fields=fields, proxy=proxy, ssl_opts=ssl_opts)
 
-    async def inetHttpConnect(self, url, headers=None, ssl_verify=True, timeout=300, params=None):
+    async def inetHttpConnect(self, url, headers=None, ssl_verify=True, timeout=300,
+                              params=None, proxy=True, ssl_opts=None):
 
         url = await s_stormtypes.tostr(url)
         headers = await s_stormtypes.toprim(headers)
         timeout = await s_stormtypes.toint(timeout, noneok=True)
         params = await s_stormtypes.toprim(params)
+        proxy = await s_stormtypes.toprim(proxy)
+        ssl_verify = await s_stormtypes.tobool(ssl_verify, noneok=True)
+        ssl_opts = await s_stormtypes.toprim(ssl_opts)
 
-        headers = self.strify(headers)
+        headers = s_stormtypes.strifyHttpArg(headers)
 
         sock = await WebSocket.anit()
 
-        proxyurl = await self.runt.snap.core.getConfOpt('http:proxy')
         connector = None
-        if proxyurl is not None:
+        if proxyurl := await s_stormtypes.resolveCoreProxyUrl(proxy):
             connector = aiohttp_socks.ProxyConnector.from_url(proxyurl)
 
-        timeout = aiohttp.ClientTimeout(total=timeout)
+        client_timeout = aiohttp.ClientTimeout(total=timeout)
+        kwargs = {}
+        if timeout:
+            kwargs = {'timeout': aiohttp.ClientWSTimeout(ws_receive=None, ws_close=timeout)}
+        if params:
+            kwargs['params'] = params
+
+        kwargs['ssl'] = self.runt.snap.core.getCachedSslCtx(opts=ssl_opts, verify=ssl_verify)
 
         try:
-            sess = await sock.enter_context(aiohttp.ClientSession(connector=connector, timeout=timeout))
-            sock.resp = await sock.enter_context(sess.ws_connect(url, headers=headers, ssl=ssl_verify, timeout=timeout,
-                                                                 params=params, ))
+            sess = await sock.enter_context(aiohttp.ClientSession(connector=connector, timeout=client_timeout))
+            sock.resp = await sock.enter_context(sess.ws_connect(url, headers=headers, **kwargs))
 
             sock._syn_refs = 0
             self.runt.onfini(sock)
@@ -265,7 +376,11 @@ class LibHttp(s_stormtypes.Lib):
     def _buildFormData(self, fields):
         data = aiohttp.FormData()
         for field in fields:
-            data.add_field(field.get('name'),
+            name = field.get('name')
+            if not isinstance(name, str):
+                mesg = f'Each field requires a "name" key with a string value: {name}'
+                raise s_exc.BadArg(mesg=mesg, name=name)
+            data.add_field(name,
                            field.get('value'),
                            content_type=field.get('content_type'),
                            filename=field.get('filename'),
@@ -274,7 +389,7 @@ class LibHttp(s_stormtypes.Lib):
 
     async def _httpRequest(self, meth, url, headers=None, json=None, body=None,
                            ssl_verify=True, params=None, timeout=300, allow_redirects=True,
-                           fields=None, ):
+                           fields=None, proxy=True, ssl_opts=None):
         meth = await s_stormtypes.tostr(meth)
         url = await s_stormtypes.tostr(url)
         json = await s_stormtypes.toprim(json)
@@ -285,50 +400,90 @@ class LibHttp(s_stormtypes.Lib):
         timeout = await s_stormtypes.toint(timeout, noneok=True)
         ssl_verify = await s_stormtypes.tobool(ssl_verify, noneok=True)
         allow_redirects = await s_stormtypes.tobool(allow_redirects)
+        proxy = await s_stormtypes.toprim(proxy)
+        ssl_opts = await s_stormtypes.toprim(ssl_opts)
 
-        kwargs = {'allow_redirects': allow_redirects}
+        kwargs = {
+            'max_line_size': s_const.MAX_LINE_SIZE,
+            'max_field_size': s_const.MAX_FIELD_SIZE,
+            'allow_redirects': allow_redirects,
+        }
+
         if params:
-            kwargs['params'] = self.strify(params)
+            kwargs['params'] = s_stormtypes.strifyHttpArg(params, multi=True)
 
-        headers = self.strify(headers)
+        headers = s_stormtypes.strifyHttpArg(headers)
 
         if fields:
             if any(['sha256' in field for field in fields]):
                 self.runt.confirm(('storm', 'lib', 'axon', 'wput'))
-                axon = self.runt.snap.core.axon
-                info = await axon.postfiles(fields, url, headers=headers, params=params,
-                                            method=meth, ssl=ssl_verify, timeout=timeout)
-                return HttpResp(info)
-            else:
-                data = self._buildFormData(fields)
-        else:
-            data = body
 
-        proxyurl = self.runt.snap.core.conf.get('http:proxy')
-        cadir = self.runt.snap.core.conf.get('tls:ca:dir')
+                kwargs = {}
+
+                ok, proxy = await s_stormtypes.resolveAxonProxyArg(proxy)
+                if ok:
+                    kwargs['proxy'] = proxy
+
+                if ssl_opts is not None:
+                    axonvers = await s_stormtypes.getAxonSynapseVersion(self.runt)
+                    mesg = f'The ssl_opts argument requires an Axon Synapse version {s_stormtypes.AXON_MINVERS_SSLOPTS}, ' \
+                           f'but the Axon is running {axonvers}'
+                    s_version.reqVersion(axonvers, s_stormtypes.AXON_MINVERS_SSLOPTS, mesg=mesg)
+                    kwargs['ssl_opts'] = ssl_opts
+
+                axon = self.runt.snap.core.axon
+                info = await axon.postfiles(fields, url, headers=headers, params=params, method=meth,
+                                            ssl=ssl_verify, timeout=timeout, **kwargs)
+                return HttpResp(info)
+
+        kwargs['ssl'] = self.runt.snap.core.getCachedSslCtx(opts=ssl_opts, verify=ssl_verify)
 
         connector = None
-        if proxyurl is not None:
+        if proxyurl := await s_stormtypes.resolveCoreProxyUrl(proxy):
             connector = aiohttp_socks.ProxyConnector.from_url(proxyurl)
-
-        if ssl_verify is False:
-            kwargs['ssl'] = False
-        elif cadir:
-            kwargs['ssl'] = s_common.getSslCtx(cadir)
-        else:
-            # default aiohttp behavior
-            kwargs['ssl'] = None
 
         timeout = aiohttp.ClientTimeout(total=timeout)
 
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as sess:
             try:
-                async with sess.request(meth, url, headers=headers, json=json, data=data, **kwargs) as resp:
+                if fields:
+                    data = self._buildFormData(fields)
+                else:
+                    data = body
+
+                # `data` and `json` are passed in kwargs only if they are not
+                # None because of a weird interaction with aiohttp and vcrpy.
+                if data is not None:
+                    kwargs['data'] = data
+
+                if json is not None:
+                    kwargs['json'] = json
+
+                async with sess.request(meth, url, headers=headers, **kwargs) as resp:
+                    history = []
+                    for hist in resp.history:
+                        hnfo = {
+                            'code': hist.status,
+                            'reason': await self.codereason(hist.status),
+                            'headers': {str(k): v for k, v in hist.headers.items()},
+                            'url': str(hist.url),
+                            # aiohttp has already closed the connection by this point
+                            # so there is no connection to read a body from.
+                            'body': b'',
+                            'history': [],
+                            '_raw_headers': [[str(k), v] for k, v in hist.headers.items()],
+                            'request_headers': {str(k): v for k, v in hist.request_info.headers.items()}
+                        }
+                        history.append(hnfo)
                     info = {
                         'code': resp.status,
-                        'headers': dict(resp.headers),
+                        'reason': await self.codereason(resp.status),
+                        'headers': {str(k): v for k, v in resp.headers.items()},
                         'url': str(resp.url),
                         'body': await resp.read(),
+                        'history': history,
+                        '_raw_headers': [[str(k), v] for k, v in resp.headers.items()],
+                        'request_headers': {str(k): v for k, v in resp.request_info.headers.items()},
                     }
                     return HttpResp(info)
 
@@ -337,12 +492,21 @@ class LibHttp(s_stormtypes.Lib):
             except Exception as e:
                 logger.exception(f'Error during http {meth} @ {url}')
                 err = s_common.err(e)
+                errmsg = err[1].get('mesg')
+                if errmsg:
+                    reason = f'Exception occurred during request: {err[0]}: {errmsg}'
+                else:
+                    reason = f'Exception occurred during request: {err[0]}'
+
                 info = {
+                    'err': err,
                     'code': -1,
-                    'headers': dict(),
+                    'reason': reason,
+                    'headers': {},
                     'url': url,
                     'body': b'',
-                    'err': err,
+                    'history': [],
+                    'request_headers': {},
                 }
                 return HttpResp(info)
 
@@ -354,13 +518,27 @@ class HttpResp(s_stormtypes.Prim):
     _storm_locals = (
         {'name': 'code', 'desc': 'The HTTP status code. It is -1 if an exception occurred.',
             'type': 'int', },
+        {'name': 'reason', 'desc': 'The reason phrase for the HTTP status code.', 'type': 'str'},
         {'name': 'body', 'desc': 'The raw HTTP response body as bytes.', 'type': 'bytes', },
         {'name': 'headers', 'type': 'dict', 'desc': 'The HTTP Response headers.'},
-        {'name': 'err', 'type': 'list', 'desc': 'Tufo of the error type and information if an exception occurred.'},
+        {'name': 'request_headers', 'type': 'dict', 'desc': 'The HTTP Request headers.'},
+        {'name': 'url', 'type': 'str',
+         'desc': 'The response URL. If the request was redirected, this would be the final URL in the redirection chain. If the status code is -1, then this is the request URL.'},
+        {'name': 'err', 'type': 'list', 'desc': 'Tuple of the error type and information if an exception occurred.'},
+        {'name': 'history', 'desc': 'A list of response objects representing the history of the response. This is populated when responses are redirected.',
+         'type': {'type': 'gtor', '_gtorfunc': '_gtorHistory',
+                  'returns': {'type': 'list', 'desc': 'A list of ``inet:http:resp`` objects.', }}},
+        {'name': 'getRawHeaders', 'desc': 'Get a dictionary mapping header names to lists of all their values.',
+         'type': {'type': 'function', '_funcname': 'getRawHeaders',
+                  'returns': {'type': 'dict', 'desc': 'A dictionary mapping each header name to a list of values.'}}},
         {'name': 'json', 'desc': 'Get the JSON deserialized response.',
-            'type': {'type': 'function', '_funcname': '_httpRespJson',
-                     'returns': {'type': 'prim'}
-                     }
+         'type': {'type': 'function', '_funcname': '_httpRespJson',
+                  'args': (
+                      {'name': 'encoding', 'type': 'str', 'desc': 'Specify an encoding to use.', 'default': None, },
+                      {'name': 'errors', 'type': 'str', 'desc': 'Specify an error handling scheme to use.', 'default': 'surrogatepass', },
+                   ),
+                   'returns': {'type': 'prim'}
+                 }
         },
         {'name': 'msgpack', 'desc': 'Yield the msgpack deserialized objects.',
             'type': {'type': 'function', '_funcname': '_httpRespMsgpack',
@@ -368,30 +546,62 @@ class HttpResp(s_stormtypes.Prim):
                      }
         },
     )
-    _storm_typename = 'storm:http:resp'
+    _storm_typename = 'inet:http:resp'
     def __init__(self, valu, path=None):
         super().__init__(valu, path=path)
         self.locls.update(self.getObjLocals())
+        self.locls['url'] = self.valu.get('url')
         self.locls['code'] = self.valu.get('code')
+        self.locls['reason'] = self.valu.get('reason')
         self.locls['body'] = self.valu.get('body')
         self.locls['headers'] = self.valu.get('headers')
+        self.locls['request_headers'] = self.valu.get('request_headers')
         self.locls['err'] = self.valu.get('err', ())
+
+        self.gtors.update({
+            'history': self._gtorHistory,
+        })
 
     def getObjLocals(self):
         return {
+            'getRawHeaders': self.getRawHeaders,
             'json': self._httpRespJson,
             'msgpack': self._httpRespMsgpack,
         }
 
-    async def _httpRespJson(self):
+    async def getRawHeaders(self):
+        retn = {}
+        for k, v in self.valu.get('_raw_headers', []):
+            retn.setdefault(k, []).append(v)
+        return retn
+
+    async def _httpRespJson(self, encoding=None, errors='surrogatepass'):
         try:
-            return json.loads(self.valu.get('body'))
-        except json.JSONDecodeError as e:
-            mesg = f'Unable to decode HTTP response as json: {e.args[0]}'
-            raise s_exc.BadJsonText(mesg=mesg)
+            valu = self.valu.get('body')
+            errors = await s_stormtypes.tostr(errors)
+
+            if encoding is None:
+                encoding = s_json.detect_encoding(valu)
+            else:
+                encoding = await s_stormtypes.tostr(encoding)
+
+            return s_json.loads(valu.decode(encoding, errors))
+
+        except UnicodeDecodeError as e:
+            raise s_exc.StormRuntimeError(mesg=f'{e}: {s_common.trimText(repr(valu))}') from None
+
+        except s_exc.BadJsonText as e:
+            mesg = f'Unable to decode HTTP response as json: {e.get("mesg")}'
+            info = {'mesg': mesg}
+            if (text := e.get('text')) is not None:
+                info['text'] = text
+            raise s_exc.BadJsonText(**info)
 
     async def _httpRespMsgpack(self):
         byts = self.valu.get('body')
         unpk = s_msgpack.Unpk()
         for _, item in unpk.feed(byts):
             yield item
+
+    async def _gtorHistory(self):
+        return [HttpResp(hnfo) for hnfo in self.valu.get('history')]

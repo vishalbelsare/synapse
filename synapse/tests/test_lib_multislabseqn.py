@@ -5,6 +5,7 @@ import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.lib.coro as s_coro
+import synapse.lib.json as s_json
 import synapse.lib.lmdbslab as s_lmdbslab
 import synapse.lib.multislabseqn as s_multislabseqn
 
@@ -13,7 +14,7 @@ from synapse.tests.utils import alist
 
 class MultiSlabSeqn(s_t_utils.SynTest):
 
-    async def test_multislabseqn(self):
+    async def test_multislabseqn_base(self):
 
         with self.getTestDir() as dirn:
 
@@ -160,15 +161,12 @@ class MultiSlabSeqn(s_t_utils.SynTest):
                 retn = await msqn.add('foo13b', indx=13)
                 self.eq(13, retn)
 
-                await self.asyncraises(s_exc.BadIndxValu, msqn.add('foo7', indx=7))
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.add('foo7', indx=7)
 
                 retn = await alist(msqn.iter(1))
                 exp = [(11, 'foo11b'), (12, 'foo12'), (13, 'foo13b'), (14, 'foo14'), (15, 'done')]
                 self.eq(exp, retn)
-
-                # Give a chance for the non-iterated async generators to get cleaned up
-                await asyncio.sleep(0)
-                await asyncio.sleep(0)
 
                 # Make sure we're not holding onto more than 2 slabs
 
@@ -180,6 +178,10 @@ class MultiSlabSeqn(s_t_utils.SynTest):
 
                 fns = sorted(s_common.listdir(dirn, glob='*.lmdb'))
                 self.len(3, fns)
+
+                # Slab @ 13 will get fini out
+                _slab = msqn._openslabs[13][0]
+                self.true(await _slab.waitfini(6))
 
                 self.len(2, msqn._openslabs)
 
@@ -225,6 +227,28 @@ class MultiSlabSeqn(s_t_utils.SynTest):
                 # Iterator exhausted: should have just the cache slab (10) and the tail slab (20)
                 self.len(2, msqn._openslabs)
 
+    async def test_multislabseqn_retnpack(self):
+
+        with self.getTestDir() as dirn:
+
+            async with await s_multislabseqn.MultiSlabSeqn.anit(dirn) as msqn:
+
+                self.eq((0, b'\xa4foo1'), await msqn.addWithPackRetn('foo1'))
+                self.eq((1, b'\xa4foo2'), await msqn.addWithPackRetn('foo2'))
+                self.eq((0, b'\xa4foo3'), await msqn.addWithPackRetn('foo3', indx=0))
+
+                await msqn.addWithPackRetn('foo4', indx=10)
+                await msqn.rotate()
+                await msqn.addWithPackRetn('foo5')
+                await msqn.addWithPackRetn('foo6', indx=7)
+
+                self.true(await msqn.cull(10))
+
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.addWithPackRetn('foo7', indx=7)
+
+                self.eq((12, b'\xa4foo8'), msqn.tailseqn.addWithPackRetn('foo8'))
+
     async def test_multislabseqn_cull(self):
 
         with self.getTestDir() as dirn:
@@ -236,7 +260,8 @@ class MultiSlabSeqn(s_t_utils.SynTest):
 
                 # cull with only one seqn
                 self.true(await msqn.cull(2))
-                await self.asyncraises(s_exc.BadIndxValu, msqn.get(2))
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.get(2)
 
                 await msqn.rotate()
 
@@ -251,15 +276,20 @@ class MultiSlabSeqn(s_t_utils.SynTest):
                 self.eq('foo4', retn)
 
                 self.true(await msqn.cull(4))
-                await self.asyncraises(s_exc.BadIndxValu, msqn.get(4))
-                await self.asyncraises(s_exc.BadIndxValu, msqn.add('foo12', indx=4))
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.get(4)
+
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.add('foo12', indx=4)
 
                 retn = await msqn.get(5)
                 self.eq('foo5', retn)
 
                 it = msqn.iter(0)
                 retn = await it.__anext__()
-                await self.asyncraises(s_exc.SlabInUse, msqn.cull(6))
+                with self.raises(s_exc.SlabInUse):
+                    await msqn.cull(6)
+
                 await it.aclose()
 
                 # culling on the tail just moves firstindx forward
@@ -272,8 +302,11 @@ class MultiSlabSeqn(s_t_utils.SynTest):
                 retn = await alist(msqn.iter(1))
                 self.eq([(12, 'foo12'), (13, 'foo13'), (14, 'foo14')], retn)
 
-                await self.asyncraises(s_exc.BadIndxValu, msqn.get(11))
-                await self.asyncraises(s_exc.BadIndxValu, msqn.add('foo', indx=11))
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.get(11)
+
+                with self.raises(s_exc.BadIndxValu):
+                    await msqn.add('foo', indx=11)
 
                 # Make sure it deleted a slab
                 fns = sorted(s_common.listdir(dirn, glob='*.lmdb'))
@@ -314,12 +347,12 @@ class MultiSlabSeqn(s_t_utils.SynTest):
             # Make a slab a non-dir
             slab0dirn = s_common.genpath(baddirn, f'seqn{"0" * 16}.lmdb')
             shutil.rmtree(slab0dirn)
-            s_common.jssave('{}', slab0dirn)
+            s_json.jssave('{}', slab0dirn)
 
-            with self.getAsyncLoggerStream('synapse.lib.multislabseqn', 'non-directory') as stream:
+            with self.getLoggerStream('synapse.lib.multislabseqn') as stream:
                 async with await s_multislabseqn.MultiSlabSeqn.anit(baddirn) as msqn:
                     await self.agenlen(15, msqn.iter(0))
-                await stream.wait(timeout=1)
+                await stream.expect('non-directory', timeout=1)
 
             # Switcheroo
 
@@ -344,10 +377,10 @@ class MultiSlabSeqn(s_t_utils.SynTest):
             slab10dirn = s_common.genpath(baddirn, f'seqn{"0" * 14}0a.lmdb')
             shutil.rmtree(slab10dirn)
 
-            with self.getAsyncLoggerStream('synapse.lib.multislabseqn', 'gap in indices') as stream:
+            with self.getLoggerStream('synapse.lib.multislabseqn') as stream:
                 async with await s_multislabseqn.MultiSlabSeqn.anit(baddirn) as msqn:
                     await self.agenlen(15, msqn.iter(0))
-                await stream.wait(timeout=1)
+                await stream.expect('gap in indices', timeout=1)
 
             # Wipe a seqn clean
             baddirn = s_common.genpath(dirn, 'bad4')

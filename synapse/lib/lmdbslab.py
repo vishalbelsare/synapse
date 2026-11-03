@@ -18,6 +18,7 @@ import synapse.lib.coro as s_coro
 import synapse.lib.cache as s_cache
 import synapse.lib.const as s_const
 import synapse.lib.nexus as s_nexus
+import synapse.lib.logging as s_logging
 import synapse.lib.msgpack as s_msgpack
 import synapse.lib.thishost as s_thishost
 import synapse.lib.thisplat as s_thisplat
@@ -29,8 +30,27 @@ PROGRESS_PERIOD = COPY_CHUNKSIZE * 1024
 # By default, double the map size each time we run out of space, until this amount, and then we only increase by that
 MAX_DOUBLE_SIZE = 100 * s_const.gibibyte
 
+MAX_MDB_KEYLEN = 511
+
 int64min = s_common.int64en(0)
 int64max = s_common.int64en(0xffffffffffffffff)
+
+class LmdbBackup(s_base.Base):
+
+    async def __anit__(self, path):
+        await s_base.Base.__anit__(self)
+        self.path = s_common.genpath(path)
+        self.datafile = os.path.join(self.path, 'data.mdb')
+
+        stat = os.stat(self.datafile)
+
+        self.lenv = await self.enter_context(
+            lmdb.open(self.path, map_size=stat.st_size, max_dbs=16384, create=False, readonly=True)
+        )
+        self.ltxn = await self.enter_context(self.lenv.begin())
+
+    async def saveto(self, dstdir):
+        await s_coro.executor(self.lenv.copy, dstdir, compact=True, txn=self.ltxn)
 
 class Hist:
     '''
@@ -149,6 +169,152 @@ class SlabDict:
         self.set(name, curv)
         return curv
 
+class SafeKeyVal:
+    '''
+    Key/value storage that does not store items in memory and ensures keys are < 512 characters in length.
+
+        Note:
+            The key size limitation includes the length of any prefixes added by
+            using getSubKeyVal().
+    '''
+    def __init__(self, slab, name, prefix=''):
+
+        self.prefix = prefix
+        self._prefix = prefix.encode('utf8')
+        self.preflen = len(self._prefix)
+
+        if self.preflen >= MAX_MDB_KEYLEN:
+            mesg = f'SafeKeyVal prefix lengths must be < {MAX_MDB_KEYLEN} bytes.'
+            raise s_exc.BadArg(mesg=mesg, prefix=self._prefix[:1024])
+
+        self.name = name
+        self.slab = slab
+        self.valudb = slab.initdb(name)
+
+    def getSubKeyVal(self, prefix):
+
+        if not prefix or not isinstance(prefix, str):
+            mesg = 'SafeKeyVal.getSubKeyVal() requires a string prefix of at least one character.'
+            raise s_exc.BadArg(mesg=mesg, prefix=prefix)
+
+        if self.prefix:
+            prefix = self.prefix + prefix
+
+        return SafeKeyVal(self.slab, self.name, prefix=prefix)
+
+    def reqValidName(self, name):
+
+        if not isinstance(name, str):
+            mesg = f'SafeKeyVal key names must be strings, got {type(name).__name__}.'
+            raise s_exc.BadArg(mesg=mesg, name=s_common.trimText(repr(name)))
+
+        _name = name.encode('utf-8')
+
+        if self._prefix:
+            _name = self._prefix + _name
+
+        if len(_name) > MAX_MDB_KEYLEN:
+            maxlen = MAX_MDB_KEYLEN - self.preflen
+            mesg = f'SafeKeyVal keys with prefix {self.prefix} must be less < {maxlen} bytes in length.'
+            raise s_exc.BadArg(mesg=mesg, prefix=self.prefix, name=name[:1024])
+        return _name
+
+    def get(self, name, defv=None):
+        '''
+        Get the value for a key.
+
+        Note:
+            This may only be used for keys < 512 characters in length.
+        '''
+        name = self.reqValidName(name)
+
+        if (byts := self.slab.get(name, db=self.valudb)) is None:
+            return defv
+        return s_msgpack.un(byts)
+
+    def set(self, name, valu):
+
+        name = self.reqValidName(name)
+
+        self.slab.put(name, s_msgpack.en(valu), db=self.valudb)
+        return valu
+
+    def pop(self, name, defv=None):
+
+        name = self.reqValidName(name)
+
+        if (byts := self.slab.pop(name, db=self.valudb)) is not None:
+            return s_msgpack.un(byts)
+        return defv
+
+    def delete(self, name):
+        '''
+        Delete a key.
+        '''
+        name = self.reqValidName(name)
+        return self.slab.delete(name, db=self.valudb)
+
+    async def truncate(self, pref=''):
+        '''
+        Delete all keys.
+        '''
+        pref = self.reqValidName(pref)
+
+        if not pref:
+            genr = self.slab.scanKeys(db=self.valudb)
+        else:
+            genr = self.slab.scanKeysByPref(pref, db=self.valudb)
+
+        for lkey in genr:
+            self.slab.delete(lkey, db=self.valudb)
+            await asyncio.sleep(0)
+
+    def items(self, pref=''):
+
+        pref = self.reqValidName(pref)
+
+        if not pref:
+            genr = self.slab.scanByFull(db=self.valudb)
+        else:
+            genr = self.slab.scanByPref(pref, db=self.valudb)
+
+        if self.prefix:
+            for lkey, byts in genr:
+                yield lkey[self.preflen:].decode('utf8'), s_msgpack.un(byts)
+            return
+
+        for lkey, byts in genr:
+            yield lkey.decode('utf8'), s_msgpack.un(byts)
+
+    def keys(self, pref=''):
+
+        pref = self.reqValidName(pref)
+
+        if not pref:
+            genr = self.slab.scanKeys(db=self.valudb)
+        else:
+            genr = self.slab.scanKeysByPref(pref, db=self.valudb)
+
+        if self.prefix:
+            for lkey in genr:
+                yield lkey[self.preflen:].decode('utf8')
+            return
+
+        for lkey in genr:
+            yield lkey.decode('utf8')
+
+    def values(self, pref=''):
+
+        pref = self.reqValidName(pref)
+
+        if not pref:
+            genr = self.slab.scanByFull(db=self.valudb)
+        else:
+            genr = self.slab.scanByPref(pref, db=self.valudb)
+
+        for lkey, byts in genr:
+            yield s_msgpack.un(byts)
+
 class SlabAbrv:
     '''
     A utility for translating arbitrary bytes into fixed with id bytes
@@ -258,7 +424,7 @@ class HotKeyVal(s_base.Base):
         if not tups:
             return
 
-        self.slab.putmulti(tups, db=self.db)
+        self.slab._putmulti(tups, db=self.db)
         self.dirty.clear()
 
     def pack(self):
@@ -275,6 +441,7 @@ class HotCount(HotKeyVal):
         byts = name.encode()
         self.cache[byts] += valu
         self.dirty.add(byts)
+        self.slab.dirty = True
 
     def set(self, name: str, valu):
         byts = name.encode()
@@ -544,6 +711,33 @@ class GuidStor:
         bidn = s_common.uhex(iden)
         return SlabDict(self.slab, db=self.db, pref=bidn)
 
+    async def del_(self, iden):
+        bidn = s_common.uhex(iden)
+        for lkey, lval in self.slab.scanByPref(bidn, db=self.db):
+            self.slab.pop(lkey, db=self.db)
+            await asyncio.sleep(0)
+
+    def has(self, iden):
+        bidn = s_common.uhex(iden)
+        for _ in self.slab.scanKeysByPref(bidn, db=self.db):
+            return True
+        return False
+
+    def set(self, iden, name, valu):
+        bidn = s_common.uhex(iden)
+        byts = s_msgpack.en(valu)
+        self.slab.put(bidn + name.encode(), byts, db=self.db)
+
+    async def dict(self, iden):
+        bidn = s_common.uhex(iden)
+
+        retn = {}
+        for lkey, lval in self.slab.scanByPref(bidn, db=self.db):
+            await asyncio.sleep(0)
+            name = lkey[len(bidn):].decode()
+            retn[name] = s_msgpack.un(lval)
+        return retn
+
 def _florpo2(i):
     '''
     Return largest power of 2 equal to or less than i
@@ -648,12 +842,13 @@ class Slab(s_base.Base):
                 'xactops': len(slab.xactops),
                 'mapsize': slab.mapsize,
                 'readonly': slab.readonly,
+                'readahead': slab.readahead,
                 'lockmemory': slab.lockmemory,
                 'recovering': slab.recovering,
                 'maxsize': slab.maxsize,
                 'growsize': slab.growsize,
-                'mapasync': slab.mapasync,
-
+                'mapasync': True,
+                'commitstats': list(slab.commitstats),
             })
         return retn
 
@@ -665,6 +860,8 @@ class Slab(s_base.Base):
         kwargs.setdefault('lockmemory', False)
         kwargs.setdefault('map_async', True)
 
+        assert kwargs.get('map_async')
+
         opts = kwargs
 
         self.path = path
@@ -675,11 +872,13 @@ class Slab(s_base.Base):
             raise s_exc.SlabAlreadyOpen(mesg=path)
 
         if os.path.isfile(self.optspath):
-            opts.update(s_common.yamlload(self.optspath))
+            _opts = s_common.yamlload(self.optspath)
+            if isinstance(_opts, dict):
+                opts.update(_opts)
 
         initial_mapsize = opts.get('map_size')
         if initial_mapsize is None:
-            raise s_exc.BadArg('Slab requires map_size')
+            raise s_exc.BadArg(mesg='Slab requires map_size')
 
         mdbpath = s_common.genpath(path, 'data.mdb')
         if os.path.isfile(mdbpath):
@@ -699,6 +898,7 @@ class Slab(s_base.Base):
         self.growsize = opts.pop('growsize', self.DEFAULT_GROWSIZE)
 
         self.readonly = opts.get('readonly', False)
+        self.readahead = opts.get('readahead', True)
         self.lockmemory = opts.pop('lockmemory', False)
 
         if self.lockmemory:
@@ -707,11 +907,11 @@ class Slab(s_base.Base):
                 logger.info(f'SYN_LOCKMEM_DISABLE envar set, skipping lockmem for {self.path}')
                 self.lockmemory = False
 
-        self.mapasync = opts.setdefault('map_async', True)
-
         self.mapsize = _mapsizeround(mapsize)
         if self.maxsize is not None:
             self.mapsize = min(self.mapsize, self.maxsize)
+
+        opts['map_size'] = self.mapsize
 
         self._saveOptsFile()
 
@@ -737,6 +937,7 @@ class Slab(s_base.Base):
         else:
             self._initCoXact()
 
+        self.resizecallbacks = []
         self.resizeevent = threading.Event()  # triggered when a resize event occurred
         self.lockdoneevent = asyncio.Event()  # triggered when a memory locking finished
 
@@ -797,6 +998,13 @@ class Slab(s_base.Base):
         mq = await MultiQueue.anit(self, name, nexsroot=None)
         self.onfini(mq)
         return mq
+
+    def getSafeKeyVal(self, name, prefix='', create=True):
+        if not create and not self.dbexists(name):
+            mesg = f'Database {name=} does not exist.'
+            raise s_exc.BadArg(mesg=mesg)
+
+        return SafeKeyVal(self, name, prefix=prefix)
 
     def statinfo(self):
         return {
@@ -894,6 +1102,9 @@ class Slab(s_base.Base):
         del self.xact
         self.xact = None
 
+    def addResizeCallback(self, callback):
+        self.resizecallbacks.append(callback)
+
     def _growMapSize(self, size=None):
         mapsize = self.mapsize
 
@@ -912,12 +1123,17 @@ class Slab(s_base.Base):
                 raise s_exc.DbOutOfSpace(
                     mesg=f'DB at {self.path} is at specified max capacity of {self.maxsize} and is out of space')
 
-        logger.warning('lmdbslab %s growing map size to: %d MiB', self.path, mapsize // s_const.mebibyte)
+        logger.info('lmdbslab %s growing map size to: %d MiB', self.path, mapsize // s_const.mebibyte)
 
         self.lenv.set_mapsize(mapsize)
         self.mapsize = mapsize
 
         self.resizeevent.set()
+        for callback in self.resizecallbacks:
+            try:
+                callback()
+            except Exception as e:
+                logger.exception(f'Error during slab resize callback - {str(e)}')
 
         return self.mapsize
 
@@ -1138,46 +1354,77 @@ class Slab(s_base.Base):
             self._relXactForReading()
 
     def has(self, lkey, db=None):
+        self._acqXactForReading()
         realdb, dupsort = self.dbnames[db]
-        with self.xact.cursor(db=realdb) as curs:
-            return curs.set_key(lkey)
+        try:
+            with self.xact.cursor(db=realdb) as curs:
+                return curs.set_key(lkey)
+        finally:
+            self._relXactForReading()
 
     def hasdup(self, lkey, lval, db=None):
+        self._acqXactForReading()
         realdb, dupsort = self.dbnames[db]
-        with self.xact.cursor(db=realdb) as curs:
-            return curs.set_key_dup(lkey, lval)
+        try:
+            with self.xact.cursor(db=realdb) as curs:
+                return curs.set_key_dup(lkey, lval)
+        finally:
+            self._relXactForReading()
+
+    def count(self, lkey, db=None):
+        self._acqXactForReading()
+        realdb, dupsort = self.dbnames[db]
+        try:
+            with self.xact.cursor(db=realdb) as curs:
+                if not curs.set_key(lkey):
+                    return 0
+
+                if not dupsort:
+                    return 1
+
+                return curs.count()
+        finally:
+            self._relXactForReading()
 
     def prefexists(self, byts, db=None):
         '''
         Returns True if a prefix exists in the db.
         '''
+        self._acqXactForReading()
         realdb, _ = self.dbnames[db]
-        with self.xact.cursor(db=realdb) as curs:
-            if not curs.set_range(byts):
+        try:
+            with self.xact.cursor(db=realdb) as curs:
+                if not curs.set_range(byts):
+                    return False
+
+                lkey = curs.key()
+
+                if lkey[:len(byts)] == byts:
+                    return True
+
                 return False
-
-            lkey = curs.key()
-
-            if lkey[:len(byts)] == byts:
-                return True
-
-            return False
+        finally:
+            self._relXactForReading()
 
     def rangeexists(self, lmin, lmax=None, db=None):
         '''
         Returns True if at least one key exists in the range.
         '''
+        self._acqXactForReading()
         realdb, _ = self.dbnames[db]
-        with self.xact.cursor(db=realdb) as curs:
-            if not curs.set_range(lmin):
+        try:
+            with self.xact.cursor(db=realdb) as curs:
+                if not curs.set_range(lmin):
+                    return False
+
+                lkey = curs.key()
+
+                if lkey[:len(lmin)] >= lmin and (lmax is None or lkey[:len(lmax)] <= lmax):
+                    return True
+
                 return False
-
-            lkey = curs.key()
-
-            if lkey[:len(lmin)] >= lmin and (lmax is None or lkey[:len(lmax)] <= lmax):
-                return True
-
-            return False
+        finally:
+            self._relXactForReading()
 
     def stat(self, db=None):
         self._acqXactForReading()
@@ -1187,18 +1434,18 @@ class Slab(s_base.Base):
         finally:
             self._relXactForReading()
 
-    def scanKeys(self, db=None):
+    def scanKeys(self, db=None, nodup=False):
 
-        with ScanKeys(self, db) as scan:
+        with ScanKeys(self, db, nodup=nodup) as scan:
 
             if not scan.first():
                 return
 
             yield from scan.iternext()
 
-    def scanKeysByPref(self, byts, db=None):
+    def scanKeysByPref(self, byts, db=None, nodup=False):
 
-        with ScanKeys(self, db) as scan:
+        with ScanKeys(self, db, nodup=nodup) as scan:
 
             if not scan.set_range(byts):
                 return
@@ -1211,13 +1458,61 @@ class Slab(s_base.Base):
 
                 yield lkey
 
+    async def scanKeysByHierPref(self, byts, sepr=b'.', depth=0, db=None, nodup=False):
+
+        if len(sepr) != 1 or sepr == b'\xff':
+            mesg = f'Invalid sepr value {sepr} for scanKeysByHierPref, must be a single character < \xff.'
+            raise s_exc.BadArg(mesg=mesg, sepr=sepr)
+
+        if depth < 0:
+            mesg = f'Invalid depth value {depth} for scanKeysByHierPref, must be >= 0.'
+            raise s_exc.BadArg(mesg=mesg, depth=depth)
+
+        with ScanKeys(self, db, nodup=nodup) as scan:
+
+            if not scan.set_range(byts):
+                return
+
+            size = len(byts)
+            splitcnt = depth + 1
+            seprnext = (int.from_bytes(sepr, 'big') + 1).to_bytes(1, 'big')
+
+            for lkey in scan.iternext():
+
+                while True:
+                    await asyncio.sleep(0)
+
+                    if lkey[:size] != byts:
+                        return
+
+                    if len(parts := lkey[size:].split(sepr, splitcnt)) <= splitcnt:
+                        break
+
+                    taillen = len(parts[-1]) + 1
+                    nextvalu = lkey[:-taillen] + seprnext
+
+                    # Due to the sleep in this loop, we may get bumped and set_range
+                    # doesn't need to handle that elsewhere so just check/refresh it here.
+                    if scan.bumped:
+                        if self.isfini:
+                            raise s_exc.IsFini()
+                        scan.bumped = False
+                        scan.curs = self.xact.cursor(db=scan.db)
+
+                    if not scan.set_range(nextvalu):
+                        return
+
+                    lkey = scan.atitem
+
+                yield lkey
+
     async def countByPref(self, byts, db=None, maxsize=None):
         '''
         Return the number of rows in the given db with the matching prefix bytes.
         '''
         count = 0
         size = len(byts)
-        with ScanKeys(self, db) as scan:
+        with ScanKeys(self, db, nodup=True) as scan:
 
             if not scan.set_range(byts):
                 return 0
@@ -1227,7 +1522,7 @@ class Slab(s_base.Base):
                 if lkey[:size] != byts:
                     return count
 
-                count += 1
+                count += scan.curs.count()
                 if maxsize is not None and maxsize == count:
                     return count
 
@@ -1300,6 +1595,10 @@ class Slab(s_base.Base):
 
                 if not scan.set_range(nextbyts):
                     return
+
+                if scan.atitem[0] == nextbyts:
+                    if not scan.next_key():
+                        return
 
             except OverflowError:
                 if not scan.first():
@@ -1430,7 +1729,28 @@ class Slab(s_base.Base):
         except lmdb.MapFullError:
             return self._handle_mapfull()
 
-    def putmulti(self, kvpairs, dupdata=False, append=False, db=None):
+    async def putmulti(self, kvpairs, dupdata=False, append=False, db=None):
+
+        # Use a fast path when we have a small amount of data to prevent creating new
+        # list objects when we don't have to.
+        if isinstance(kvpairs, (list, tuple)) and len(kvpairs) <= self.max_xactops_len:
+            ret = self._putmulti(kvpairs, dupdata=dupdata, append=append, db=db)
+            await asyncio.sleep(0)
+            return ret
+
+        # Otherwise, we chunk the large data or a generator into lists no greater than
+        # max_xactops_len and allow the slab the opportunity to commit between chunks.
+        # This helps to avoid a situation where a large generator or list of kvpairs
+        # could cause a greedy commit operation from happening.
+        consumed, added = 0, 0
+        for chunk in s_common.chunks(kvpairs, self.max_xactops_len):
+            rc, ra = self._putmulti(chunk, dupdata=dupdata, append=append, db=db)
+            consumed = consumed + rc
+            added = added + ra
+            await asyncio.sleep(0)
+        return (consumed, added)
+
+    def _putmulti(self, kvpairs: list, dupdata: bool =False, append: bool =False, db: str =None):
         '''
         Returns:
             Tuple of number of items consumed, number of items added
@@ -1448,7 +1768,7 @@ class Slab(s_base.Base):
             self.dirty = True
 
             if not self.recovering:
-                self._logXactOper(self.putmulti, kvpairs, dupdata=dupdata, append=append, db=db)
+                self._logXactOper(self._putmulti, kvpairs, dupdata=dupdata, append=append, db=db)
 
             with self.xact.cursor(db=realdb) as curs:
                 return curs.putmulti(kvpairs, dupdata=dupdata, append=append)
@@ -1456,7 +1776,7 @@ class Slab(s_base.Base):
         except lmdb.MapFullError:
             return self._handle_mapfull()
 
-    def copydb(self, sourcedbname, destslab, destdbname=None, progresscb=None):
+    async def copydb(self, sourcedbname, destslab, destdbname=None, progresscb=None):
         '''
         Copy an entire database in this slab to a new database in potentially another slab.
 
@@ -1486,7 +1806,7 @@ class Slab(s_base.Base):
         rowcount = 0
 
         for chunk in s_common.chunks(self.scanByFull(db=sourcedbname), COPY_CHUNKSIZE):
-            ccount, acount = destslab.putmulti(chunk, dupdata=True, append=True, db=destdbname)
+            ccount, acount = await destslab.putmulti(chunk, dupdata=True, append=True, db=destdbname)
             if ccount != len(chunk) or acount != len(chunk):
                 raise s_exc.BadCoreStore(mesg='Unexpected number of values written')  # pragma: no cover
 
@@ -1518,9 +1838,15 @@ class Slab(s_base.Base):
         return True
 
     def pop(self, lkey, db=None):
+        # an in-transaction delete can disrupt the live cursors of active scans
+        # and cause already-yielded rows to be re-emitted, so bump them to force
+        # a safe cursor resume on their next step
+        [scan.bump() for scan in self.scans]
         return self._xact_action(self.pop, lmdb.Transaction.pop, lkey, db=db)
 
     def delete(self, lkey, val=None, db=None):
+        # see pop(): bump active scans so a delete cannot corrupt their cursors
+        [scan.bump() for scan in self.scans]
         return self._xact_action(self.delete, lmdb.Transaction.delete, lkey, val, db=db)
 
     def put(self, lkey, lval, dupdata=False, overwrite=True, append=False, db=None):
@@ -1553,7 +1879,17 @@ class Slab(s_base.Base):
         self.commitstats.append((starttime, xactopslen, delta))
 
         if self.WARN_COMMIT_TIME_MS and delta > self.WARN_COMMIT_TIME_MS:
-            logger.warning(f'Commit with {xactopslen} items in {self!r} took {delta} ms.')
+
+            extra = {
+                'delta': delta,
+                'path': self.path,
+                'sysctls': s_thisplat.getSysctls(),
+                'xactopslen': xactopslen,
+            }
+
+            mesg = f'Commit with {xactopslen} items in {self!r} took {delta} ms - performance may be degraded.'
+            logger.warning(mesg, extra=s_logging.getLogExtra(**extra))
+
         self._initCoXact()
         return True
 
@@ -1679,6 +2015,8 @@ class Scan:
         '''
         Returns if the cursor is at the value in atitem
         '''
+        if not self.dupsort:
+            return self.atitem[0] == self.curs.item()[0]
         return self.atitem == self.curs.item()
 
 class ScanKeys(Scan):
@@ -1686,14 +2024,21 @@ class ScanKeys(Scan):
     An iterator over the keys of the database.  If the database is dupsort, a key with multiple values with be yielded
     once for each value.
     '''
+    def __init__(self, slab, db, nodup=False):
+        Scan.__init__(self, slab, db)
+        self.nodup = nodup
+
     def iterfunc(self):
         if self.dupsort:
-            return Scan.iterfunc(self)
+            if self.nodup:
+                return self.curs.iternext_nodup(keys=True, values=False)
+            else:
+                return Scan.iterfunc(self)
 
         return self.curs.iternext(keys=True, values=False)
 
     def resume(self):
-        if self.dupsort:
+        if self.dupsort and not self.nodup:
             return Scan.resume(self)
 
         return self.curs.set_range(self.atitem)
@@ -1702,13 +2047,13 @@ class ScanKeys(Scan):
         '''
         Returns if the cursor is at the value in atitem
         '''
-        if self.dupsort:
+        if self.dupsort and not self.nodup:
             return Scan.isatitem(self)
 
         return self.atitem == self.curs.key()
 
     def iternext(self):
-        if self.dupsort:
+        if self.dupsort and not self.nodup:
             yield from (item[0] for item in Scan.iternext(self))
             return
 
@@ -1742,6 +2087,19 @@ class ScanBack(Scan):
 
         self.genr = self.iterfunc()
         self.atitem = next(self.genr)
+        return True
+
+    def next_key(self):
+
+        if not self.curs.prev_nodup():
+            return False
+
+        if self.dupsort:
+            self.curs.last_dup()
+
+        self.genr = self.iterfunc()
+        self.atitem = next(self.genr)
+
         return True
 
     def set_range(self, lkey):

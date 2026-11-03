@@ -25,17 +25,17 @@ import math
 import types
 import shutil
 import asyncio
-import hashlib
 import inspect
 import logging
 import tempfile
 import unittest
-import threading
 import contextlib
 import collections
 
 import unittest.mock as mock
 
+import vcr
+import regex
 import aiohttp
 
 from prompt_toolkit.formatted_text import FormattedText
@@ -50,9 +50,12 @@ import synapse.cryotank as s_cryotank
 import synapse.telepath as s_telepath
 
 import synapse.lib.aha as s_aha
+import synapse.lib.base as s_base
+import synapse.lib.cell as s_cell
 import synapse.lib.coro as s_coro
 import synapse.lib.cmdr as s_cmdr
 import synapse.lib.hive as s_hive
+import synapse.lib.json as s_json
 import synapse.lib.task as s_task
 import synapse.lib.const as s_const
 import synapse.lib.layer as s_layer
@@ -63,14 +66,19 @@ import synapse.lib.module as s_module
 import synapse.lib.output as s_output
 import synapse.lib.certdir as s_certdir
 import synapse.lib.httpapi as s_httpapi
+import synapse.lib.logging as s_logging
 import synapse.lib.msgpack as s_msgpack
 import synapse.lib.jsonstor as s_jsonstor
 import synapse.lib.lmdbslab as s_lmdbslab
+import synapse.lib.modelrev as s_modelrev
 import synapse.lib.thishost as s_thishost
-import synapse.lib.structlog as s_structlog
 import synapse.lib.stormtypes as s_stormtypes
 
+import synapse.tools.storm.pkg.gen as s_genpkg
+
 logger = logging.getLogger(__name__)
+
+logging.getLogger('vcr').setLevel(logging.ERROR)
 
 # Default LMDB map size for tests
 TEST_MAP_SIZE = s_const.gibibyte
@@ -85,12 +93,74 @@ def norm(z):
         return {norm(k): norm(v) for (k, v) in z.items()}
     return z
 
+def deguidify(x):
+    return regex.sub('[0-9a-f]{32}', '*' * 32, x)
+
+def jsonlines(text: str):
+    lines = [k for k in text.split('\n') if k]
+    return [s_json.loads(line) for line in lines]
+
+async def waitForBehold(core, events):
+    async for mesg in core.behold():
+        for event in list(events):
+            for key, valu in event.items():
+                if mesg.get(key) != valu:
+                    break
+            else:
+                events.remove(event)
+
+        if len(events) == 0:
+            break
+
+@contextlib.asynccontextmanager
+async def matchContexts(testself):
+    origenter = s_base.Base.__aenter__
+    origexit = s_base.Base.__aexit__
+    origstorm = s_cortex.Cortex.storm
+    orignodes = s_cortex.Cortex.nodes
+
+    contexts = collections.defaultdict(int)
+
+    async def enter(self):
+        contexts[type(self)] += 1
+        return await origenter(self)
+
+    async def exit(self, exc, cls, tb):
+        contexts[type(self)] -= 1
+        await origexit(self, exc, cls, tb)
+
+    async def storm(self, text, opts=None):
+        async for mesg in origstorm(self, text, opts=opts):
+            yield mesg
+
+        for cont, refs in contexts.items():
+            testself.eq(0, refs)
+
+    async def nodes(self, text, opts=None):
+        nodes = await orignodes(self, text, opts=opts)
+
+        for cont, refs in contexts.items():
+            testself.eq(0, refs)
+
+        return nodes
+
+    with mock.patch('synapse.lib.base.Base.__aenter__', enter):
+        with mock.patch('synapse.lib.base.Base.__aexit__', exit):
+            with mock.patch('synapse.cortex.Cortex.nodes', nodes):
+                with mock.patch('synapse.cortex.Cortex.storm', storm):
+                    yield
+
+class PickleableMagicMock(mock.MagicMock):
+    def __reduce__(self):
+        return mock.MagicMock, ()
+
 class LibTst(s_stormtypes.Lib):
     '''
     LibTst for testing!
     '''
     _storm_locals = (
         {'name': 'beep',
+         'deprecated': {'eoldate': '8080-08-08'},
          'desc': '''
         Example storm func.
 
@@ -101,12 +171,23 @@ class LibTst(s_stormtypes.Lib):
                       {'name': 'valu', 'type': 'str', 'desc': 'The value to beep.', },
                   ),
                   'returns': {'type': 'str', 'desc': 'The beeped string.', }}},
+        {'name': 'someargs',
+         'desc': '''Example storm func with args.''',
+         'deprecated': {'eolvers': 'v3.0.0', 'mesg': 'This is a test library was deprecated from the day it was made.'},
+         'type': {'type': 'function', '_funcname': 'someargs',
+                  'args': (
+                      {'name': 'valu', 'type': 'str', 'desc': 'The value to beep.', },
+                      {'name': 'bar', 'type': 'bool', 'desc': 'The value to beep.', 'default': True, },
+                      {'name': 'faz', 'type': 'str', 'desc': 'The value to beep.', 'default': None, },
+                  ),
+                  'returns': {'type': 'str', 'desc': 'The beeped string.', }}},
     )
     _storm_lib_path = ('test',)
 
     def addLibFuncs(self):
         self.locls.update({
             'beep': self.beep,
+            'someargs': self.someargs,
         })
 
     async def beep(self, valu):
@@ -115,6 +196,39 @@ class LibTst(s_stormtypes.Lib):
         '''
         ret = f'A {valu} beep!'
         return ret
+
+    async def someargs(self, valu, bar=True, faz=None):
+        '''
+        Example storm func
+        '''
+        ret = f'A {valu} beep which {bar} the {faz}!'
+        return ret
+
+class LibDepr(s_stormtypes.Lib):
+    '''
+    Deprecate me!
+    '''
+    _storm_locals = (
+        {'name': 'boop',
+         'desc': '''
+         An example storm function that's not deprecated on its own, but the entire library is.
+         ''',
+         'type': {'type': 'function', '_funcname': 'boop',
+                  'args': (
+                      {'name': 'valu', 'type': 'str', 'desc': 'What to boop.', },
+                  ),
+                  'returns': {'type': 'str', 'desc': 'The booped.', }}},
+    )
+    _storm_lib_path = ('depr',)
+    _storm_lib_deprecation = {'eolvers': 'v3.0.0'}
+
+    def addLibFuncs(self):  # pragma: no cover
+        self.locls.update({
+            'boop': self.boop,
+        })
+
+    async def boop(self, valu):  # pragma: no cover
+        return f'You have been booped, {valu}!'
 
 class TestType(s_types.Type):
 
@@ -177,7 +291,16 @@ testmodel = {
         ('test:type', 'synapse.tests.utils.TestType', {}, {}),
         ('test:threetype', 'synapse.tests.utils.ThreeType', {}, {}),
     ),
-
+    'interfaces': (
+        ('test:interface', {
+            'doc': 'test interface',
+            'props': (
+                ('size', ('int', {}), {}),
+                ('names', ('array', {'type': 'str'}), {}),
+            ),
+            'interfaces': ('inet:proto:request',)
+        }),
+    ),
     'types': (
         ('test:type10', ('test:type', {'foo': 10}), {
             'doc': 'A fake type.'}),
@@ -188,17 +311,22 @@ testmodel = {
 
         ('test:ival', ('ival', {}), {}),
 
+        ('test:ro', ('str', {}), {}),
         ('test:int', ('int', {}), {}),
         ('test:float', ('float', {}), {}),
         ('test:str', ('str', {}), {}),
+        ('test:strregex', ('str', {'lower': True, 'strip': True, 'regex': r'^#[^\p{Z}#]+$'}), {}),
         ('test:migr', ('str', {}), {}),
         ('test:auto', ('str', {}), {}),
         ('test:edge', ('edge', {}), {}),
         ('test:guid', ('guid', {}), {}),
         ('test:data', ('data', {}), {}),
+        ('test:taxonomy', ('taxonomy', {}), {'interfaces': ('meta:taxonomy',)}),
+        ('test:hugenum', ('hugenum', {}), {}),
 
         ('test:arrayprop', ('guid', {}), {}),
         ('test:arrayform', ('array', {'type': 'int'}), {}),
+        ('test:rostr', ('guid', {}), {}),
 
         ('test:comp', ('comp', {'fields': (
             ('hehe', 'test:int'),
@@ -208,12 +336,28 @@ testmodel = {
             ('comp1', 'test:comp'),
             ('comp2', 'test:comp'))
         }), {}),
+        ('test:arraycomp', ('comp', {'fields': (
+            ('ints', ('array', {'type': 'test:int'})),
+            ('name', 'test:lower'))
+        }), {'doc': 'A comp type with an array field.'}),
+        # deliberately named to sort before test:comp and test:compcomp, so a cascade
+        # through it is discovered last but iterates first once a spool has spilled
+        ('test:acomp', ('comp', {'fields': (
+            ('cc', 'test:compcomp'),
+            ('name', 'test:lower'))
+        }), {'doc': 'A comp type nesting a comp of comps.'}),
         ('test:complexcomp', ('comp', {'fields': (
             ('foo', 'test:int'),
             ('bar', ('str', {'lower': True}),),
         )}), {'doc': 'A complex comp type.'}),
-        ('test:hexa', ('hex', {}), {'doc': 'anysize test hex type'}),
-        ('test:hex4', ('hex', {'size': 4}), {'doc': 'size 4 test hex type'}),
+        ('test:mutcomp', ('comp', {'fields': (
+            ('str', 'str'),
+            ('list', 'array'))
+        }), {'doc': 'A mutable comp type.'}),
+        ('test:hexa', ('hex', {}), {'doc': 'anysize test hex type.'}),
+        ('test:hex4', ('hex', {'size': 4}), {'doc': 'size 4 test hex type.'}),
+        ('test:hexpad', ('hex', {'size': 8, 'zeropad': True}), {'doc': 'size 8 test hex type, zero padded.'}),
+        ('test:zeropad', ('hex', {'zeropad': 20}), {'doc': 'test hex type, zero padded to 40 bytes.'}),
 
         ('test:pivtarg', ('str', {}), {}),
         ('test:pivcomp', ('comp', {'fields': (('targ', 'test:pivtarg'), ('lulz', 'test:str'))}), {}),
@@ -223,8 +367,20 @@ testmodel = {
         ('test:cycle1', ('str', {}), {}),
 
         ('test:ndef', ('ndef', {}), {}),
-        ('test:runt', ('str', {'lower': True, 'strip': True}), {'doc': 'A Test runt node'}),
+        ('test:ndef:formfilter1', ('ndef', {
+            'forms': ('inet:ipv4', 'inet:ipv6')
+        }), {}),
+        ('test:ndef:formfilter2', ('ndef', {
+            'interfaces': ('meta:taxonomy',)
+        }), {}),
+        ('test:ndef:formfilter3', ('ndef', {
+            'forms': ('inet:ipv4',),
+            'interfaces': ('file:mime:msoffice',)
+        }), {}),
 
+        ('test:runt', ('str', {'lower': True, 'strip': True}), {'doc': 'A Test runt node.'}),
+        ('test:hasiface', ('str', {}), {'interfaces': ('test:interface',)}),
+        ('test:hasiface2', ('str', {}), {'interfaces': ('test:interface',)}),
     ),
 
     'univs': (
@@ -238,9 +394,11 @@ testmodel = {
             ('ints', ('array', {'type': 'test:int'}), {}),
             ('strs', ('array', {'type': 'test:str', 'split': ','}), {}),
             ('strsnosplit', ('array', {'type': 'test:str'}), {}),
+            ('strregexs', ('array', {'type': 'test:strregex', 'uniq': True, 'sorted': True}), {}),
         )),
         ('test:arrayform', {}, (
         )),
+        ('test:taxonomy', {}, ()),
         ('test:type10', {}, (
 
             ('intprop', ('int', {'min': 20, 'max': 30}), {}),
@@ -270,9 +428,24 @@ testmodel = {
             ('comp2', ('test:comp', {}), {'ro': True}),
         )),
 
+        ('test:arraycomp', {}, (
+            ('ints', ('array', {'type': 'test:int'}), {'ro': True}),
+            ('name', ('test:lower', {}), {'ro': True}),
+        )),
+
+        ('test:acomp', {}, (
+            ('cc', ('test:compcomp', {}), {'ro': True}),
+            ('name', ('test:lower', {}), {'ro': True}),
+        )),
+
         ('test:complexcomp', {}, (
             ('foo', ('test:int', {}), {'ro': True}),
             ('bar', ('str', {'lower': 1}), {'ro': True})
+        )),
+
+        ('test:mutcomp', {}, (
+            ('str', ('str', {}), {'ro': True}),
+            ('list', ('array', {'type': 'int'}), {'ro': True}),
         )),
 
         ('test:int', {}, (
@@ -294,7 +467,11 @@ testmodel = {
 
         ('test:guid', {}, (
             ('size', ('test:int', {}), {}),
+            ('name', ('test:str', {}), {}),
             ('tick', ('test:time', {}), {}),
+            ('data', ('data', {}), {}),
+            ('comp', ('test:comp', {}), {}),
+            ('mutcomp', ('test:mutcomp', {}), {}),
             ('posneg', ('test:sub', {}), {}),
             ('posneg:isbig', ('bool', {}), {}),
         )),
@@ -303,12 +480,20 @@ testmodel = {
             ('data', ('test:data', {}), {}),
         )),
 
+        ('test:hugenum', {}, (
+            ('huge', ('test:hugenum', {}), {}),
+        )),
+
         ('test:str', {}, (
             ('bar', ('ndef', {}), {}),
             ('baz', ('nodeprop', {}), {}),
             ('tick', ('test:time', {}), {}),
             ('hehe', ('str', {}), {}),
+            ('ndefs', ('array', {'type': 'ndef'}), {}),
+            ('somestr', ('test:str', {}), {}),
+            ('gprop', ('test:guid', {}), {}),
         )),
+        ('test:strregex', {}, ()),
 
         ('test:migr', {}, (
             ('bar', ('ndef', {}), {}),
@@ -322,8 +507,13 @@ testmodel = {
         ('test:auto', {}, ()),
         ('test:hexa', {}, ()),
         ('test:hex4', {}, ()),
+        ('test:zeropad', {}, ()),
         ('test:ival', {}, (
             ('interval', ('ival', {}), {}),
+        )),
+
+        ('test:rostr', {}, (
+            ('strref', ('test:str', {}), {'ro': True}),
         )),
 
         ('test:pivtarg', {}, (
@@ -352,6 +542,14 @@ testmodel = {
             ('newp', ('str', {}), {'doc': 'A stray property we never use in nodes.'}),
         )),
 
+        ('test:ro', {}, (
+            ('writeable', ('str', {}), {'doc': 'writeable property.'}),
+            ('readable', ('str', {}), {'doc': 'ro property.', 'ro': True}),
+        )),
+
+        ('test:hasiface', {}, ()),
+        ('test:hasiface2', {}, ()),
+
     ),
 }
 
@@ -361,6 +559,12 @@ deprmodel = {
         ('test:deprarray', ('array', {'type': 'test:deprprop'}), {}),
         ('test:deprform', ('test:str', {}), {}),
         ('test:deprndef', ('ndef', {}), {}),
+        ('test:deprsub', ('str', {}), {}),
+        ('test:range', ('range', {}), {}),
+        ('test:deprsub2', ('comp', {'fields': (
+            ('name', 'test:str'),
+            ('range', 'test:range'))
+        }), {}),
     ),
     'forms': (
         ('test:deprprop', {}, ()),
@@ -368,6 +572,17 @@ deprmodel = {
             ('ndefprop', ('test:deprndef', {}), {}),
             ('deprprop', ('test:deprarray', {}), {}),
             ('okayprop', ('str', {}), {}),
+        )),
+        ('test:deprsub', {}, (
+            ('range', ('test:range', {}), {}),
+            ('range:min', ('int', {}), {'deprecated': True}),
+            ('range:max', ('int', {}), {}),
+        )),
+        ('test:deprsub2', {}, (
+            ('name', ('str', {}), {}),
+            ('range', ('test:range', {}), {}),
+            ('range:min', ('int', {}), {}),
+            ('range:max', ('int', {}), {'deprecated': True}),
         )),
     ),
 
@@ -416,10 +631,7 @@ class TestModule(s_module.CoreModule):
 
         self.core.setFeedFunc('com.test.record', self.addTestRecords)
 
-        async with await self.core.snap() as snap:
-            node = await snap.getNodeByNdef(('meta:source', self.testguid))
-            if node is None:
-                await snap.addNode('meta:source', self.testguid, {'name': 'test'})
+        await self.core.addNode(self.core.auth.rootuser, 'meta:source', self.testguid, {'name': 'test'})
 
         self.core.addStormLib(('test',), LibTst)
 
@@ -557,7 +769,7 @@ class TstEnv:
 
 class TstOutPut(s_output.OutPutStr):
 
-    def expect(self, substr, throw=True):
+    def expect(self, substr, throw=True, whitespace=True):
         '''
         Check if a string is present in the messages captured by the OutPutStr object.
 
@@ -569,6 +781,11 @@ class TstOutPut(s_output.OutPutStr):
             bool: True if the string is present; False if the string is not present and throw is False.
         '''
         outs = str(self)
+
+        if not whitespace:
+            outs = ' '.join(outs.split())
+            substr = ' '.join(substr.split())
+
         if outs.find(substr) == -1:
             if throw:
                 mesg = 'TestOutPut.expect(%s) not in %s' % (substr, outs)
@@ -608,64 +825,73 @@ class CmdGenerator:
 
         return retn
 
-class StreamEvent(io.StringIO, threading.Event):
+class LoggerStream(io.StringIO):
     '''
-    A combination of a io.StringIO object and a threading.Event object.
-    '''
-    def __init__(self, *args, **kwargs):
-        io.StringIO.__init__(self, *args, **kwargs)
-        threading.Event.__init__(self)
-        self.mesg = ''
-
-    def setMesg(self, mesg):
-        '''
-        Clear the internal event and set a new message that is used to set the event.
-
-        Args:
-            mesg (str): The string to monitor for.
-
-        Returns:
-            None
-        '''
-        self.mesg = mesg
-        self.clear()
-
-    def write(self, s):
-        io.StringIO.write(self, s)
-        if self.mesg and self.mesg in s:
-            self.set()
-
-class AsyncStreamEvent(io.StringIO, asyncio.Event):
-    '''
-    A combination of a io.StringIO object and an asyncio.Event object.
+    A stream of log output.
     '''
     def __init__(self, *args, **kwargs):
         io.StringIO.__init__(self, *args, **kwargs)
-        asyncio.Event.__init__(self)
-        self.mesg = ''
+        self._lines = []
+        self._event = asyncio.Event()
 
-    def setMesg(self, mesg):
-        '''
-        Clear the internal event and set a new message that is used to set the event.
-
-        Args:
-            mesg (str): The string to monitor for.
-
-        Returns:
-            None
-        '''
-        self.mesg = mesg
-        self.clear()
+    def clear(self):
+        self._lines.clear()
+        self.seek(0)
+        self.truncate()
+        self._event.clear()
 
     def write(self, s):
         io.StringIO.write(self, s)
-        if self.mesg and self.mesg in s:
-            self.set()
+        self._lines.append(s)
+        self._event.set()
 
-    async def wait(self, timeout=None):
-        if timeout is None:
-            return await asyncio.Event.wait(self)
-        return await s_coro.event_wait(self, timeout=timeout)
+    async def expect(self, text, count=1, timeout=6, escape=True):
+        '''
+        Expect a string to be present in the logged text.
+
+        Args:
+            text: String to search the logs for.
+            count: Number of occurances of the entry.
+            timeout: Amount of time to wait for the text to be logged.
+            escape: re.escape() the provided text; to to false is text is a regular expression.
+
+        Returns:
+            True if the text is found.
+        '''
+        try:
+            coro = self._expect(text, count=count, escape=escape)
+            await s_common.wait_for(coro, timeout=timeout)
+        except TimeoutError:
+            logger.warning(f'Pattern [{text}] not found in...')
+            [logger.warning(f'    {line}') for line in self._lines]
+            raise AssertionError(f'Pattern [{text}] not found!')
+
+    async def _expect(self, text, count=1, escape=True):
+
+        if escape:
+            text = regex.escape(text)
+
+        regx = regex.compile(text)
+
+        while True:
+
+            offs = 0
+            tally = 0
+
+            for line in self._lines[offs:]:
+                offs += 1
+
+                if regx.search(line) is not None:
+                    tally += 1
+
+                if tally >= count:
+                    return True
+
+            await self._event.wait()
+            self._event.clear()
+
+    def jsonlines(self):
+        return jsonlines(self.getvalue())
 
 class HttpReflector(s_httpapi.Handler):
     '''Test handler which reflects get/post data back to the caller'''
@@ -676,7 +902,7 @@ class HttpReflector(s_httpapi.Handler):
             for k, items in self.request.arguments.items():
                 for v in items:
                     d[k].append(v.decode())
-        return d
+        return dict(d)
 
     async def get(self):
         resp = {}
@@ -692,9 +918,17 @@ class HttpReflector(s_httpapi.Handler):
             sleep = int(sleep[0])
             await asyncio.sleep(sleep)
 
+        redirect = params.get('redirect')
+        if redirect:
+            self.add_header('Redirected', '1')
+            self.redirect(redirect[0])
+            return
+
         self.sendRestRetn(resp)
 
     async def post(self):
+        self.set_header('Giant', 'x' * 64_000)
+
         resp = {}
         params = self._decode_params()
         if params:
@@ -793,9 +1027,38 @@ test_schema = {
                 'description': 'Foo String',
                 'type': 'string',
             },
+            'key:multi': {
+                'description': 'String or integer',
+                'type': ['string', 'integer'],
+            }
         },
         'type': 'object',
     }
+
+class ReloadCell(s_cell.Cell):
+    async def postAnit(self):
+        self._reloaded = False
+        self._reloadevt = None
+
+    async def getCellInfo(self):
+        info = await s_cell.Cell.getCellInfo(self)
+        info['cell']['reloaded'] = self._reloaded
+        return info
+
+    async def addTestReload(self):
+        async def func():
+            self._reloaded = True
+            if self._reloadevt:
+                self._reloadevt.set()
+            return True
+
+        self.addReloadableSystem('testreload', func)
+
+    async def addTestBadReload(self):
+        async def func():
+            return 1 / 0
+
+        self.addReloadableSystem('badreload', func)
 
 class SynTest(unittest.TestCase):
     '''
@@ -806,14 +1069,15 @@ class SynTest(unittest.TestCase):
     '''
     def __init__(self, *args, **kwargs):
         unittest.TestCase.__init__(self, *args, **kwargs)
-        self._NextBuid = 0
-        self._NextGuid = 0
 
         for s in dir(self):
             attr = getattr(self, s, None)
             # If s is an instance method and starts with 'test_', synchelp wrap it
             if inspect.iscoroutinefunction(attr) and s.startswith('test_') and inspect.ismethod(attr):
                 setattr(self, s, s_glob.synchelp(attr))
+
+    def tearDown(self):
+        s_logging.reset()
 
     def checkNode(self, node, expected):
         ex_ndef, ex_props = expected
@@ -828,17 +1092,6 @@ class SynTest(unittest.TestCase):
         for ndef in ndefs:
             node = await core.nodes('', opts={'ndefs': (ndef,)})
             self.len(1, node)
-
-    def worker(func, *args, **kwargs):
-        '''
-        Fire a worker thread to run the given func(*args,**kwargs)
-        '''
-        def work():
-            return func(*args, **kwargs)
-
-        thr = threading.Thread(target=work)
-        thr.start()
-        return thr
 
     def printed(self, msgs, text):
         # a helper for testing storm print message output
@@ -869,11 +1122,41 @@ class SynTest(unittest.TestCase):
         with self.getTestDir(copyfrom=dirn) as regrdir:
             yield regrdir
 
+    async def waitForActiveMigration(self, core):
+        '''
+        Wait for any tasks that may occur after anit() returns the object.
+        '''
+        self.true(await s_coro.event_wait(core._migration_evnt, timeout=30))
+
     @contextlib.asynccontextmanager
-    async def getRegrCore(self, vers, conf=None):
-        with self.getRegrDir('cortexes', vers) as dirn:
-            async with await s_cortex.Cortex.anit(dirn, conf=conf) as core:
-                yield core
+    async def getRegrCore(self, vers, conf=None, maxvers=None):
+        with self.withNexusReplay():
+            with self.getRegrDir('cortexes', vers) as dirn:
+                if maxvers is not None:
+
+                    orig = s_modelrev.ModelRev
+                    class ModelRev(orig):
+                        def __init__(self, core):
+                            orig.__init__(self, core)
+                            self.revs = [k for k in self.revs if k[0] <= maxvers]
+
+                    with mock.patch.object(s_modelrev, 'ModelRev', ModelRev):
+                        async with await s_cortex.Cortex.anit(dirn, conf=conf) as core:
+                            if not core.conf.get('mirror'):
+                                await self.waitForActiveMigration(core)
+                            yield core
+                else:
+                    async with await s_cortex.Cortex.anit(dirn, conf=conf) as core:
+                        if not core.conf.get('mirror'):
+                            await self.waitForActiveMigration(core)
+                        yield core
+
+    @contextlib.asynccontextmanager
+    async def getRegrAxon(self, vers, conf=None):
+        with self.withNexusReplay():
+            with self.getRegrDir('axons', vers) as dirn:
+                async with await s_axon.Axon.anit(dirn, conf=conf) as axon:
+                    yield axon
 
     def skipIfNoInternet(self):  # pragma: no cover
         '''
@@ -895,6 +1178,34 @@ class SynTest(unittest.TestCase):
         if bool(int(os.getenv('SYN_TEST_SKIP_LONG', 0))):
             raise unittest.SkipTest('SYN_TEST_SKIP_LONG envar set')
 
+    def skipIfNexusReplay(self):
+        '''
+        Allow skipping a test if SYNDEV_NEXUS_REPLAY envar is set.
+
+        Raises:
+            unittest.SkipTest if SYNDEV_NEXUS_REPLAY envar is set to true value.
+        '''
+        if s_common.envbool('SYNDEV_NEXUS_REPLAY'):
+            raise unittest.SkipTest('SYNDEV_NEXUS_REPLAY envar set')
+
+    def skipIfNoPath(self, path, mesg=None):
+        '''
+        Allows skipping a test if the test/files path does not exist.
+
+        Args:
+            path (str): Path to check.
+            mesg (str): Optional additional message.
+
+        Raises:
+            unittest.SkipTest if the path does not exist.
+        '''
+        path = self.getTestFilePath(path)
+        if not os.path.exists(path):
+            m = f'Path does not exist: {path}'
+            if mesg:
+                m = f'{m} mesg={mesg}'
+            raise unittest.SkipTest(m)
+
     def getTestOutp(self):
         '''
         Get a Output instance with a expects() function.
@@ -903,6 +1214,28 @@ class SynTest(unittest.TestCase):
             TstOutPut: A TstOutPut instance.
         '''
         return TstOutPut()
+
+    def thisEnvMust(self, *envvars):
+        '''
+        Requires a host must have environment variables set to truthy values.
+
+        Args:
+            *envars: Environment variables to require being present.
+        '''
+        for envar in envvars:
+            if not s_common.envbool(envar):
+                self.skip(f'Envar {envar} is not set to a truthy value.')
+
+    def thisEnvMustNot(self, *envvars):
+        '''
+        Requires a host must not have environment variables set to truthy values.
+
+        Args:
+            *envars: Environment variables to require being absent or set to falsey values.
+        '''
+        for envar in envvars:
+            if s_common.envbool(envar):
+                self.skip(f'Envar {envar} is set to a truthy value.')
 
     def thisHostMust(self, **props):  # pragma: no cover
         '''
@@ -941,15 +1274,21 @@ class SynTest(unittest.TestCase):
         Returns:
             s_axon.Axon: A Axon object.
         '''
-        if dirn is not None:
-            async with await s_axon.Axon.anit(dirn, conf) as axon:
-                yield axon
 
-            return
+        if conf is None:
+            conf = {}
+        conf = copy.deepcopy(conf)
 
-        with self.getTestDir() as dirn:
-            async with await s_axon.Axon.anit(dirn, conf) as axon:
-                yield axon
+        with self.withNexusReplay():
+            if dirn is not None:
+                async with await s_axon.Axon.anit(dirn, conf) as axon:
+                    yield axon
+
+                return
+
+            with self.getTestDir() as dirn:
+                async with await s_axon.Axon.anit(dirn, conf) as axon:
+                    yield axon
 
     @contextlib.contextmanager
     def withTestCmdr(self, cmdg):
@@ -998,17 +1337,13 @@ class SynTest(unittest.TestCase):
     @contextlib.asynccontextmanager
     async def withSetLoggingMock(self):
         '''
-        Context manager to mock calls to the setlogging function to avoid unittests calling logging.basicconfig.
+        Context manager to mock calls to the logging setup function to avoid unittests calling logging.basicconfig.
 
         Returns:
-            mock.MagicMock: Yields a mock.MagikMock object.
+            mock.MagicMock: Yields a mock.MagicMock object.
         '''
-        # Since the setlogging routine is used in the forkserver initializer,
-        # we need to make sure we've initialized our worker prior to mocking
-        self.eq(1, await s_coro.forked(int, '1'))
-
-        with mock.patch('synapse.common.setlogging',
-                        mock.MagicMock(return_value=dict())) as patch:  # type: mock.MagicMock
+        with mock.patch('synapse.lib.logging.setup',
+                        PickleableMagicMock(return_value=dict())) as patch:  # type: mock.MagicMock
             yield patch
 
     def getMagicPromptLines(self, patch):
@@ -1093,14 +1428,18 @@ class SynTest(unittest.TestCase):
         '''
         Patch so that the Nexus apply log is applied twice. Useful to verify idempotency.
 
+        Args:
+            replay (bool): Set the default value of resolving the existence of SYNDEV_NEXUS_REPLAY variable.
+                           This can be used to force the apply patch without using the environment variable.
+
         Notes:
             This is applied if the environment variable SYNDEV_NEXUS_REPLAY is set
-            or the replay argument is set to True.
+            to a non zero value or the replay argument is set to True.
 
         Returns:
             contextlib.ExitStack: An exitstack object.
         '''
-        replay = os.environ.get('SYNDEV_NEXUS_REPLAY', default=replay)
+        replay = s_common.envbool('SYNDEV_NEXUS_REPLAY', defval=str(replay))
 
         with contextlib.ExitStack() as stack:
             if replay:
@@ -1115,33 +1454,17 @@ class SynTest(unittest.TestCase):
         Returns:
             s_cortex.Cortex: A Cortex object.
         '''
-        if conf is None:
-            conf = {'layer:lmdb:map_async': True,
-                    'provenance:en': True,
-                    'nexslog:en': True,
-                    'layers:logedits': True,
-                    }
+        conf = self.getCellConf(conf=conf)
 
-        conf = copy.deepcopy(conf)
-
-        mods = conf.get('modules')
-
-        if mods is None:
-            mods = []
-            conf['modules'] = mods
+        mods = list(conf.get('modules', ()))
+        conf['modules'] = mods
 
         mods.insert(0, ('synapse.tests.utils.TestModule', {'key': 'valu'}))
 
         with self.withNexusReplay():
 
-            if dirn is not None:
+            with self.mayTestDir(dirn) as dirn:
 
-                async with await s_cortex.Cortex.anit(dirn, conf=conf) as core:
-                    yield core
-
-                return
-
-            with self.getTestDir() as dirn:
                 async with await s_cortex.Cortex.anit(dirn, conf=conf) as core:
                     yield core
 
@@ -1160,10 +1483,20 @@ class SynTest(unittest.TestCase):
                 yield core, prox
 
     @contextlib.asynccontextmanager
-    async def getTestJsonStor(self):
-        with self.getTestDir() as dirn:
-            async with await s_jsonstor.JsonStorCell.anit(dirn) as jsonstor:
-                yield jsonstor
+    async def getTestJsonStor(self, dirn=None, conf=None):
+
+        conf = self.getCellConf(conf=conf)
+
+        with self.withNexusReplay():
+            if dirn is not None:
+                async with await s_jsonstor.JsonStorCell.anit(dirn, conf) as jsonstor:
+                    yield jsonstor
+
+                return
+
+            with self.getTestDir() as dirn:
+                async with await s_jsonstor.JsonStorCell.anit(dirn, conf) as jsonstor:
+                    yield jsonstor
 
     @contextlib.asynccontextmanager
     async def getTestCryo(self, dirn=None, conf=None):
@@ -1173,15 +1506,12 @@ class SynTest(unittest.TestCase):
         Returns:
             s_cryotank.CryoCell: Test cryocell.
         '''
-        if dirn is not None:
-            async with await s_cryotank.CryoCell.anit(dirn, conf=conf) as cryo:
-                yield cryo
+        conf = self.getCellConf(conf=conf)
 
-            return
-
-        with self.getTestDir() as dirn:
-            async with await s_cryotank.CryoCell.anit(dirn, conf=conf) as cryo:
-                yield cryo
+        with self.withNexusReplay():
+            with self.mayTestDir(dirn) as dirn:
+                async with await s_cryotank.CryoCell.anit(dirn, conf=conf) as cryo:
+                    yield cryo
 
     @contextlib.asynccontextmanager
     async def getTestCryoAndProxy(self, dirn=None):
@@ -1197,6 +1527,7 @@ class SynTest(unittest.TestCase):
 
     @contextlib.asynccontextmanager
     async def getTestDmon(self):
+        self.skipIfNoPath(path='certdir', mesg='Missing files for test dmon!')
         with self.getTestDir(mirror='certdir') as certpath:
             certdir = s_certdir.CertDir(path=certpath)
             s_certdir.addCertPath(certpath)
@@ -1207,25 +1538,15 @@ class SynTest(unittest.TestCase):
             s_certdir.delCertPath(certpath)
 
     @contextlib.asynccontextmanager
-    async def getTestCell(self, ctor, conf=None, dirn=None):
+    async def getTestCell(self, ctor=s_cell.Cell, conf=None, dirn=None):
         '''
         Get a test Cell.
         '''
-        if conf is None:
-            conf = {}
-
-        conf = copy.deepcopy(conf)
-
-        if dirn is not None:
-
-            async with await ctor.anit(dirn, conf=conf) as cell:
-                yield cell
-
-            return
-
-        with self.getTestDir() as dirn:
-            async with await ctor.anit(dirn, conf=conf) as cell:
-                yield cell
+        conf = self.getCellConf(conf=conf)
+        with self.withNexusReplay():
+            with self.mayTestDir(dirn) as dirn:
+                async with await ctor.anit(dirn, conf=conf) as cell:
+                    yield cell
 
     @contextlib.asynccontextmanager
     async def getTestCoreProxSvc(self, ssvc, ssvc_conf=None, core_conf=None):
@@ -1246,15 +1567,111 @@ class SynTest(unittest.TestCase):
 
                 yield core, prox, testsvc
 
+    @contextlib.contextmanager
+    def mayTestDir(self, dirn: str | None) -> contextlib.AbstractContextManager[str, None, None]:
+        '''
+        Convenience method to make a temporary directory or use an existing one.
+
+        Args:
+            dirn: Directory to use, or None.
+
+        Returns:
+            The directory to use.
+        '''
+        if dirn is not None:
+            yield dirn
+            return
+
+        with self.getTestDir() as dirn:
+            yield dirn
+
     @contextlib.asynccontextmanager
-    async def getTestAha(self, conf=None, dirn=None):
-        if dirn:
-            async with await s_aha.AhaCell.anit(dirn, conf=conf) as aha:
-                yield aha
-        else:
-            with self.getTestDir() as dirn:
-                async with await s_aha.AhaCell.anit(dirn, conf=conf) as aha:
+    async def getTestAha(self, conf=None, dirn=None, ctor=None):
+
+        if conf is None:
+            conf = {}
+
+        if ctor is None:
+            ctor = s_aha.AhaCell.anit
+
+        conf = s_msgpack.deepcopy(conf)
+
+        hasdmonlisn = 'dmon:listen' in conf
+        hasprovlisn = 'provision:listen' in conf
+
+        network = conf.setdefault('aha:network', 'synapse')
+        hostname = conf.setdefault('dns:name', '00.aha.loop.vertex.link')
+
+        if hostname:
+            conf.setdefault('provision:listen', f'ssl://0.0.0.0:0?hostname={hostname}')
+            conf.setdefault('dmon:listen', f'ssl://0.0.0.0:0?hostname={hostname}&ca={network}')
+
+        conf.setdefault('health:sysctl:checks', False)
+
+        with self.withNexusReplay():
+
+            with self.mayTestDir(dirn) as dirn:
+
+                if conf.get('aha:network') == 'synapse':
+                    dstpath = os.path.join(dirn, 'certs')
+                    if not os.path.isdir(dstpath):
+                        srcpath = self.getTestFilePath('aha/certs')
+                        shutil.copytree(srcpath, os.path.join(dirn, 'certs'))
+
+                async with await ctor(dirn, conf=conf) as aha:
+
+                    mods = {}
+                    if not hasdmonlisn and hostname:
+                        mods['dmon:listen'] = f'ssl://0.0.0.0:{aha.sockaddr[1]}?hostname={hostname}&ca={network}'
+
+                    if not hasprovlisn and hostname:
+                        mods['provision:listen'] = f'ssl://0.0.0.0:{aha.provaddr[1]}?hostname={hostname}'
+
+                    if mods:
+                        aha.modCellConf(mods)
+
                     yield aha
+
+    def getCellConf(self, conf=None):
+        if conf is None:
+            conf = {}
+        conf = s_msgpack.deepcopy(conf)
+        conf.setdefault('health:sysctl:checks', False)
+        return conf
+
+    @contextlib.asynccontextmanager
+    async def addSvcToAha(self, aha, svcname, ctor,
+                          conf=None, dirn=None, provinfo=None):
+        '''
+        Creates a service and provisions it in an Aha network via the provisioning API.
+
+        This assumes the Aha cell has a provision:listen and aha:urls set.
+
+        Args:
+            aha (s_aha.AhaCell): Aha cell.
+            svcname (str): Service name.
+            ctor: Service class to add.
+            conf (dict): Optional service conf.
+            dirn (str): Optional directory.
+            provinfo (dict): Optional provisioning info.
+
+        Notes:
+            The config data for the cell is pushed into dirn/cell.yaml.
+            The cells are created with the ``ctor.anit()`` function.
+        '''
+        ahanetw = aha.conf.req('aha:network')
+        svcfull = f'{svcname}.{ahanetw}'
+        onetime = await aha.addAhaSvcProv(svcname, provinfo=provinfo)
+
+        conf = self.getCellConf(conf=conf)
+        conf['aha:provision'] = onetime
+
+        waiter = aha.waiter(1, f'aha:svcadd:{svcfull}')
+        with self.mayTestDir(dirn) as dirn:
+            s_common.yamlsave(conf, dirn, 'cell.yaml')
+            async with await ctor.anit(dirn) as svc:
+                self.true(await waiter.wait(timeout=12))
+                yield svc
 
     async def addSvcToCore(self, svc, core, svcname='svc'):
         '''
@@ -1289,14 +1706,17 @@ class SynTest(unittest.TestCase):
         return s_telepath.openurl(f'tcp:///{name}', **kwargs)
 
     @contextlib.contextmanager
-    def getTestDir(self, mirror=None, copyfrom=None, chdir=False, startdir=None):
+    def getTestDir(self, mirror=None, copyfrom=None, chdir=False, startdir=None) -> contextlib.AbstractContextManager[str, None, None]:
         '''
         Get a temporary directory for test purposes.
         This destroys the directory afterwards.
 
         Args:
-            mirror (str): A directory to mirror into the test directory.
-            startdir (str): The directory under which to place the temporary kdirectory
+            mirror (str): A Synapse test directory to mirror into the test directory.
+            copyfrom (str): An arbitrary directory to copy into the test directory.
+            chdir (boolean): If true, chdir the current process to that directory. This is undone when the context
+                             manager exits.
+            startdir (str): The directory under which to place the temporary directory
 
         Notes:
             The mirror argument is normally used to mirror test directory
@@ -1344,166 +1764,29 @@ class SynTest(unittest.TestCase):
         return os.path.join(path, 'files', *names)
 
     @contextlib.contextmanager
-    def getLoggerStream(self, logname, mesg=''):
-        '''
-        Get a logger and attach a io.StringIO object to the logger to capture log messages.
+    def getLoggerStream(self, name, struct=True):
 
-        Args:
-            logname (str): Name of the logger to get.
-            mesg (str): A string which, if provided, sets the StreamEvent event if a message
-            containing the string is written to the log.
-
-        Examples:
-            Do an action and get the stream of log messages to check against::
-
-                with self.getLoggerStream('synapse.foo.bar') as stream:
-                    # Do something that triggers a log message
-                    doSomething()
-
-                stream.seek(0)
-                mesgs = stream.read()
-                # Do something with messages
-
-            Do an action and wait for a specific log message to be written::
-
-                with self.getLoggerStream('synapse.foo.bar', 'big badda boom happened') as stream:
-                    # Do something that triggers a log message
-                    doSomething()
-                    stream.wait(timeout=10)  # Wait for the mesg to be written to the stream
-
-                stream.seek(0)
-                mesgs = stream.read()
-                # Do something with messages
-
-            You can also reset the message and wait for another message to occur::
-
-                with self.getLoggerStream('synapse.foo.bar', 'big badda boom happened') as stream:
-                    # Do something that triggers a log message
-                    doSomething()
-                    stream.wait(timeout=10)
-                    stream.setMesg('yo dawg')  # This will now wait for the 'yo dawg' string to be written.
-                    stream.wait(timeout=10)
-
-                stream.seek(0)
-                mesgs = stream.read()
-                # Do something with messages
-
-        Notes:
-            This **only** captures logs for the current process.
-
-        Yields:
-            StreamEvent: A StreamEvent object
-        '''
-        stream = StreamEvent()
-        stream.setMesg(mesg)
+        stream = LoggerStream()
+        logger = logging.getLogger(name)
         handler = logging.StreamHandler(stream)
-        slogger = logging.getLogger(logname)
-        slogger.addHandler(handler)
-        level = slogger.level
-        slogger.setLevel('DEBUG')
+
+        oldlevel = logger.level
+
+        fmtclass = s_logging.JsonFormatter
+        if not struct:
+            fmtclass = s_logging.TextFormatter
+
+        handler.setFormatter(fmtclass())
+        logger.setLevel(logging.DEBUG)
+
+        logger.addHandler(handler)
         try:
             yield stream
-        except Exception:  # pragma: no cover
+        except Exception: # pragma: no cover
             raise
         finally:
-            slogger.removeHandler(handler)
-            slogger.setLevel(level)
-
-    @contextlib.contextmanager
-    def getAsyncLoggerStream(self, logname, mesg=''):
-        '''
-        Async version of getLoggerStream.
-
-        Args:
-            logname (str): Name of the logger to get.
-            mesg (str): A string which, if provided, sets the StreamEvent event if a message
-            containing the string is written to the log.
-
-        Notes:
-            The event object mixed in for the AsyncStreamEvent is a asyncio.Event object.
-            This requires the user to await the Event specific calls as neccesary.
-
-        Examples:
-            Do an action and wait for a specific log message to be written::
-
-                with self.getAsyncLoggerStream('synapse.foo.bar',
-                                               'big badda boom happened') as stream:
-                    # Do something that triggers a log message
-                    await doSomething()
-                    # Wait for the mesg to be written to the stream
-                    await stream.wait(timeout=10)
-
-                stream.seek(0)
-                mesgs = stream.read()
-                # Do something with messages
-
-        Returns:
-            AsyncStreamEvent: An AsyncStreamEvent object.
-        '''
-        stream = AsyncStreamEvent()
-        stream.setMesg(mesg)
-        handler = logging.StreamHandler(stream)
-        slogger = logging.getLogger(logname)
-        slogger.addHandler(handler)
-        level = slogger.level
-        slogger.setLevel('DEBUG')
-        try:
-            yield stream
-        except Exception:  # pragma: no cover
-            raise
-        finally:
-            slogger.removeHandler(handler)
-            slogger.setLevel(level)
-
-    @contextlib.contextmanager
-    def getStructuredAsyncLoggerStream(self, logname, mesg=''):
-        '''
-        Async version of getLoggerStream which uses structured logging.
-
-        Args:
-            logname (str): Name of the logger to get.
-            mesg (str): A string which, if provided, sets the StreamEvent event if a message
-            containing the string is written to the log.
-
-        Notes:
-            The event object mixed in for the AsyncStreamEvent is a asyncio.Event object.
-            This requires the user to await the Event specific calls as needed.
-            The messages written to the stream will be JSON lines.
-
-        Examples:
-            Do an action and wait for a specific log message to be written::
-
-                with self.getStructuredAsyncLoggerStream('synapse.foo.bar',
-                                                         '"some JSON string"') as stream:
-                    # Do something that triggers a log message
-                    await doSomething()
-                    # Wait for the mesg to be written to the stream
-                    await stream.wait(timeout=10)
-
-                data = stream.getvalue()
-                raw_mesgs = [m for m in data.split('\n') if m]
-                msgs = [json.loads(m) for m in raw_mesgs]
-                # Do something with messages
-
-        Returns:
-            AsyncStreamEvent: An AsyncStreamEvent object.
-        '''
-        stream = AsyncStreamEvent()
-        stream.setMesg(mesg)
-        handler = logging.StreamHandler(stream)
-        slogger = logging.getLogger(logname)
-        formatter = s_structlog.JsonFormatter()
-        handler.setFormatter(formatter)
-        slogger.addHandler(handler)
-        level = slogger.level
-        slogger.setLevel('DEBUG')
-        try:
-            yield stream
-        except Exception:  # pragma: no cover
-            raise
-        finally:
-            slogger.removeHandler(handler)
-            slogger.setLevel(level)
+            logger.setLevel(oldlevel)
+            logger.removeHandler(handler)
 
     @contextlib.asynccontextmanager
     async def getHttpSess(self, auth=None, port=None):
@@ -1612,15 +1895,18 @@ class SynTest(unittest.TestCase):
             new_stdin(file-like object):  file-like object.
 
         Examples:
-            inp = io.StringIO('stdin stuff\nanother line\n')
-            with self.redirectStdin(inp):
-                main()
+            Patch stdin with a string buffer::
 
-            Here's a way to use this for code that's expecting the stdin buffer to have bytes.
-            inp = Mock()
-            inp.buffer = io.BytesIO(b'input data')
-            with self.redirectStdin(inp):
-                main()
+                inp = io.StringIO('stdin stuff\\nanother line\\n')
+                with self.redirectStdin(inp):
+                    main()
+
+            Here's a way to use this for code that's expecting the stdin buffer to have bytes::
+
+                inp = Mock()
+                inp.buffer = io.BytesIO(b'input data')
+                with self.redirectStdin(inp):
+                    main()
 
         Returns:
             None
@@ -1654,11 +1940,15 @@ class SynTest(unittest.TestCase):
         '''
         Helper to validate that an async generator will throw an exception.
 
+        Deprecated and will be removed on 2026-12-31. Use ``with self.raises(exc): await alist(genr)`` instead.
+
         Args:
             exc: Exception class to catch
             gfunc: async Generator
         '''
-        await self.asyncraises(exc, alist(gfunc))
+        s_common.deprdate('SynTest.agenraises()', '2026-12-31')
+        with self.raises(exc):
+            await alist(gfunc)
 
     @contextlib.contextmanager
     def setSynDir(self, dirn):
@@ -1751,6 +2041,7 @@ class SynTest(unittest.TestCase):
         Assert X is not None
         '''
         self.assertIsNotNone(x, msg=msg)
+        return x
 
     def none(self, x, msg=None):
         '''
@@ -1772,14 +2063,20 @@ class SynTest(unittest.TestCase):
         return self.assertRaises(*args, **kwargs)
 
     async def asyncraises(self, exc, coro):
+        '''
+        Assert a coroutine raises an exception.
+
+        Deprecated and will be removed on 2026-12-31. Use ``with self.raises(exc): await coro`` instead.
+        '''
+        s_common.deprdate('SynTest.asyncraises()', '2026-12-31')
         with self.assertRaises(exc):
             await coro
 
-    def sorteq(self, x, y, msg=None):
+    def sorteq(self, x, y, msg=None, key=None):
         '''
         Assert two sorted sequences are the same.
         '''
-        return self.eq(sorted(x), sorted(y), msg=msg)
+        return self.eq(sorted(x, key=key), sorted(y, key=key), msg=msg)
 
     def isinstance(self, obj, cls, msg=None):
         '''
@@ -1847,7 +2144,7 @@ class SynTest(unittest.TestCase):
             count += 1
         self.eq(x, count, msg=msg)
 
-    def stormIsInPrint(self, mesg, mesgs):
+    def stormIsInPrint(self, mesg, mesgs, deguid=False, whitespace=True):
         '''
         Check if a string is present in all of the print messages from a stream of storm messages.
 
@@ -1855,7 +2152,17 @@ class SynTest(unittest.TestCase):
             mesg (str): A string to check.
             mesgs (list): A list of storm messages.
         '''
+        if deguid:
+            mesg = deguidify(mesg)
+
         print_str = '\n'.join([m[1].get('mesg') for m in mesgs if m[0] == 'print'])
+        if not whitespace:
+            mesg = ' '.join(mesg.split())
+            print_str = ' '.join(print_str.split())
+
+        if deguid:
+            print_str = deguidify(print_str)
+
         self.isin(mesg, print_str)
 
     def stormNotInPrint(self, mesg, mesgs):
@@ -1880,6 +2187,17 @@ class SynTest(unittest.TestCase):
         print_str = '\n'.join([m[1].get('mesg') for m in mesgs if m[0] == 'warn'])
         self.isin(mesg, print_str)
 
+    def stormNotInWarn(self, mesg, mesgs):
+        '''
+        Assert a string is not present in all of the warn messages from a stream of storm messages.
+
+        Args:
+            mesg (str): A string to check.
+            mesgs (list): A list of storm messages.
+        '''
+        print_str = '\n'.join([m[1].get('mesg') for m in mesgs if m[0] == 'warn'])
+        self.notin(mesg, print_str)
+
     def stormIsInErr(self, mesg, mesgs):
         '''
         Check if a string is present in all of the error messages from a stream of storm messages.
@@ -1891,17 +2209,39 @@ class SynTest(unittest.TestCase):
         print_str = '\n'.join([m[1][1].get('mesg', '') for m in mesgs if m[0] == 'err'])
         self.isin(mesg, print_str)
 
+    def stormHasNoErr(self, mesgs):
+        '''
+        Raise an AssertionError if there is a message of type "err" in the list.
+
+        Args:
+            mesgs (list): A list of storm messages.
+        '''
+        for mesg in mesgs:
+            if mesg[0] == 'err':
+                self.fail(f'storm err mesg found: {mesg}')
+
+    def stormHasNoWarnErr(self, mesgs):
+        '''
+        Raise an AssertionError if there is a message of type "err" or "warn" in the list.
+
+        Args:
+            mesgs (list): A list of storm messages.
+        '''
+        for mesg in mesgs:
+            if mesg[0] in ('err', 'warn'):
+                self.fail(f'storm err/warn mesg found: {mesg}')
+
     def istufo(self, obj):
         '''
         Check to see if an object is a tufo.
 
         Args:
-            obj (object): Object being inspected. This is validated to be a
-            tuple of length two, containing a str or None as the first value,
-            and a dict as the second value.
+            obj (object): Object being inspected.
 
         Notes:
             This does not make any assumptions about the contents of the dictionary.
+            This validates the object to be a tuple of length two, containing a str
+            or None as the first value, and a dict as the second value.
 
         Returns:
             None
@@ -1967,64 +2307,8 @@ class SynTest(unittest.TestCase):
 
         async with await s_lmdbslab.Slab.anit(dirn, map_size=map_size) as slab:
 
-            nexsroot = await s_nexus.NexsRoot.anit(dirn)
-            await nexsroot.startup(None)
-
-            async with await s_hive.SlabHive.anit(slab, nexsroot=nexsroot) as hive:
-                hive.onfini(nexsroot.fini)
+            async with await s_hive.SlabHive.anit(slab) as hive:
                 yield hive
-
-    @contextlib.asynccontextmanager
-    async def getTestHiveDmon(self):
-        with self.getTestDir() as dirn:
-            async with self.getTestHiveFromDirn(dirn) as hive:
-                async with self.getTestDmon() as dmon:
-                    dmon.share('hive', hive)
-                    yield dmon
-
-    @contextlib.asynccontextmanager
-    async def getTestTeleHive(self):
-
-        async with self.getTestHiveDmon() as dmon:
-
-            turl = self.getTestUrl(dmon, 'hive')
-
-            async with await s_hive.openurl(turl) as hive:
-
-                yield hive
-
-    def stablebuid(self, valu=None):
-        '''
-        A stable buid generation for testing purposes
-        '''
-        if valu is None:
-            retn = self._NextBuid.to_bytes(32, 'big')
-            self._NextBuid += 1
-            return retn
-
-        byts = s_msgpack.en(valu)
-        return hashlib.sha256(byts).digest()
-
-    def stableguid(self, valu=None):
-        '''
-        A stable guid generation for testing purposes
-        '''
-        if valu is None:
-            retn = s_common.ehex(self._NextGuid.to_bytes(16, 'big'))
-            self._NextGuid += 1
-            return retn
-
-        byts = s_msgpack.en(valu)
-        return hashlib.md5(byts).hexdigest()
-
-    @contextlib.contextmanager
-    def withStableUids(self):
-        '''
-        A context manager that generates guids and buids in sequence so that successive test runs use the same
-        data
-        '''
-        with mock.patch('synapse.common.guid', self.stableguid), mock.patch('synapse.common.buid', self.stablebuid):
-            yield
 
     async def runCoreNodes(self, core, query, opts=None):
         '''
@@ -2033,3 +2317,54 @@ class SynTest(unittest.TestCase):
         async def coro():
             return await core.nodes(query, opts)
         return await core.schedCoro(coro())
+
+ONLOAD_TIMEOUT = int(os.getenv('SYNDEV_PKG_LOAD_TIMEOUT', 30))  # seconds
+
+class StormPkgTest(SynTest):
+
+    vcr = None
+    assetdir = None
+    pkgprotos = ()
+
+    @contextlib.asynccontextmanager
+    async def getTestCore(self, conf=None, dirn=None, prepkghook=None):
+
+        async with SynTest.getTestCore(self, conf=None, dirn=None) as core:
+
+            if prepkghook is not None:
+                await prepkghook(core)
+
+            for pkgproto in self.pkgprotos:
+
+                pkgdef = s_genpkg.loadPkgProto(pkgproto, no_docs=True, readonly=True)
+                pkgname = pkgdef.get('name')
+
+                load_event = asyncio.Event()
+
+                async def func(event):
+                    if event[1].get('pkg') == pkgname:
+                        load_event.set()
+
+                with core.onWith('core:pkg:onload:complete', func):
+                    await core.addStormPkg(pkgdef)
+                    self.nn(await asyncio.wait_for(load_event.wait(), timeout=ONLOAD_TIMEOUT),
+                            f'Package onload failed to run for {pkgname}')
+
+            if self.assetdir is not None:
+
+                if self.vcr is None:
+                    self.vcr = vcr.VCR()
+
+                assetdir = s_common.gendir(self.assetdir)
+                vcrname = f'{self.__class__.__name__}.{self._testMethodName}.yaml'
+                cass = self.vcr.use_cassette(s_common.genpath(assetdir, vcrname))
+                await core.enter_context(cass)
+
+            await self.initTestCore(core)
+            yield core
+
+    async def initTestCore(self, core):
+        '''
+        This is executed after the package has been loaded and a VCR context has been entered.
+        '''
+        pass

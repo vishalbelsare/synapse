@@ -27,8 +27,7 @@ class UnivServerTest(s_t_utils.SynTest):
                 async with await s_s_univ.main(argv) as core:
 
                     async with await s_telepath.openurl(f'cell://{dirn}') as proxy:
-                        podes = await s_t_utils.alist(proxy.eval(f'[ou:org={guid}]'))
-                        self.len(1, podes)
+                        self.eq(1, await proxy.count(f'[ou:org={guid}]'))
                         self.eq('cortex', await proxy.getCellType())
 
                     self.true(core.dmon.shared.get('univtest') is core)
@@ -42,8 +41,7 @@ class UnivServerTest(s_t_utils.SynTest):
                 ]
                 async with await s_cortex.Cortex.initFromArgv(argv) as core:
                     async with await s_telepath.openurl(f'cell://{dirn}') as proxy:
-                        podes = await s_t_utils.alist(proxy.eval(f'ou:org={guid}'))
-                        self.len(1, podes)
+                        self.eq(1, await proxy.count(f'ou:org={guid}'))
 
                 argv = [
                     'synapse.lib.cell.Cell',
@@ -57,18 +55,6 @@ class UnivServerTest(s_t_utils.SynTest):
                 async with await s_s_univ.main(argv) as cell:
                     async with await s_telepath.openurl(f'cell://{dirn}') as proxy:
                         self.eq('cell', await proxy.getCellType())
-
-                argv = [
-                    'synapse.tests.test_lib_cell.EchoAuth',
-                    '--telepath', 'tcp://127.0.0.1:0/',
-                    '--https', '0',
-                    '--name', 'univtest',
-                    dirn,
-                ]
-                # Or start the Cortex off a a EchoAuth (don't do this in practice...)
-                async with await s_s_univ.main(argv) as cell:
-                    async with await s_telepath.openurl(f'cell://{dirn}') as proxy:
-                        self.eq('echoauth', await proxy.getCellType())
 
                 argv = ['synapse.lib.newp.Newp']
                 with self.raises(s_exc.NoSuchCtor):

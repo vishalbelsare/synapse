@@ -1,11 +1,11 @@
 import logging
-import ipaddress
-
 
 import synapse.exc as s_exc
+import synapse.common as s_common
 
 import synapse.lib.stormtypes as s_stormtypes
 
+ipaddress = s_common.ipaddress
 logger = logging.getLogger(__name__)
 
 @s_stormtypes.registry.registerLib
@@ -39,6 +39,7 @@ class LibIpv6(s_stormtypes.Lib):
             'expand': self._expand,
         }
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _expand(self, valu):
         valu = await s_stormtypes.tostr(valu)
         valu = valu.strip()

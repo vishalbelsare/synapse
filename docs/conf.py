@@ -13,16 +13,35 @@
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
 import os
+import re
 import sys
+import datetime
 sys.path.insert(0, os.path.abspath('..'))
 
 import synapse
 
+# -- Warning Filter Configuration --------------------------------------------
+
+# List of warning patterns to ignore
+WARNINGS_IGNORE = [
+    r'Detected \d+ deprecated properties unlocked and not in use',
+    r'Sysctl values different than expected',
+    r'The form edge:refs is deprecated or using a deprecated type',
+    r'The form edge:has is deprecated or using a deprecated type',
+    r'The property media:news:author is deprecated or using a deprecated type', # storm_ref_automation Cron Example
+    r'The type [a-z:]+ field [a-z:]+ uses a deprecated type [a-z:]+.',
+    r'Caught SIGTERM, shutting down\.',
+]
+
+# List of warning patterns to convert to errors
+WARNINGS_ERROR = [
+    r'.* is deprecated or using a deprecated type',
+]
 
 # -- Project information -----------------------------------------------------
 
 project = 'Synapse'
-copyright = '2021, The Vertex Project'
+copyright = f'{datetime.datetime.now().year}, The Vertex Project, LLC'
 author = 'The Vertex Project'
 
 # The short X.Y version
@@ -44,6 +63,7 @@ extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.napoleon',
     'sphinx.ext.viewcode',
+    'sphinxcontrib.jquery',
     'notfound.extension',
 ]
 
@@ -64,7 +84,7 @@ master_doc = 'index'
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = 'en'
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -95,7 +115,9 @@ html_favicon = "_static/favicon.svg"
 # further.  For a list of options available for each theme, see the
 # documentation.
 #
-# html_theme_options = {}
+html_theme_options = {
+    'navigation_depth': 5,
+}
 
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
@@ -190,12 +212,24 @@ epub_exclude_files = ['search.html']
 
 # -- Extension configuration -------------------------------------------------
 
+# Define the canonical URL if you are using a custom domain on Read the Docs
+html_baseurl = os.environ.get("READTHEDOCS_CANONICAL_URL", "")
+
+# Tell Jinja2 templates the build is running on Read the Docs
+if os.environ.get("READTHEDOCS", "") == "True":
+    if "html_context" not in globals():
+        html_context = {}
+    html_context["READTHEDOCS"] = True
+
 # Our magic
 def run_apidoc(_):
     from sphinx.ext.apidoc import main
 
     args = ['-M', '--no-toc', '-o', './synapse/autodocs', '../synapse', ]
-    ignores = ['../synapse/tests', '../synapse/vendor']
+    ignores = ['../synapse/tests/test_*',
+               '../synapse/tests/files',
+               '../synapse/tests/nopmod',
+               '../synapse/vendor']
     args.extend(ignores)
     main(args)
 
@@ -205,7 +239,7 @@ def run_modeldoc(_):
     abssynf = os.path.abspath(synapse.__file__)
     synbd = os.path.split(abssynf)[0]  # Split off __init__
     synpd = os.path.split(synbd)[0]  # split off the synapse module directory
-    args = ['python', '-m', 'synapse.tools.autodoc', '--doc-model',
+    args = ['python', '-m', 'synapse.tools.utils.autodoc', '--doc-model',
             '--savedir', './docs/synapse/autodocs']
     subprocess.run(args, cwd=synpd)
 
@@ -215,15 +249,13 @@ def run_confdocs(_):
     abssynf = os.path.abspath(synapse.__file__)
     synbd = os.path.split(abssynf)[0]  # Split off __init__
     synpd = os.path.split(synbd)[0]  # split off the synapse module directory
-    baseargs = ['python', '-m', 'synapse.tools.autodoc', '--savedir',
+    baseargs = ['python', '-m', 'synapse.tools.utils.autodoc', '--savedir',
                 './docs/synapse/autodocs', '--doc-conf']
     svcargs = (
         ('synapse.axon.Axon',),
         ('synapse.cortex.Cortex',),
         ('synapse.lib.aha.AhaCell', ),
         ('synapse.lib.jsonstor.JsonStorCell', ),
-        # TODO For now lets leave this off...
-        # ('synapse.cryotank.CryoCell',),
     )
     for args in svcargs:
         argv = baseargs.copy()
@@ -236,30 +268,10 @@ def run_stormtypes(_):
     abssynf = os.path.abspath(synapse.__file__)
     synbd = os.path.split(abssynf)[0]  # Split off __init__
     synpd = os.path.split(synbd)[0]  # split off the synapse module directory
-    args = ['python', '-m', 'synapse.tools.autodoc', '--doc-stormtypes',
+    args = ['python', '-m', 'synapse.tools.utils.autodoc', '--doc-stormtypes',
             '--savedir', './docs/synapse/autodocs']
     r = subprocess.run(args, cwd=synpd)
     assert r.returncode == 0, f'Failed to convert stormtypes.'
-
-def convert_ipynb(_):
-    import synapse.common as s_common
-    import nbconvert.nbconvertapp as nba
-    cwd = os.getcwd()
-    for fdir, dirs, fns in os.walk(cwd):
-        if '.ipynb_checkpoints' in dirs:
-            dirs.remove('.ipynb_checkpoints')
-        for fn in fns:
-            if fn.endswith('.ipynb'):
-                # if 'httpapi' not in fn:
-                #     continue
-                tick = s_common.now()
-                fp = os.path.join(fdir, fn)
-                args = ['--execute', '--template', './vertex.tpl', '--to', 'rst', fp]
-                nba.main(args)
-                tock = s_common.now()
-                took = (tock - tick) / 1000
-                print(f'convert_ipynb: Notebook {fn} execution took {took} seconds.')
-
 
 def convert_rstorm(_):
     import subprocess
@@ -270,6 +282,20 @@ def convert_rstorm(_):
     synbd = os.path.split(abssynf)[0]  # Split off __init__
     synpd = os.path.split(synbd)[0]  # split off the synapse module directory
     env = {**os.environ, 'SYN_LOG_LEVEL': 'DEBUG'}
+
+    def check_output_for_warnings(output):
+        for line in output.splitlines():
+            if '[WARNING]' in line:
+                msg = line.split('[WARNING]', 1)[1].strip()
+                for pattern in WARNINGS_IGNORE:
+                    if re.search(pattern, msg):
+                        break
+                else:
+                    for pattern in WARNINGS_ERROR:
+                        if re.search(pattern, msg):
+                            raise RuntimeError(f"Warning converted to error: {msg}")
+                        else: # Unhandled warnings
+                            raise RuntimeError(f"Unhandled warning found: {msg}")
 
     cwd = os.getcwd()
     for fdir, dirs, fns in os.walk(cwd):
@@ -283,9 +309,19 @@ def convert_rstorm(_):
 
                 tick = s_common.now()
 
-                args = ['python', '-m', 'synapse.tools.rstorm', '--save', ofile, sfile]
-                r = subprocess.run(args, cwd=synpd, env=env)
-                assert r.returncode == 0, f'Failed to convert {sfile}'
+                args = ['python', '-m', 'synapse.tools.utils.rstorm', '--save', ofile, sfile]
+                result = subprocess.run(args, cwd=synpd, env=env, capture_output=True, text=True)
+
+                if result.stdout:
+                    print(result.stdout, end='')
+                    check_output_for_warnings(result.stdout)
+
+                if result.stderr:
+                    print(result.stderr, end='')
+                    check_output_for_warnings(result.stderr)
+
+                if result.returncode != 0:
+                    raise RuntimeError(f'Failed to convert {sfile}: {result.stderr}')
 
                 tock = s_common.now()
                 took = (tock - tick) / 1000
@@ -295,6 +331,5 @@ def setup(app):
     app.connect('builder-inited', run_apidoc)
     app.connect('builder-inited', run_modeldoc)
     app.connect('builder-inited', run_confdocs)
-    app.connect('builder-inited', convert_ipynb)
     app.connect('builder-inited', convert_rstorm)
     app.connect('builder-inited', run_stormtypes)

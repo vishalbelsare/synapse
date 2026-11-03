@@ -1,9 +1,10 @@
 import io
-import json
 
 import msgpack
 
 import unittest.mock as mock
+
+import synapse.exc as s_exc
 
 import synapse.lib.msgpack as s_msgpack
 import synapse.tests.utils as s_t_utils
@@ -34,7 +35,7 @@ class CryoCatTest(s_t_utils.SynTest):
             argv = ['--ingest', '--jsonl', cryourl]
             inp = io.StringIO('{"foo: "bar"}\n[]\n')
             with self.redirectStdin(inp):
-                with self.raises(json.decoder.JSONDecodeError):
+                with self.raises(s_exc.BadJsonText):
                     retn, outp = await self.execToolMain(s_cryocat.main, argv)
 
             # Happy path msgpack ingest
@@ -74,7 +75,7 @@ class CryoCatTest(s_t_utils.SynTest):
 
             argv = ['--offset', '0', '--jsonl', '--size', '2', '--omit-offset', cryourl]
             retn, outp = await self.execToolMain(s_cryocat.main, argv)
-            self.true(outp.expect('[null, {"key": 0}]\n[null, {"key": 1}]\n'))
+            self.true(outp.expect('[null,{"key":0}]\n[null,{"key":1}]\n'))
 
             argv = ['--offset', '0', '--size', '20', cryourl]
             retn, outp = await self.execToolMain(s_cryocat.main, argv)
@@ -92,14 +93,9 @@ class CryoCatTest(s_t_utils.SynTest):
             stdout.buffer = io.BytesIO()
 
             with mock.patch('sys.stdout', stdout):
-                with self.getLoggerStream('synapse.tools.cryo.cat') as stream:
-                    argv = ['--verbose', '--msgpack', '--size', '20', cryourl]
-                    retn, _ = await self.execToolMain(s_cryocat.main, argv)
-                    self.eq(0, retn)
-
-                stream.seek(0)
-                mesgs = stream.read()
-                self.isin(f'connecting to: {cryourl}', mesgs)
+                argv = ['--msgpack', '--size', '20', cryourl]
+                retn, _ = await self.execToolMain(s_cryocat.main, argv)
+                self.eq(0, retn)
 
             stdout.buffer.seek(0)
             outdata = list(msgpack.Unpacker(stdout.buffer, raw=False, use_list=False))

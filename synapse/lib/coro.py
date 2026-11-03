@@ -1,15 +1,11 @@
 '''
 Async/Coroutine related utilities.
 '''
-import os
-import queue
-import atexit
 import asyncio
 import inspect
 import logging
 import functools
-import multiprocessing
-import concurrent.futures
+import contextlib
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +25,39 @@ async def agen(item):
         non-blocking IO; otherwise that IO will block the ioloop.
     '''
     if getattr(item, '__aiter__', None) is not None:
-        async for x in item:
-            yield x
+        async with contextlib.aclosing(item) as agen:
+            async for x in agen:
+                yield x
         return
 
     for x in item:
         yield x
+
+async def chunks(genr, size=100):
+
+    retn = []
+    async for item in genr:
+
+        retn.append(item)
+
+        if len(retn) == size:
+            yield retn
+            retn = []
+
+    if retn:
+        yield retn
+
+async def pause(genr, iterations=10):
+    idx = 0
+
+    async for out in agen(genr):
+        yield out
+        idx += 1
+
+        if idx % iterations == 0:
+            await asyncio.sleep(0)
+
+    return
 
 def executor(func, *args, **kwargs):
     '''
@@ -75,7 +98,7 @@ class Event(asyncio.Event):
             return True
 
         try:
-            await asyncio.wait_for(self.wait(), timeout)
+            await s_common.wait_for(self.wait(), timeout)
         except asyncio.TimeoutError:
             return False
 
@@ -93,7 +116,7 @@ async def event_wait(event: asyncio.Event, timeout=None):
         return True
 
     try:
-        await asyncio.wait_for(event.wait(), timeout)
+        await s_common.wait_for(event.wait(), timeout)
     except asyncio.TimeoutError:
         return False
     return True
@@ -108,12 +131,50 @@ async def waittask(task, timeout=None):
     futu = asyncio.get_running_loop().create_future()
     task.add_done_callback(futu.set_result)
     try:
-        await asyncio.wait_for(futu, timeout=timeout)
+        await s_common.wait_for(futu, timeout=timeout)
         return True
     except asyncio.TimeoutError:
         return False
     finally:
         task.remove_done_callback(futu.set_result)
+
+def deadline(timeout):
+    '''
+    Return a callable that yields the seconds remaining until ``timeout``
+    seconds from now have elapsed.
+
+    The returned callable yields ``None`` if ``timeout`` is ``None``
+    (unbounded), otherwise ``max(0.0, <seconds until deadline>)``.
+
+    This is useful for sharing a single timeout across multiple awaited
+    operations.
+
+    Examples:
+
+        Share a single timeout across multiple operations::
+
+            remaining = s_coro.deadline(timeout)
+
+            await opOne(timeout=remaining())
+            await opTwo(timeout=remaining())
+
+    Notes:
+        Must be called from within a running event loop.
+    '''
+    if timeout is None:
+        return lambda: None
+
+    if timeout < 0:
+        mesg = f'timeout must be non-negative, got {timeout}.'
+        raise s_exc.BadArg(mesg=mesg)
+
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+
+    def remaining():
+        return max(0.0, end - loop.time())
+
+    return remaining
 
 async def ornot(func, *args, **kwargs):
     '''
@@ -132,6 +193,37 @@ async def ornot(func, *args, **kwargs):
     if iscoro(retn):
         return await retn
     return retn
+
+def has_running_loop():
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+bgtasks = set()
+def create_task(coro):
+
+    task = asyncio.get_running_loop().create_task(coro)
+    bgtasks.add(task)
+
+    def done(t):
+        bgtasks.remove(t)
+
+    task.add_done_callback(done)
+
+    return task
+
+async def await_bg_tasks(timeout=None):
+
+    if not bgtasks:
+        return []
+
+    coro = asyncio.gather(*tuple(bgtasks), return_exceptions=True)
+    try:
+        return await s_common.wait_for(coro, timeout)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        return []
 
 class GenrHelp:
 
@@ -171,108 +263,3 @@ def genrhelp(f):
     def func(*args, **kwargs):
         return GenrHelp(f(*args, **kwargs))
     return func
-
-def _exectodo(que, todo):
-    func, args, kwargs = todo
-    try:
-        que.put(func(*args, **kwargs))
-    except Exception as e:
-        que.put(e)
-
-async def spawn(todo, timeout=None, ctx=None):
-    '''
-    Run a todo (func, args, kwargs) tuple in a multiprocessing subprocess.
-
-    Args:
-        todo (tuple): A tuple of function, ``*args``, and ``**kwargs``.
-        timeout (int): The timeout to wait for the todo function to finish.
-        ctx (multiprocess.Context): A optional multiprocessing context object.
-
-    Notes:
-        The contents of the todo tuple must be able to be pickled for execution.
-        This means that locally bound functions are not eligible targets for spawn.
-
-    Returns:
-        The return value of executing the todo function.
-    '''
-    if ctx is None:
-        ctx = multiprocessing.get_context('spawn')
-
-    que = ctx.Queue()
-    proc = ctx.Process(target=_exectodo, args=(que, todo))
-
-    def execspawn():
-
-        proc.start()
-
-        while True:
-            try:
-                # we have to block/wait on the queue because the sender
-                # could need to stream the return value in multiple chunks
-                retn = que.get(timeout=1)
-                # now that we've retrieved the response, it should have exited.
-                proc.join()
-                return retn
-            except queue.Empty:
-                if not proc.is_alive():
-                    proc.join()
-                    raise s_exc.SpawnExit(code=proc.exitcode)
-
-    try:
-
-        coro = executor(execspawn)
-
-        retn = await asyncio.wait_for(coro, timeout=timeout)
-        if isinstance(retn, Exception):
-            raise retn
-
-        return retn
-
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        proc.terminate()
-        raise
-
-# shared process pool
-forkpool = None
-if multiprocessing.current_process().name == 'MainProcess':
-    # only create the forkpool in the MainProcess...
-    try:
-        mpctx = multiprocessing.get_context('forkserver')
-        max_workers = int(os.getenv('SYN_FORKED_WORKERS', 1))
-        forkpool = concurrent.futures.ProcessPoolExecutor(mp_context=mpctx, max_workers=max_workers)
-        atexit.register(forkpool.shutdown)
-    except OSError as e:  # pragma: no cover
-        logger.warning(f'Failed to init forkserver pool, fallback enabled: {e}', exc_info=True)
-
-def set_pool_logging(logger_, logconf):
-    # This must be called before any calls to forked()
-    todo = s_common.todo(s_common.setlogging, logger_, **logconf)
-    if forkpool is not None:
-        forkpool._initializer = _runtodo
-        forkpool._initargs = (todo,)
-
-def _runtodo(todo):
-    return todo[0](*todo[1], **todo[2])
-
-async def forked(func, *args, **kwargs):
-    '''
-    Execute a target function in the forked process pool.
-
-    Args:
-        func: The target function.
-        *args: Function positional arguments.
-        **kwargs: Function keyword arguments.
-
-    Returns:
-        The target function return.
-
-    Raises:
-        The function may raise from the target function, or raise a s_exc.FatalErr in the event of a broken forked
-        process pool. The fatalerr represents a unrecoverable application state.
-    '''
-    todo = (func, args, kwargs)
-    try:
-        return await asyncio.get_running_loop().run_in_executor(forkpool, _runtodo, todo)
-    except concurrent.futures.process.BrokenProcessPool as e:
-        logger.exception(f'Fatal error executing forked task: {func} {args} {kwargs}')
-        raise s_exc.FatalErr(mesg=f'Fatal error encountered: {e}') from None

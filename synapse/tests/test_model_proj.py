@@ -1,4 +1,5 @@
 import synapse.exc as s_exc
+import synapse.common as s_common
 import synapse.tests.utils as s_test
 
 class ProjModelTest(s_test.SynTest):
@@ -18,6 +19,13 @@ class ProjModelTest(s_test.SynTest):
             proj = await core.callStorm('return($lib.projects.add(foo, desc=bar))', opts=asvisi)
             self.nn(proj)
             self.len(1, await core.nodes('proj:project:desc=bar'))
+
+            nodes = await core.nodes('proj:project [ :type=foo.bar :platform={[ inet:service:platform=* ]} ]')
+            self.len(1, nodes)
+            self.nn(nodes[0].get('platform'))
+            self.eq('foo.bar.', nodes[0].get('type'))
+
+            self.len(1, await core.nodes('proj:project -> proj:project:type:taxonomy'))
 
             opts = {'user': visi.iden, 'vars': {'proj': proj}}
             with self.raises(s_exc.AuthDeny):
@@ -236,25 +244,28 @@ class ProjModelTest(s_test.SynTest):
             self.len(1, nodes)
             self.eq(proj, nodes[0].get('project'))
 
-            nodes = await core.nodes('proj:ticket')
+            nodes = await core.nodes('proj:ticket [ :ext:creator={[ps:contact=* :name=visi ]} :ext:assignee={[ps:contact=* :name=bob ]} ]')
             self.len(1, nodes)
             self.nn(nodes[0].get('creator'))
             self.nn(nodes[0].get('created'))
             self.nn(nodes[0].get('updated'))
             self.nn(nodes[0].get('assignee'))
+            self.nn(nodes[0].get('ext:creator'))
+            self.nn(nodes[0].get('ext:assignee'))
             self.eq(70, nodes[0].get('status'))
             self.eq(50, nodes[0].get('priority'))
             self.eq('done', nodes[0].repr('status'))
             self.eq('highest', nodes[0].repr('priority'))
             self.eq(proj, nodes[0].get('project'))
 
-            nodes = await core.nodes('proj:comment')
+            nodes = await core.nodes('proj:comment [ :ext:creator={[ps:contact=(visi,) :name=visi ]} ]')
             self.len(1, nodes)
             self.nn(nodes[0].get('created'))
             self.nn(nodes[0].get('updated'))
             self.eq(tick, nodes[0].get('ticket'))
             self.eq('hithere', nodes[0].get('text'))
             self.eq(visi.iden, nodes[0].get('creator'))
+            self.eq(s_common.guid(('visi',)), nodes[0].get('ext:creator'))
 
             self.eq('foo', await core.callStorm('return($lib.projects.get($proj).name)', opts=opts))
             self.eq('bar', await core.callStorm('return($lib.projects.get($proj).epics.get($epic).name)', opts=opts))
@@ -326,7 +337,7 @@ class ProjModelTest(s_test.SynTest):
             self.true(await core.callStorm('return($lib.projects.del($proj))', opts=opts))
             self.false(await core.callStorm('return($lib.projects.del(newp))', opts=opts))
 
-            self.none(core.auth.getAuthGate(proj))
+            self.nn(core.auth.getAuthGate(proj))
 
             self.len(1, await core.nodes('yield $lib.projects.add(proj)'))
             self.len(1, await core.nodes('yield $lib.projects.get(proj).epics.add(epic)'))
@@ -336,6 +347,16 @@ class ProjModelTest(s_test.SynTest):
 
             name = await core.callStorm('$p=$lib.projects.get(proj) $p.name=newproj return ( $p.name )')
             self.eq(name, 'newproj')
+
+            viewiden = core.getView().iden
+            self.len(1, await core.nodes(f'[ proj:project={viewiden}]'))
+            gate = core.auth.getAuthGate(viewiden)
+            self.eq(gate.type, 'view')
+
+            await core.nodes(f'proj:project={viewiden} | delnode')
+            gate = core.auth.getAuthGate(viewiden)
+            self.nn(gate)
+            self.eq(gate.type, 'view')
 
     async def test_model_proj_attachment(self):
 

@@ -22,8 +22,31 @@ class CryptoModule(s_module.CoreModule):
 
             'types': (
 
+                ('crypto:currency:chain', ('guid', {}), {
+                    'props': (
+
+                        # TODO: 3.0 this should become base:id
+                        ('id', ('str', {'strip': True}), {
+                            'ex': 'eip155:8453',
+                            'doc': 'An ID for the chain.'}),
+
+                        # TODO: 3.0 this should become base:name
+                        ('name', ('str', {'strip': True, 'lower': True}), {
+                            'ex': 'ethereum',
+                            'doc': 'The name of the chain.'}),
+
+                        # TODO: 3.0 this should become econ:currency
+                        ('symbol', ('crypto:currency:coin', {}), {
+                            'ex': 'eth',
+                            'doc': 'The symbol associated with the native currency of the chain.'}),
+                    ),
+                    'doc': 'A crypto currency chain.'}),
+
                 ('crypto:currency:transaction', ('guid', {}), {
                     'doc': 'An individual crypto currency transaction recorded on the blockchain.',
+                }),
+                ('crypto:currency:bridge:swap', ('guid', {}), {
+                    'doc': 'A cross-chain swap which bridges value between two transactions on different chains.',
                 }),
                 ('crypto:currency:block', ('comp', {'fields': (
                                                         ('coin', 'crypto:currency:coin'),
@@ -36,12 +59,47 @@ class CryptoModule(s_module.CoreModule):
                 }),
                 ('crypto:smart:effect:transfertoken', ('guid', {}), {
                     'doc': 'A smart contract effect which transfers ownership of a non-fungible token.',
+                    'interfaces': ('crypto:smart:effect',),
                 }),
                 ('crypto:smart:effect:transfertokens', ('guid', {}), {
                     'doc': 'A smart contract effect which transfers fungible tokens.',
+                    'interfaces': ('crypto:smart:effect',),
                 }),
                 ('crypto:smart:effect:edittokensupply', ('guid', {}), {
                     'doc': 'A smart contract effect which increases or decreases the supply of a fungible token.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:minttoken', ('guid', {}), {
+                    'doc': 'A smart contract effect which creates a new non-fungible token.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:burntoken', ('guid', {}), {
+                    'doc': 'A smart contract effect which destroys a non-fungible token.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:proxytoken', ('guid', {}), {
+                    'doc': 'A smart contract effect which grants a non-owner address the ability to manipulate a specific non-fungible token.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:proxytokenall', ('guid', {}), {
+                    'doc': 'A smart contract effect which grants a non-owner address the ability to manipulate all non-fungible tokens of the owner.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:proxytokens', ('guid', {}), {
+                    'doc': 'A smart contract effect which grants a non-owner address the ability to manipulate fungible tokens.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:freeze', ('guid', {}), {
+                    'doc': 'A smart contract effect which freezes or unfreezes an address on an issuer blocklist.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:seize', ('guid', {}), {
+                    'doc': 'A smart contract effect which destroys the tokens held by an address.',
+                    'interfaces': ('crypto:smart:effect',),
+                }),
+                ('crypto:smart:effect:swaptokens', ('guid', {}), {
+                    'doc': 'A smart contract effect which swaps one token or currency for another.',
+                    'interfaces': ('crypto:smart:effect',),
                 }),
                 # TODO crypto:smart:effect:call - call another smart contract
                 # TODO crypto:smart:effect:giveproxy - grant your proxy for a token based vote
@@ -51,6 +109,9 @@ class CryptoModule(s_module.CoreModule):
                 ('crypto:payment:output', ('guid', {}), {
                     'doc': 'A payment received from a transaction.',
                 }),
+                ('crypto:payment:fee', ('guid', {}), {
+                    'doc': 'A fee paid to execute a transaction.',
+                }),
                 ('crypto:smart:token', ('comp', {'fields': (('contract', 'crypto:smart:contract'), ('tokenid', 'hugenum'))}), {
                     'doc': 'A token managed by a smart contract.',
                 }),
@@ -59,6 +120,11 @@ class CryptoModule(s_module.CoreModule):
                     'ex': 'btc',
                 }),
                 ('crypto:currency:address', ('comp', {'fields': (('coin', 'crypto:currency:coin'), ('iden', 'str')), 'sepr': '/'}), {
+
+                    'interfaces': ('econ:pay:instrument',),
+                    'template': {
+                        'instrument': 'crypto currency address'},
+
                     'doc': 'An individual crypto currency address.',
                     'ex': 'btc/1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2',
                 }),
@@ -98,6 +164,11 @@ class CryptoModule(s_module.CoreModule):
                     'doc': 'A hex encoded Microsoft Windows NTLM password hash.',
                     'ex': ex_md5
                 }),
+                ('hash:ssdeep', ('str', {'strip': True,
+                                         'regex': r'^([3-9]|[1-9]\d+):[A-Za-z0-9+/]{0,64}:[A-Za-z0-9+/]{0,64}$'}), {
+                    'doc': 'A fuzzy hash of a file in ssdeep format.',
+                    'ex': '98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLL:iglLlsHSfxVYVL',
+                }),
 
                 ('rsa:key', ('comp', {'fields': (('mod', 'hex'), ('pub:exp', 'int')), }), {
                     'doc': 'An RSA keypair modulus and public exponent.'
@@ -130,9 +201,28 @@ class CryptoModule(s_module.CoreModule):
                 }),
             ),
 
+            'interfaces': (
+                ('crypto:smart:effect', {
+                    'doc': 'Properties common to the effects of a crypto smart contract transaction.',
+                    'props': (
+                        ('index', ('int', {}), {
+                            'doc': 'The order of the effect within the effects of one transaction.'}),
+                        ('transaction', ('crypto:currency:transaction', {}), {
+                            'doc': 'The transaction where the smart contract was called.'}),
+                    ),
+                }),
+            ),
+
+            'edges': (
+                (('crypto:key', 'decrypts', 'file:bytes'), {
+                    'doc': 'The key is used to decrypt the file.'}),
+            ),
+
             'forms': (
 
                 ('crypto:payment:input', {}, (
+                    ('index', ('int', {}), {
+                        'doc': 'The index of this input in the array of inputs for the transaction.'}),
                     ('transaction', ('crypto:currency:transaction', {}), {
                         'doc': 'The transaction the payment was input to.'}),
                     ('address', ('crypto:currency:address', {}), {
@@ -141,12 +231,22 @@ class CryptoModule(s_module.CoreModule):
                         'doc': 'The value of the currency paid into the transaction.'}),
                 )),
                 ('crypto:payment:output', {}, (
+                    ('index', ('int', {}), {
+                        'doc': 'The index of this output in the array of outputs for the transaction.'}),
                     ('transaction', ('crypto:currency:transaction', {}), {
                         'doc': 'The transaction the payment was output from.'}),
                     ('address', ('crypto:currency:address', {}), {
                         'doc': 'The address which received payment from the transaction.'}),
                     ('value', ('econ:price', {}), {
-                        'doc': 'The value of the currency recieved from the transaction.'}),
+                        'doc': 'The value of the currency received from the transaction.'}),
+                )),
+                ('crypto:payment:fee', {}, (
+                    ('transaction', ('crypto:currency:transaction', {}), {
+                        'doc': 'The transaction the fee was paid for.'}),
+                    ('address', ('crypto:currency:address', {}), {
+                        'doc': 'The address which paid the fee.'}),
+                    ('value', ('econ:price', {}), {
+                        'doc': 'The value of the fee paid to execute the transaction.'}),
                 )),
                 ('crypto:currency:transaction', {}, (
                     ('hash', ('hex', {}), {
@@ -159,6 +259,8 @@ class CryptoModule(s_module.CoreModule):
                         'doc': 'The coin/blockchain of the block which records this transaction.'}),
                     ('block:offset', ('int', {}), {
                         'doc': 'The offset of the block which records this transaction.'}),
+                    ('block:chain', ('crypto:currency:chain', {}), {
+                        'doc': 'The chain where the transaction is recorded.'}),
 
                     ('success', ('bool', {}), {
                         'doc': 'Set to true if the transaction was successfully executed and recorded.'}),
@@ -198,6 +300,29 @@ class CryptoModule(s_module.CoreModule):
                     # TODO break out args/retvals and maybe make humon repr?
                 )),
 
+                ('crypto:currency:bridge:swap', {}, (
+                    ('name', ('str', {'strip': True}), {
+                        'doc': 'The name of the bridge protocol which executed the swap.'}),
+                    ('matched', ('bool', {}), {
+                        'doc': 'Set to true if the two transactions were matched together by an external observer.'}),
+                    ('source:transaction', ('crypto:currency:transaction', {}), {
+                        'doc': 'The transaction which sent the bridged value.'}),
+                    ('source:address', ('crypto:currency:address', {}), {
+                        'doc': 'The address which sent the bridged value.'}),
+                    ('source:contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the sent tokens. This is not set if the sent value was a native currency.'}),
+                    ('source:amount', ('hugenum', {}), {
+                        'doc': 'The amount of tokens or currency sent.'}),
+                    ('target:transaction', ('crypto:currency:transaction', {}), {
+                        'doc': 'The transaction which received the bridged value.'}),
+                    ('target:address', ('crypto:currency:address', {}), {
+                        'doc': 'The address which received the bridged value.'}),
+                    ('target:contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the received tokens. This is not set if the received value was a native currency.'}),
+                    ('target:amount', ('hugenum', {}), {
+                        'doc': 'The amount of tokens or currency received.'}),
+                )),
+
                 ('crypto:currency:block', {}, (
                     ('coin', ('crypto:currency:coin', {}), {
                         'doc': 'The coin/blockchain this block resides on.', 'ro': True, }),
@@ -209,6 +334,8 @@ class CryptoModule(s_module.CoreModule):
                         'doc': 'The address which mined the block.'}),
                     ('time', ('time', {}), {
                         'doc': 'Time timestamp embedded in the block by the miner.'}),
+                    ('chain', ('crypto:currency:chain', {}), {
+                        'doc': 'The chain where the block is recorded.'}),
                 )),
 
                 ('crypto:smart:contract', {}, (
@@ -251,8 +378,6 @@ class CryptoModule(s_module.CoreModule):
                 )),
 
                 ('crypto:smart:effect:transfertoken', {}, (
-                    ('transaction', ('crypto:currency:transaction', {}), {
-                        'doc': 'The transaction where the smart contract was called.'}),
                     ('token', ('crypto:smart:token', {}), {
                         'doc': 'The non-fungible token that was transferred.'}),
                     ('from', ('crypto:currency:address', {}), {
@@ -262,27 +387,97 @@ class CryptoModule(s_module.CoreModule):
                 )),
 
                 ('crypto:smart:effect:transfertokens', {}, (
-                    ('transaction', ('crypto:currency:transaction', {}), {
-                        'doc': 'The transaction where the smart contract was called.'}),
                     ('contract', ('crypto:smart:contract', {}), {
                         'doc': 'The contract which defines the tokens.'}),
                     ('from', ('crypto:currency:address', {}), {
-                        'doc': 'The address the NFT was transferred from.'}),
+                        'doc': 'The address the tokens were transferred from.'}),
                     ('to', ('crypto:currency:address', {}), {
-                        'doc': 'The address the NFT was transferred to.'}),
+                        'doc': 'The address the tokens were transferred to.'}),
                     ('amount', ('hugenum', {}), {
                         'doc': 'The number of tokens transferred.'}),
                 )),
 
                 ('crypto:smart:effect:edittokensupply', {}, (
-                    ('transaction', ('crypto:currency:transaction', {}), {
-                        'doc': 'The transaction where the smart contract was called.'}),
                     ('contract', ('crypto:smart:contract', {}), {
                         'doc': 'The contract which defines the tokens.'}),
                     ('amount', ('hugenum', {}), {
                         'doc': 'The number of tokens added or removed if negative.'}),
                     ('totalsupply', ('hugenum', {}), {
                         'doc': 'The total supply of tokens after this modification.'}),
+                )),
+
+                ('crypto:smart:effect:minttoken', {}, (
+                    ('token', ('crypto:smart:token', {}), {
+                        'doc': 'The non-fungible token that was created.'}),
+                )),
+
+                ('crypto:smart:effect:burntoken', {}, (
+                    ('token', ('crypto:smart:token', {}), {
+                        'doc': 'The non-fungible token that was destroyed.'}),
+                )),
+
+                ('crypto:smart:effect:proxytoken', {}, (
+                    ('owner', ('crypto:currency:address', {}), {
+                        'doc': 'The address granting proxy authority to manipulate non-fungible tokens.'}),
+                    ('proxy', ('crypto:currency:address', {}), {
+                        'doc': 'The address granted proxy authority to manipulate non-fungible tokens.'}),
+                    ('token', ('crypto:smart:token', {}), {
+                        'doc': 'The specific token being granted access to.'}),
+                )),
+
+                ('crypto:smart:effect:proxytokenall', {}, (
+                    ('contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the tokens.'}),
+                    ('owner', ('crypto:currency:address', {}), {
+                        'doc': 'The address granting/denying proxy authority to manipulate all non-fungible tokens of the owner.'}),
+                    ('proxy', ('crypto:currency:address', {}), {
+                        'doc': 'The address granted/denied proxy authority to manipulate all non-fungible tokens of the owner.'}),
+                    ('approval', ('bool', {}), {
+                        'doc': 'The approval status.'}),
+                )),
+
+                ('crypto:smart:effect:proxytokens', {}, (
+                    ('contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the tokens.'}),
+                    ('owner', ('crypto:currency:address', {}), {
+                        'doc': 'The address granting proxy authority to manipulate fungible tokens.'}),
+                    ('proxy', ('crypto:currency:address', {}), {
+                        'doc': 'The address granted proxy authority to manipulate fungible tokens.'}),
+                    ('amount', ('hex', {}), {
+                        'doc': 'The hex encoded amount of tokens the proxy is allowed to manipulate.'}),
+                )),
+
+                ('crypto:smart:effect:freeze', {}, (
+                    ('contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which enforces the freeze.'}),
+                    ('address', ('crypto:currency:address', {}), {
+                        'doc': 'The address which was frozen or unfrozen.'}),
+                    ('frozen', ('bool', {}), {
+                        'doc': 'Set to true if the address was frozen or false if it was unfrozen.'}),
+                )),
+
+                ('crypto:smart:effect:seize', {}, (
+                    ('contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the tokens.'}),
+                    ('address', ('crypto:currency:address', {}), {
+                        'doc': 'The address whose tokens were destroyed.'}),
+                    ('amount', ('hugenum', {}), {
+                        'doc': 'The amount of tokens destroyed.'}),
+                )),
+
+                ('crypto:smart:effect:swaptokens', {}, (
+                    ('contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The pool or router contract which executed the swap.'}),
+                    ('address', ('crypto:currency:address', {}), {
+                        'doc': 'The address which swapped the tokens.'}),
+                    ('sent:contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the sent tokens. This is not set if the sent value was a native currency.'}),
+                    ('sent:amount', ('hugenum', {}), {
+                        'doc': 'The amount of tokens or currency sent by the address.'}),
+                    ('received:contract', ('crypto:smart:contract', {}), {
+                        'doc': 'The contract which defines the received tokens. This is not set if the received value was a native currency.'}),
+                    ('received:amount', ('hugenum', {}), {
+                        'doc': 'The amount of tokens or currency received by the address.'}),
                 )),
 
                 ('crypto:currency:address', {}, (
@@ -294,22 +489,60 @@ class CryptoModule(s_module.CoreModule):
                         'doc': 'The coin specific address identifier.', 'ro': True, }),
                     ('desc', ('str', {}), {
                         'doc': 'A free-form description of the address.'}),
-                    ('contact', ('ps:contact', {}), {
-                        'doc': 'Contact information associated with the address.'}),
+                    ('chain', ('crypto:currency:chain', {}), {
+                        'doc': 'The chain where the address is defined.'}),
                 )),
 
                 ('crypto:algorithm', {}, ()),
 
                 ('crypto:key', {}, (
+
                     ('algorithm', ('crypto:algorithm', {}), {
                         'ex': 'aes256',
                         'doc': 'The cryptographic algorithm which uses the key material.'}),
+
+                    ('mode', ('str', {'lower': True, 'onespace': True}), {
+                        'doc': 'The algorithm specific mode in use.'}),
+
+                    ('iv', ('hex', {}), {
+                        'doc': 'The hex encoded initialization vector.'}),
+
+                    ('iv:text', ('it:dev:str', {}), {
+                        'doc': 'Set only if the :iv property decodes to ASCII.'}),
+
                     ('public', ('hex', {}), {
                         'doc': 'The hex encoded public key material if the algorithm has a public/private key pair.'}),
+
+                    ('public:text', ('it:dev:str', {}), {
+                        'doc': 'Set only if the :public property decodes to ASCII.'}),
+
+                    ('public:md5', ('hash:md5', {}), {
+                        'doc': 'The MD5 hash of the public key in raw binary form.'}),
+
+                    ('public:sha1', ('hash:sha1', {}), {
+                        'doc': 'The SHA1 hash of the public key in raw binary form.'}),
+
+                    ('public:sha256', ('hash:sha256', {}), {
+                        'doc': 'The SHA256 hash of the public key in raw binary form.'}),
+
                     ('private', ('hex', {}), {
                         'doc': 'The hex encoded private key material. All symmetric keys are private.'}),
+
+                    ('private:text', ('it:dev:str', {}), {
+                        'doc': 'Set only if the :private property decodes to ASCII.'}),
+
+                    ('private:md5', ('hash:md5', {}), {
+                        'doc': 'The MD5 hash of the private key in raw binary form.'}),
+
+                    ('private:sha1', ('hash:sha1', {}), {
+                        'doc': 'The SHA1 hash of the private key in raw binary form.'}),
+
+                    ('private:sha256', ('hash:sha256', {}), {
+                        'doc': 'The SHA256 hash of the private key in raw binary form.'}),
+
                     ('seed:passwd', ('inet:passwd', {}), {
                         'doc': 'The seed password used to generate the key material.'}),
+
                     ('seed:algorithm', ('crypto:algorithm', {}), {
                         'ex': 'pbkdf2',
                         'doc': 'The algorithm used to generate the key from the seed password.'})
@@ -319,7 +552,7 @@ class CryptoModule(s_module.CoreModule):
                     ('inetaddr', ('inet:client', {}), {
                         'doc': 'The Internet client address observed using the crypto currency address.', 'ro': True, }),
                     ('coinaddr', ('crypto:currency:address', {}), {
-                        'doc': 'The crypto currency address observed in use the the Internet client.', 'ro': True, }),
+                        'doc': 'The crypto currency address observed in use by the Internet client.', 'ro': True, }),
                 )),
 
                 ('hash:md5', {}, ()),
@@ -327,6 +560,7 @@ class CryptoModule(s_module.CoreModule):
                 ('hash:sha256', {}, ()),
                 ('hash:sha384', {}, ()),
                 ('hash:sha512', {}, ()),
+                ('hash:ssdeep', {}, ()),
                 # TODO deprecate rsa:key and add fields to crypto:key
                 ('rsa:key', {}, (
                     ('mod', ('hex', {}), {'ro': True,
@@ -382,8 +616,8 @@ class CryptoModule(s_module.CoreModule):
                         'doc': 'The certificate used by the issuer to sign this certificate.',
                     }),
 
-                    ('serial', ('str', {}), {
-                        'doc': 'The serial number string in the certificate.',
+                    ('serial', ('hex', {'zeropad': 40}), {
+                        'doc': 'The certificate serial number as a big endian hex value.',
                     }),
 
                     ('version', ('int', {'enums': x509vers}), {
@@ -423,7 +657,7 @@ class CryptoModule(s_module.CoreModule):
                     }),
 
                     ('ext:sans', ('array', {'type': 'crypto:x509:san', 'uniq': True, 'sorted': True}), {
-                        'doc': 'The Subject Alternate Names (SANs) listed in the certficate.',
+                        'doc': 'The Subject Alternate Names (SANs) listed in the certificate.',
                     }),
 
                     ('ext:crls', ('array', {'type': 'crypto:x509:san', 'uniq': True, 'sorted': True}), {

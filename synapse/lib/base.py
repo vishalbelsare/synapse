@@ -1,5 +1,6 @@
 import gc
 import os
+import sys
 import atexit
 import signal
 import asyncio
@@ -16,10 +17,13 @@ import synapse.exc as s_exc
 import synapse.glob as s_glob
 
 import synapse.lib.coro as s_coro
+import synapse.lib.scope as s_scope
+import synapse.lib.logging as s_logging
 
 logger = logging.getLogger(__name__)
 
 OMIT_FINI_WARNS = os.environ.get('SYNDEV_OMIT_FINI_WARNS', False)
+BASE_MAIN_BG_TASK_TIMEOUT = int(os.environ.get('SYNDEV_BASE_MAIN_BG_TASK_TIMEOUT', 3))
 
 def _fini_atexit():  # pragma: no cover
 
@@ -38,7 +42,7 @@ def _fini_atexit():  # pragma: no cover
             if __debug__:
                 logger.debug(f'At exit: Missing fini for {item}')
                 for depth, call in enumerate(item.call_stack[:-2]):
-                    logger.debug(f'{depth+1:3}: {call.strip()}')
+                    logger.debug(f'{depth + 1:3}: {call.strip()}')
             continue
 
         try:
@@ -81,7 +85,7 @@ class Base:
     '''
     def __init__(self):
         self.anitted = False
-        assert inspect.stack()[1].function == 'anit', 'Objects from Base must be constructed solely via "anit"'
+        assert sys._getframe(1).f_code.co_name == 'anit', 'Objects from Base must be constructed solely via "anit"'
 
     @classmethod
     async def anit(cls, *args, **kwargs):
@@ -127,8 +131,7 @@ class Base:
 
         self.isfini = False
         self.anitted = True  # For assertion purposes
-        self.finievt = None
-        self.entered = False
+        self.finievt = asyncio.Event()
 
         # hold a weak ref to other bases we should fini if they
         # are still around when we go down...
@@ -140,7 +143,9 @@ class Base:
         self._syn_links = []
         self._fini_funcs = []
         self._fini_atexit = False
-        self._active_tasks = set()  # the free running tasks associated with me
+        self._active_tasks = None       # the set of free running tasks associated with me
+        self._context_managers = None   # the set of context managers i must fini
+        self._syn_signal_tasks = None   # initialized as a Set when addSignalHandlers is called.
 
     async def postAnit(self):
         '''
@@ -156,36 +161,45 @@ class Base:
         Returns:
             The result of item’s own __aenter__ or __enter__() method.
         '''
-        async def fini():
-            meth = getattr(item, '__aexit__', None)
-            if meth is not None:
-                return await meth(None, None, None)
+        if self.isfini: # pragma: no cover
+            mesg = 'Cannot enter_context on a fini()d object.'
+            raise s_exc.IsFini(mesg=mesg)
 
-            meth = getattr(item, '__exit__', None)
-            if meth is not None:
-                return meth(None, None, None)
-
-        self.onfini(fini)
+        if self._context_managers is None:
+            self._context_managers = []
 
         entr = getattr(item, '__aenter__', None)
-        if entr is not None:
-            async def fini():
-                await item.__aexit__(None, None, None)
-            self.onfini(fini)
-            return await entr()
+        if entr is None:
+            entr = getattr(item, '__enter__', None)
 
-        entr = getattr(item, '__enter__', None)
         assert entr is not None
 
-        async def fini():
-            item.__exit__(None, None, None)
-        self.onfini(fini)
-        return entr()
+        ret = await s_coro.ornot(entr)
+        self._context_managers.append(item)
+
+        return ret
 
     def onfini(self, func):
         '''
         Add a function/coroutine/Base to be called on fini().
+
+        The rules around how to register function/coroutine/Base to be called:
+            - Call this method with an instance of Base (this class) if holding
+              a reference to a bound method of the instance (such as a fini()
+              method) would cause the object to be leaked. This is appropriate
+              for ephemeral objects that may be constructed/destroyed multiple
+              times over the lifetime of a process.
+
+            - Call this method with an instance method if you want the object to
+              have a lifetime as long as the thing being fini'd.
         '''
+        if self.isfini:
+            if isinstance(func, Base):
+                s_coro.create_task(func.fini())
+            else:
+                s_coro.create_task(s_coro.ornot(func))
+            return
+
         if isinstance(func, Base):
             self.tofini.add(func)
             return
@@ -195,7 +209,6 @@ class Base:
 
     async def __aenter__(self):
         assert asyncio.get_running_loop() == self.loop
-        self.entered = True
         return self
 
     async def __aexit__(self, exc, cls, tb):
@@ -390,24 +403,41 @@ class Base:
 
         for base in list(self.tofini):
             await base.fini()
+        # Do not continue to hold a reference to the last item we iterated on.
+        base = None  # NOQA
 
         await self._kill_active_tasks()
+
+        if self._context_managers is not None:
+            for item in reversed(self._context_managers):
+
+                exit = getattr(item, '__aexit__', None)
+                if exit is not None:
+                    try:
+                        await exit(None, None, None)
+                    except Exception:
+                        logger.exception(f'{self} {item} - context aexit failed!')
+                    continue
+
+                exit = getattr(item, '__exit__', None)
+                if exit is not None:
+                    try:
+                        exit(None, None, None)
+                    except Exception:
+                        logger.exception(f'{self} {item} - context exit failed!')
+                    continue
+            self._context_managers.clear()
 
         for fini in self._fini_funcs:
             try:
                 await s_coro.ornot(fini)
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
             except Exception:
                 logger.exception(f'{self} - fini function failed: {fini}')
 
         self._syn_funcs.clear()
         self._fini_funcs.clear()
 
-        fevt = self.finievt
-
-        if fevt is not None:
-            fevt.set()
+        self.finievt.set()
 
         return 0
 
@@ -429,6 +459,10 @@ class Base:
         finally:
             self.off(evnt, func)
 
+    def _wouldfini(self):
+        '''Check if a Base would be fini() if fini() was called on it.'''
+        return self._syn_refs == 1
+
     async def waitfini(self, timeout=None):
         '''
         Wait for the base to fini()
@@ -441,46 +475,46 @@ class Base:
             base.waitfini(timeout=30)
 
         '''
-
-        if self.isfini:
-            return True
-
-        if self.finievt is None:
-            self.finievt = asyncio.Event()
-
         return await s_coro.event_wait(self.finievt, timeout)
 
     def schedCoro(self, coro):
         '''
-        Schedules a free-running coroutine to run on this base's event loop.  Kills the coroutine if Base is fini'd.
+        Schedules a free-running coroutine to run on this base's event loop.
         It does not pend on coroutine completion.
 
-        Precondition:
-            This function is *not* threadsafe and must be run on the Base's event loop
+        Args:
+            coro: The coroutine to schedule.
+
+        Notes:
+            This function is *not* threadsafe and must be run on the Base's event loop.
+            Tasks created by this function do inherit the synapse.lib.scope Scope from the current task.
+            Raises IsFini if the Base has already been fini'd.
 
         Returns:
             asyncio.Task: An asyncio.Task object.
 
         '''
-        import synapse.lib.provenance as s_provenance  # avoid import cycle
-
         if __debug__:
             assert inspect.isawaitable(coro)
             import synapse.lib.threads as s_threads  # avoid import cycle
             assert s_threads.iden() == self.tid
 
+        if self.isfini:
+            coro.close()
+            raise s_exc.IsFini(mesg=f'Cannot schedCoro on a fini Base: {self}')
+
+        if self._active_tasks is None:
+            self._active_tasks = set()
+
         task = self.loop.create_task(coro)
 
-        # In rare cases, (Like this function being triggered from call_soon_threadsafe), there's no task context
-        if asyncio.current_task():
-            s_provenance.dupstack(task)
+        s_scope.clone(task)
 
         def taskDone(task):
             self._active_tasks.remove(task)
             try:
-                if not task.done():
-                    task.result()
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
+                task.result()
+            except asyncio.CancelledError:
                 pass
             except Exception:
                 logger.exception('Task %s scheduled through Base.schedCoro raised exception', task)
@@ -503,6 +537,7 @@ class Base:
 
         Notes:
             This method may be called from outside of the event loop on a different thread.
+            This function will break any task scoping done with synapse.lib.scope.
 
         Returns:
             concurrent.futures.Future: A Future representing the eventual function execution.
@@ -519,11 +554,19 @@ class Base:
 
         Notes:
             This method may be run outside the event loop on a different thread.
+            This function will break any task scoping done with synapse.lib.scope.
+            If the Base is fini'd before or at the time of dispatch, the coroutine is closed.
 
         Returns:
             concurrent.futures.Future: A Future representing the eventual coroutine execution.
         '''
-        return self.loop.call_soon_threadsafe(self.schedCoro, coro)
+        def _safecall():
+            if self.isfini:
+                coro.close()
+                return
+            self.schedCoro(coro)
+
+        return self.loop.call_soon_threadsafe(_safecall)
 
     def schedCoroSafePend(self, coro):
         '''
@@ -543,30 +586,41 @@ class Base:
         '''
         Register SIGTERM/SIGINT signal handlers with the ioloop to fini this object.
         '''
+        if self._syn_signal_tasks is None:
+            self._syn_signal_tasks = set()
 
         def sigterm():
-            print('Caught SIGTERM, shutting down.')
-            asyncio.create_task(self.fini())
+            logger.warning('Caught SIGTERM, shutting down.')
+            task = asyncio.create_task(self.fini())
+            self._syn_signal_tasks.add(task)
+            task.add_done_callback(self._syn_signal_tasks.discard)
 
         def sigint():
-            print('Caught SIGINT, shutting down.')
-            asyncio.create_task(self.fini())
+            logger.warning('Caught SIGINT, shutting down.')
+            task = asyncio.create_task(self.fini())
+            self._syn_signal_tasks.add(task)
+            task.add_done_callback(self._syn_signal_tasks.discard)
 
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGINT, sigint)
         loop.add_signal_handler(signal.SIGTERM, sigterm)
 
-    async def main(self):
+    async def main(self, timeout=BASE_MAIN_BG_TASK_TIMEOUT): # pragma: no cover
         '''
         Helper function to setup signal handlers for this base as the main object.
         ( use base.waitfini() to block )
 
-        NOTE: This API may only be used when the ioloop is *also* the main thread.
+        Note:
+            This API may only be used when the ioloop is *also* the main thread.
         '''
         await self.addSignalHandlers()
-        return await self.waitfini()
+        await self.waitfini()
+        # shutdown logging to allow it to drain any queued messages it has, swapping in a stream handler,
+        # and then cancellling the task so we do not have to await the pump task in bg tasks.
+        await s_logging.shutdown()
+        await s_coro.await_bg_tasks(timeout)
 
-    def waiter(self, count, *names):
+    def waiter(self, count, *names, timeout=None):
         '''
         Construct and return a new Waiter for events on this base.
 
@@ -576,7 +630,7 @@ class Base:
 
             waiter = base.waiter(10,'foo:bar')
 
-            # .. fire thread that will cause foo:bar events
+            # .. fire task that will cause foo:bar events
 
             events = await waiter.wait(timeout=3)
 
@@ -586,20 +640,22 @@ class Base:
             for event in events:
                 # parse the events if you need...
 
-        NOTE: use with caution... it's easy to accidentally construct
-              race conditions with this mechanism ;)
+        Note:
+            Use this with caution. It's easy to accidentally construct
+            race conditions with this mechanism ;)
 
         '''
-        return Waiter(self, count, self.loop, *names)
+        return Waiter(self, count, *names, timeout=timeout)
 
 class Waiter:
     '''
     A helper to wait for a given number of events on a Base.
     '''
-    def __init__(self, base, count, *names):
+    def __init__(self, base, count, *names, timeout=None):
         self.base = base
         self.names = names
         self.count = count
+        self.timeout = timeout
         self.event = asyncio.Event()
 
         self.events = []
@@ -631,6 +687,9 @@ class Waiter:
                 doStuff(evnt)
 
         '''
+        if timeout is None:
+            timeout = self.timeout
+
         try:
 
             retn = await s_coro.event_wait(self.event, timeout)
@@ -650,6 +709,18 @@ class Waiter:
         if not self.names:
             self.base.unlink(self._onWaitEvent)
         del self.event
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc, cls, tb):
+        if exc is None:
+            if await self.wait() is None: # pragma: no cover
+                # these lines are 100% covered by the tests but
+                # the coverage plugin cannot seem to see them...
+                events = ','.join(self.names)
+                mesg = f'timeout waiting for {self.count} event(s): {events}'
+                raise s_exc.TimeOut(mesg=mesg)
 
 class BaseRef(Base):
     '''
@@ -751,9 +822,6 @@ async def schedGenr(genr, maxsize=100):
                 await q.put((True, item))
 
             await q.put((False, None))
-
-        except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-            raise
 
         except Exception:
             if not base.isfini:

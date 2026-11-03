@@ -11,45 +11,117 @@ class PsModule(s_module.CoreModule):
                     'doc': 'An instance of an edu:course taught at a given time.',
                 }),
                 ('ps:education', ('guid', {}), {
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'student::name'}},
+                            {'type': 'prop', 'opts': {'name': 'institution::orgname'}},
+                            {'type': 'prop', 'opts': {'name': 'attended:first'}},
+                            {'type': 'prop', 'opts': {'name': 'attended:last'}},
+                        ),
+                    },
                     'doc': 'A period of education for an individual.',
                 }),
                 ('ps:achievement', ('guid', {}), {
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'awardee::name'}},
+                            {'type': 'prop', 'opts': {'name': 'award::name'}},
+                            {'type': 'prop', 'opts': {'name': 'award::org::name'}},
+                            {'type': 'prop', 'opts': {'name': 'awarded'}},
+                        ),
+                    },
                     'doc': 'An instance of an individual receiving an award.',
                 }),
                 ('ps:tokn', ('str', {'lower': True, 'strip': True}), {
-                    'doc': 'A single name element (potentially given or sur).',
+                    'deprecated': True,
+                    'doc': 'Deprecated. ps:tokn will be removed in 3.0.0.',
                     'ex': 'robert'
                 }),
                 ('ps:name', ('str', {'lower': True, 'onespace': True}), {
                     'doc': 'An arbitrary, lower spaced string with normalized whitespace.',
-                    'ex': 'robert grey'
-                }),
+                    'ex': 'robert grey'}),
+
                 ('ps:person', ('guid', {}), {
-                    'doc': 'A GUID for a person.',
-                }),
+                    'doc': 'A GUID for a person.'}),
+
                 ('ps:persona', ('guid', {}), {
                     'deprecated': True,
-                    'doc': 'A GUID for a suspected person.',
-                }),
+                    'doc': 'Deprecated. Please use ps:contact.'}),
+
                 ('ps:person:has', ('comp', {'fields': (('person', 'ps:person'), ('node', 'ndef'))}), {
                     'deprecated': True,
-                    'doc': 'A person owns, controls, or has exclusive use of an object or'
-                           ' resource, potentially during a specific period of time.'
-                }),
+                    'doc': 'Deprecated. Please use ps:person -(has)>.'}),
+
                 ('ps:persona:has', ('comp', {'fields': (('persona', 'ps:persona'), ('node', 'ndef'))}), {
                     'deprecated': True,
-                    'doc': 'A persona owns, controls, or has exclusive use of an object or'
-                           ' resource, potentially during a specific period of time.'
-                }),
+                    'doc': 'Deprecated. Please use ps:contact -(has)>.'}),
+
                 ('ps:contact', ('guid', {}), {
                     'doc': 'A GUID for a contact info record.',
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'name'}},
+                            {'type': 'prop', 'opts': {'name': 'orgname'}},
+                            {'type': 'prop', 'opts': {'name': 'email'}},
+                            {'type': 'prop', 'opts': {'name': 'type'}},
+                        ),
+                    }}),
+
+                ('ps:contact:type:taxonomy', ('taxonomy', {}), {
+                    'interfaces': ('meta:taxonomy',),
+                    'doc': 'A taxonomy of contact types.',
                 }),
                 ('ps:contactlist', ('guid', {}), {
                     'doc': 'A GUID for a list of associated contacts.',
                 }),
                 ('ps:workhist', ('guid', {}), {
-                    'doc': "A GUID representing entry in a contact's work history.",
-                }),
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'contact::name'}},
+                            {'type': 'prop', 'opts': {'name': 'jobtitle'}},
+                            {'type': 'prop', 'opts': {'name': 'orgname'}},
+                            {'type': 'prop', 'opts': {'name': 'started'}},
+                            {'type': 'prop', 'opts': {'name': 'ended'}},
+                        ),
+                    },
+                    'doc': "An entry in a contact's work history."}),
+
+                ('ps:vitals', ('guid', {}), {
+                    'interfaces': ('phys:object',),
+                    'template': {'phys:object': 'person'},
+                    'doc': 'Statistics and demographic data about a person or contact.'}),
+
+                ('ps:skill', ('guid', {}), {
+                    'doc': 'A specific skill which a person or organization may have.',
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'name'}},
+                            {'type': 'prop', 'opts': {'name': 'type'}},
+                        ),
+                    }}),
+
+                ('ps:skill:type:taxonomy', ('taxonomy', {}), {
+                    'interfaces': ('meta:taxonomy',),
+                    'doc': 'A taxonomy of skill types.'}),
+
+                ('ps:proficiency', ('guid', {}), {
+                    'doc': 'The assessment that a given contact possesses a specific skill.',
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'contact::name'}},
+                            {'type': 'prop', 'opts': {'name': 'skill::name'}},
+                        ),
+                    }}),
+            ),
+            'edges': (
+                (('ps:contact', 'has', None), {
+                    'doc': 'The contact is or was in possession of the target node.'}),
+                (('ps:person', 'has', None), {
+                    'doc': 'The person is or was in possession of the target node.'}),
+                (('ps:contact', 'owns', None), {
+                    'doc': 'The contact owns or owned the target node.'}),
+                (('ps:person', 'owns', None), {
+                    'doc': 'The person owns or owned the target node.'}),
             ),
             'forms': (
                 ('ps:workhist', {}, (
@@ -89,6 +161,8 @@ class PsModule(s_module.CoreModule):
                     ('currency', ('econ:currency', {}), {
                         'doc': 'The currency that the yearly pay was delivered in.',
                     }),
+                    ('desc', ('str', {}), {
+                        'doc': 'A description of the work done as part of the job.'}),
                 )),
                 ('edu:course', {}, (
                     ('name', ('str', {'lower': True, 'onespace': True}), {
@@ -152,7 +226,7 @@ class PsModule(s_module.CoreModule):
                         'doc': 'The last date the student attended a class.',
                     }),
                     ('classes', ('array', {'type': 'edu:class', 'uniq': True, 'sorted': True}), {
-                        'doc': 'The classes attended by the student',
+                        'doc': 'The classes attended by the student.',
                     }),
                     ('achievement', ('ps:achievement', {}), {
                         'doc': 'The achievement awarded to the individual.',
@@ -178,13 +252,16 @@ class PsModule(s_module.CoreModule):
                 ('ps:tokn', {}, ()),
                 ('ps:name', {}, (
                     ('sur', ('ps:tokn', {}), {
-                        'doc': 'The surname part of the name.'
+                        'deprecated': True,
+                        'doc': 'Deprecated.'
                     }),
                     ('middle', ('ps:tokn', {}), {
-                        'doc': 'The middle name part of the name.'
+                        'deprecated': True,
+                        'doc': 'Deprecated.'
                     }),
                     ('given', ('ps:tokn', {}), {
-                        'doc': 'The given name part of the name.'
+                        'deprecated': True,
+                        'doc': 'Deprecated.'
                     }),
                 )),
                 ('ps:person', {}, (
@@ -204,17 +281,24 @@ class PsModule(s_module.CoreModule):
                     ('nick', ('inet:user', {}), {
                         'doc': 'A username commonly used by the person.',
                     }),
+                    ('vitals', ('ps:vitals', {}), {
+                        'doc': 'The most recent known vitals for the person.',
+                    }),
                     ('name', ('ps:name', {}), {
+                        'alts': ('names',),
                         'doc': 'The localized name for the person.',
                     }),
                     ('name:sur', ('ps:tokn', {}), {
-                        'doc': 'The surname of the person.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :name.'
                     }),
                     ('name:middle', ('ps:tokn', {}), {
-                        'doc': 'The middle name of the person.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :name.'
                     }),
                     ('name:given', ('ps:tokn', {}), {
-                        'doc': 'The given name of the person.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :name.'
                     }),
                     ('names', ('array', {'type': 'ps:name', 'uniq': True, 'sorted': True}), {
                         'doc': 'Variations of the name for the person.'
@@ -240,13 +324,16 @@ class PsModule(s_module.CoreModule):
                         'doc': 'The localized name for the suspected person.',
                     }),
                     ('name:sur', ('ps:tokn', {}), {
-                        'doc': 'The surname of the suspected person.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :name.'
                     }),
                     ('name:middle', ('ps:tokn', {}), {
-                        'doc': 'The middle name of the suspected person.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :name.'
                     }),
                     ('name:given', ('ps:tokn', {}), {
-                        'doc': 'The given name of the suspected person.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :name.'
                     }),
                     ('names', ('array', {'type': 'ps:name', 'uniq': True, 'sorted': True}), {
                         'doc': 'Variations of the name for a persona.'
@@ -283,9 +370,13 @@ class PsModule(s_module.CoreModule):
                         'doc': 'The form of the object or resource that is owned or controlled by the persona.',
                     }),
                 )),
+                ('ps:contact:type:taxonomy', {}, ()),
                 ('ps:contact', {}, (
                     ('org', ('ou:org', {}), {
                         'doc': 'The org which this contact represents.',
+                    }),
+                    ('type', ('ps:contact:type:taxonomy', {}), {
+                        'doc': 'The type of contact which may be used for entity resolution.',
                     }),
                     ('asof', ('time', {}), {
                         'date': 'The time this contact was created or modified.',
@@ -293,29 +384,50 @@ class PsModule(s_module.CoreModule):
                     ('person', ('ps:person', {}), {
                         'doc': 'The ps:person GUID which owns this contact.',
                     }),
+                    ('vitals', ('ps:vitals', {}), {
+                        'doc': 'The most recent known vitals for the contact.',
+                    }),
                     ('name', ('ps:name', {}), {
-                        'doc': 'The person name listed for the contact.',
-                    }),
-                    ('title', ('str', {'lower': True, 'strip': True}), {
-                        'doc': 'The job/org title listed for this contact.',
-                    }),
+                        'alts': ('names',),
+                        'doc': 'The person name listed for the contact.'}),
+
+                    ('bio', ('str', {}), {
+                        'doc': 'A brief bio provided for the contact.'}),
+
+                    ('desc', ('str', {}), {
+                        'doc': 'A description of this contact.'}),
+
+                    ('title', ('ou:jobtitle', {}), {
+                        'alts': ('titles',),
+                        'doc': 'The job/org title listed for this contact.'}),
+
+                    ('titles', ('array', {'type': 'ou:jobtitle', 'sorted': True, 'uniq': True}), {
+                        'doc': 'An array of alternate titles for the contact.'}),
+
                     ('photo', ('file:bytes', {}), {
                         'doc': 'The photo listed for this contact.',
                     }),
                     ('orgname', ('ou:name', {}), {
+                        'alts': ('orgnames',),
                         'doc': 'The listed org/company name for this contact.',
                     }),
                     ('orgfqdn', ('inet:fqdn', {}), {
                         'doc': 'The listed org/company FQDN for this contact.',
                     }),
                     ('user', ('inet:user', {}), {
-                        'doc': 'The username or handle for this contact.',
-                    }),
+                        'alts': ('users',),
+                        'doc': 'The username or handle for this contact.'}),
+
+                    ('service:accounts', ('array', {'type': 'inet:service:account', 'sorted': True, 'uniq': True}), {
+                        'doc': 'The service accounts associated with this contact.'}),
+
                     ('web:acct', ('inet:web:acct', {}), {
-                        'doc': 'The social media account for this contact.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Use :service:accounts.',
                     }),
                     ('web:group', ('inet:web:group', {}), {
-                        'doc': 'A web group representing this contact.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Use inet:service:group:profile to link to a group.',
                     }),
                     ('birth:place', ('geo:place', {}), {
                         'doc': 'A fully resolved place of birth for this contact.',
@@ -345,6 +457,7 @@ class PsModule(s_module.CoreModule):
                         'doc': 'The home or main site for this contact.',
                     }),
                     ('email', ('inet:email', {}), {
+                        'alts': ('emails',),
                         'doc': 'The main email address for this contact.',
                     }),
                     ('email:work', ('inet:email', {}), {
@@ -355,20 +468,32 @@ class PsModule(s_module.CoreModule):
                     }),
                     ('address', ('geo:address', {}), {
                         'doc': 'The street address listed for the contact.',
+                        'disp': {'hint': 'text'}
                     }),
                     ('place', ('geo:place', {}), {
                         'doc': 'The place associated with this contact.',
                     }),
+                    ('place:name', ('geo:name', {}), {
+                        'doc': 'The reported name of the place associated with this contact.',
+                    }),
                     ('phone', ('tel:phone', {}), {
+                        'alts': ('phones',),
                         'doc': 'The main phone number for this contact.',
                     }),
                     ('phone:fax', ('tel:phone', {}), {
                         'doc': 'The fax number for this contact.',
                     }),
                     ('phone:work', ('tel:phone', {}), {
-                        'doc': 'The work phone number for this contact.',
-                    }),
+                        'doc': 'The work phone number for this contact.'}),
+
+                    ('phones', ('array', {'type': 'tel:phone', 'uniq': True, 'sorted': True}), {
+                        'doc': 'An array of secondary/associated phone numbers.'}),
+
+                    ('id', ('str', {'strip': True}), {
+                        'doc': 'A type or source specific unique ID for the contact.'}),
+
                     ('id:number', ('ou:id:number', {}), {
+                        'alts': ('id:numbers',),
                         'doc': 'An ID number issued by an org and associated with this contact.',
                     }),
                     ('adid', ('it:adid', {}), {
@@ -385,13 +510,17 @@ class PsModule(s_module.CoreModule):
                     }),
                     # A few probable multi-fields for entity resolution
                     ('names', ('array', {'type': 'ps:name', 'uniq': True, 'sorted': True}), {
-                        'doc': 'The person name listed for the contact.',
+                        'doc': 'An array of associated names/aliases for the person.',
+                    }),
+                    ('orgnames', ('array', {'type': 'ou:name', 'uniq': True, 'sorted': True}), {
+                        'doc': 'An array of associated names/aliases for the organization.',
                     }),
                     ('emails', ('array', {'type': 'inet:email', 'uniq': True, 'sorted': True}), {
                         'doc': 'An array of secondary/associated email addresses.',
                     }),
                     ('web:accts', ('array', {'type': 'inet:web:acct', 'uniq': True, 'sorted': True}), {
-                        'doc': 'An array of secondary/associated web accounts.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Use :service:accounts.',
                     }),
                     ('id:numbers', ('array', {'type': 'ou:id:number', 'uniq': True, 'sorted': True}), {
                         'doc': 'An array of secondary/associated IDs.',
@@ -402,6 +531,39 @@ class PsModule(s_module.CoreModule):
                     ('crypto:address', ('crypto:currency:address', {}), {
                         'doc': 'A crypto currency address associated with the contact.'
                     }),
+                    ('lang', ('lang:language', {}), {
+                        'alts': ('langs',),
+                        'doc': 'The language specified for the contact.'}),
+                    ('langs', ('array', {'type': 'lang:language'}), {
+                        'doc': 'An array of alternative languages specified for the contact.'}),
+                    ('banner', ('file:bytes', {}), {
+                        'doc': 'The file representing the banner for the contact.'}),
+                    ('passwd', ('inet:passwd', {}), {
+                        'doc': 'The current password for the contact.'}),
+                    ('website', ('inet:url', {}), {
+                        'doc': 'A related URL specified by the contact (e.g., a personal or company web '
+                               'page, blog, etc.).'}),
+                    ('websites', ('array', {'type': 'inet:url', 'uniq': True, 'sorted': True}), {
+                        'doc': 'Alternative related URLs specified by the contact.'}),
+                )),
+                ('ps:vitals', {}, (
+                    ('asof', ('time', {}), {
+                        'doc': 'The time the vitals were gathered or computed.'}),
+                    ('contact', ('ps:contact', {}), {
+                        'doc': 'The contact that the vitals are about.'}),
+                    ('person', ('ps:person', {}), {
+                        'doc': 'The person that the vitals are about.'}),
+                    ('height', ('geo:dist', {}), {
+                        'doc': 'The height of the person or contact.'}),
+                    ('weight', ('mass', {}), {
+                        'doc': 'The weight of the person or contact.'}),
+                    ('econ:currency', ('econ:currency', {}), {
+                        'doc': 'The currency that the price values are recorded using.'}),
+                    ('econ:net:worth', ('econ:price', {}), {
+                        'doc': 'The net worth of the contact.'}),
+                    ('econ:annual:income', ('econ:price', {}), {
+                        'doc': 'The yearly income of the contact.'}),
+                    # TODO: eye color etc. color names / rgb values?
                 )),
                 ('ps:contactlist', {}, (
                     ('contacts', ('array', {'type': 'ps:contact', 'uniq': True, 'split': ',', 'sorted': True}), {
@@ -414,8 +576,31 @@ class PsModule(s_module.CoreModule):
                         'doc': 'The file from which the contact list was extracted.',
                     }),
                     ('source:acct', ('inet:web:acct', {}), {
-                        'doc': 'The web account from which the contact list was extracted.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Use :source:account.',
                     }),
+                    ('source:account', ('inet:service:account', {}), {
+                        'doc': 'The service account from which the contact list was extracted.',
+                    }),
+                )),
+
+                ('ps:skill:type:taxonomy', {}, ()),
+                ('ps:skill', {}, (
+
+                    ('name', ('str', {'lower': True, 'onespace': True}), {
+                        'doc': 'The name of the skill.'}),
+
+                    ('type', ('ps:skill:type:taxonomy', {}), {
+                        'doc': 'The type of skill as a taxonomy.'})
+                )),
+
+                ('ps:proficiency', {}, (
+
+                    ('skill', ('ps:skill', {}), {
+                        'doc': 'The skill in which the contact is proficient.'}),
+
+                    ('contact', ('ps:contact', {}), {
+                        'doc': 'The contact which is proficient in the skill.'}),
                 )),
             )
         }

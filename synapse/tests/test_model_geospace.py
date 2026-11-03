@@ -2,7 +2,6 @@ import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.tests.utils as s_t_utils
-from synapse.tests.utils import alist
 
 import synapse.lib.module as s_module
 
@@ -215,56 +214,70 @@ class GeoTest(s_t_utils.SynTest):
             stamp = -0
 
             place = s_common.guid()
-            props = {'place': place,
-                     'loc': 'us.hehe.haha'}
-
-            async with await core.snap() as snap:
-                node = await snap.addNode('geo:nloc', (ndef, latlong, stamp), props=props)
-                self.eq(node.ndef[1], (('inet:ipv4', 0), (0.0, 0.0), stamp))
-                self.eq(node.get('ndef'), ('inet:ipv4', 0))
-                self.eq(node.get('ndef:form'), 'inet:ipv4')
-                self.eq(node.get('latlong'), (0.0, 0.0))
-                self.eq(node.get('time'), 0)
-                self.eq(node.get('place'), place)
-                self.eq(node.get('loc'), 'us.hehe.haha')
-                self.nn(await snap.getNodeByNdef(('inet:ipv4', 0)))
+            opts = {'vars': {'place': place, 'loc': 'us.hehe.haha', 'valu': (ndef, latlong, stamp)}}
+            nodes = await core.nodes('[(geo:nloc=$valu :place=$place :loc=$loc)]', opts=opts)
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.ndef[1], (('inet:ipv4', 0), (0.0, 0.0), stamp))
+            self.eq(node.get('ndef'), ('inet:ipv4', 0))
+            self.eq(node.get('ndef:form'), 'inet:ipv4')
+            self.eq(node.get('latlong'), (0.0, 0.0))
+            self.eq(node.get('time'), 0)
+            self.eq(node.get('place'), place)
+            self.eq(node.get('loc'), 'us.hehe.haha')
+            self.len(1, await core.nodes('inet:ipv4=0'))
 
             # geo:place
 
             # test inline tuple/float with negative syntax...
-            node = (await alist(core.eval('[ geo:place="*" :latlong=(-30.0,20.22) ]')))[0]
+            nodes = await core.nodes('[ geo:place="*" :latlong=(-30.0,20.22) :type=woot.woot]')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('type'), 'woot.woot.')
             self.eq(node.get('latlong'), (-30.0, 20.22))
 
-            async with await core.snap() as snap:
-                guid = s_common.guid()
-                fbyts = s_common.guid()
-                parent = s_common.guid()
-                props = {'name': 'Vertex  HQ',
-                         'desc': 'The place where Vertex Project hangs out at!',
-                         'address': '208 Datong Road, Pudong District, Shanghai, China',
-                         'parent': parent,
-                         'loc': 'us.hehe.haha',
-                         'photo': f'guid:{fbyts}',
-                         'latlong': '34.1341, -118.3215',
-                         'bbox': '2.11, 2.12, -4.88, -4.9',
-                         'radius': '1.337km'}
-                node = await snap.addNode('geo:place', guid, props)
-                self.eq(node.ndef[1], guid)
-                self.eq(node.get('name'), 'vertex hq')
-                self.eq(node.get('loc'), 'us.hehe.haha')
-                self.eq(node.get('latlong'), (34.1341, -118.3215))
-                self.eq(node.get('radius'), 1337000)
-                self.eq(node.get('desc'), 'The place where Vertex Project hangs out at!')
-                self.eq(node.get('address'), '208 datong road, pudong district, shanghai, china')
-                self.eq(node.get('parent'), parent)
-                self.eq(node.get('photo'), f'guid:{fbyts}')
+            guid = s_common.guid()
+            fbyts = s_common.guid()
+            parent = s_common.guid()
+            props = {'name': 'Vertex  HQ',
+                     'desc': 'The place where Vertex Project hangs out at!',
+                     'address': '208 Datong Road, Pudong District, Shanghai, China',
+                     'parent': parent,
+                     'loc': 'us.hehe.haha',
+                     'photo': f'guid:{fbyts}',
+                     'latlong': '34.1341, -118.3215',
+                     'bbox': '2.11, 2.12, -4.88, -4.9',
+                     'radius': '1.337km'}
+            opts = {'vars': {'valu': guid, 'p': props}}
+            q = '''
+                [ geo:place=$valu
+                    :id=IAD
+                    :name=$p.name :desc=$p.desc :address=$p.address :parent=$p.parent :loc=$p.loc
+                    :photo=$p.photo :latlong=$p.latlong :bbox=$p.bbox :radius=$p.radius
+                ]
+            '''
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.ndef[1], guid)
+            self.eq(node.get('id'), 'IAD')
+            self.eq(node.get('name'), 'vertex hq')
+            self.eq(node.get('loc'), 'us.hehe.haha')
+            self.eq(node.get('latlong'), (34.1341, -118.3215))
+            self.eq(node.get('radius'), 1337000)
+            self.eq(node.get('desc'), 'The place where Vertex Project hangs out at!')
+            self.eq(node.get('address'), '208 datong road, pudong district, shanghai, china')
+            self.eq(node.get('parent'), parent)
+            self.eq(node.get('photo'), f'guid:{fbyts}')
 
-                self.eq(node.get('bbox'), (2.11, 2.12, -4.88, -4.9))
-                self.eq(node.repr('bbox'), '2.11,2.12,-4.88,-4.9')
+            self.eq(node.get('bbox'), (2.11, 2.12, -4.88, -4.9))
+            self.eq(node.repr('bbox'), '2.11,2.12,-4.88,-4.9')
 
-                opts = {'vars': {'place': parent}}
-                nodes = await core.nodes('geo:place=$place', opts=opts)
-                self.len(1, nodes)
+            opts = {'vars': {'place': parent}}
+            nodes = await core.nodes('geo:place=$place', opts=opts)
+            self.len(1, nodes)
+
+            self.len(1, await core.nodes('geo:place -> geo:place:taxonomy'))
 
             q = '[geo:place=(beep,) :latlong=$latlong]'
             opts = {'vars': {'latlong': (11.38, 20.01)}}
@@ -274,24 +287,35 @@ class GeoTest(s_t_utils.SynTest):
             nodes = await core.nodes('[ geo:place=(hehe, haha) :names=("Foo  Bar ", baz) ] -> geo:name')
             self.eq(('baz', 'foo bar'), [n.ndef[1] for n in nodes])
 
+            nodes = await core.nodes('geo:place=(hehe, haha)')
+            node = nodes[0]
+
+            self.len(1, nodes := await core.nodes('[ geo:place=({"name": "baz"}) ]'))
+            self.eq(node.ndef, nodes[0].ndef)
+
     async def test_eq(self):
 
         async with self.getTestCore() as core:
-            async with await core.snap() as snap:
+            guid0 = s_common.guid()
+            props = {'name': 'Vertex  HQ',
+                     'latlong': '34.1341, -118.3215',
+                     'radius': '1.337km'}
+            opts = {'vars': {'valu': guid0, 'p': props}}
+            q = '[(geo:place=$valu :name=$p.name :latlong=$p.latlong :radius=$p.radius)]'
 
-                guid0 = s_common.guid()
-                props = {'name': 'Vertex  HQ',
-                         'latlong': '34.1341, -118.3215',
-                         'radius': '1.337km'}
-                node = await snap.addNode('geo:place', guid0, props)
-                self.nn(node)
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
-                guid1 = s_common.guid()
-                props = {'name': 'Griffith Observatory',
-                         'latlong': '34.1341, -118.3215',
-                         'radius': '75m'}
-                node = await snap.addNode('geo:place', guid1, props)
-                self.nn(node)
+            guid1 = s_common.guid()
+            props = {'name': 'Griffith Observatory',
+                     'latlong': '34.1341, -118.3215',
+                     'radius': '75m'}
+
+            opts = {'vars': {'valu': guid1, 'p': props}}
+            q = '[(geo:place=$valu :name=$p.name :latlong=$p.latlong :radius=$p.radius)]'
+
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
             nodes = await core.nodes('geo:place:latlong=(34.1341, -118.3215)')
             self.len(2, nodes)
@@ -305,49 +329,62 @@ class GeoTest(s_t_utils.SynTest):
     async def test_near(self):
 
         async with self.getTestCore() as core:
-            async with await core.snap() as snap:
-                # These two nodes are 2,605m apart
-                guid0 = s_common.guid()
-                props = {'name': 'Vertex  HQ',
-                         'latlong': '34.1341, -118.3215',  # hollywood sign
-                         'radius': '1.337km'}
-                node = await snap.addNode('geo:place', guid0, props)
-                self.nn(node)
 
-                guid1 = s_common.guid()
-                props = {'name': 'Griffith Observatory',
-                         'latlong': '34.118560, -118.300370',
-                         'radius': '75m'}
-                node = await snap.addNode('geo:place', guid1, props)
-                self.nn(node)
+            # These two nodes are 2,605m apart
+            guid0 = s_common.guid()
+            props = {'name': 'Vertex  HQ',
+                     'latlong': '34.1341, -118.3215',  # hollywood sign
+                     'radius': '1.337km'}
+            opts = {'vars': {'valu': guid0, 'p': props}}
+            q = '[(geo:place=$valu :name=$p.name :latlong=$p.latlong :radius=$p.radius)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
-                guid2 = s_common.guid()
-                props = {'name': 'unknown location'}
-                node = await snap.addNode('geo:place', guid2, props)
-                self.nn(node)
+            guid1 = s_common.guid()
+            props = {'name': 'Griffith Observatory',
+                     'latlong': '34.118560, -118.300370',
+                     'radius': '75m'}
+            opts = {'vars': {'valu': guid1, 'p': props}}
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
-                # A telemetry node for example by the observatory
-                guid3 = s_common.guid()
-                props = {'latlong': '34.118660, -118.300470'}
-                node = await snap.addNode('tel:mob:telem', guid3, props)
-                self.nn(node)
+            guid2 = s_common.guid()
+            props = {'name': 'unknown location'}
+            opts = {'vars': {'valu': guid2, 'p': props}}
+            q = '[(geo:place=$valu :name=$p.name)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
-                # A telemetry node for example by the HQ
-                guid4 = s_common.guid()
-                props = {'latlong': '34.13412, -118.32153'}
-                node = await snap.addNode('tel:mob:telem', guid4, props)
-                self.nn(node)
+            # A telemetry node for example by the observatory
+            guid3 = s_common.guid()
+            props = {'latlong': '34.118660, -118.300470'}
+            opts = {'vars': {'valu': guid3, 'p': props}}
+            q = '[(tel:mob:telem=$valu :latlong=$p.latlong)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
-                # Far away nodes to test bounding box
-                guid5 = s_common.guid()
-                props = {'latlong': '35.118660, -118.300470'}
-                node = await snap.addNode('tel:mob:telem', guid5, props)
-                self.nn(node)
+            # A telemetry node for example by the HQ
+            guid4 = s_common.guid()
+            props = {'latlong': '34.13412, -118.32153'}
+            opts = {'vars': {'valu': guid4, 'p': props}}
+            q = '[(tel:mob:telem=$valu :latlong=$p.latlong)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
-                guid6 = s_common.guid()
-                props = {'latlong': '33.118660, -118.300470'}
-                node = await snap.addNode('tel:mob:telem', guid6, props)
-                self.nn(node)
+            # Far away nodes to test bounding box
+            guid5 = s_common.guid()
+            props = {'latlong': '35.118660, -118.300470'}
+            opts = {'vars': {'valu': guid5, 'p': props}}
+            q = '[(tel:mob:telem=$valu :latlong=$p.latlong)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
+
+            guid6 = s_common.guid()
+            props = {'latlong': '33.118660, -118.300470'}
+            opts = {'vars': {'valu': guid6, 'p': props}}
+            q = '[(tel:mob:telem=$valu :latlong=$p.latlong)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
 
             # Node filtering behavior
             nodes = await core.nodes('geo:place +:latlong*near=((34.1, -118.3), 10km)')
@@ -367,38 +404,34 @@ class GeoTest(s_t_utils.SynTest):
             # Storm variable use to filter nodes based on a given location.
             q = f'geo:place={guid0} $latlong=:latlong $radius=:radius | spin | geo:place +:latlong*near=($latlong, ' \
                 f'$radius)'
-            nodes = await alist(core.eval(q))
-            self.len(1, nodes)
+            self.len(1, await core.nodes(q))
 
             q = f'geo:place={guid0} $latlong=:latlong $radius=:radius | spin | geo:place +:latlong*near=($latlong, 5km)'
-            nodes = await alist(core.eval(q))
-            self.len(2, nodes)
+            self.len(2, await core.nodes(q))
 
             # Lifting nodes by *near=((latlong), radius)
-            nodes = await alist(core.eval('geo:place:latlong*near=((34.1, -118.3), 10km)'))
-            self.len(2, nodes)
+            q = 'geo:place:latlong*near=((34.1, -118.3), 10km)'
+            self.len(2, await core.nodes(q))
 
-            nodes = await alist(core.eval('geo:place:latlong*near=(("34.118560", "-118.300370"), 50m)'))
-            self.len(1, nodes)
+            q = 'geo:place:latlong*near=(("34.118560", "-118.300370"), 50m)'
+            self.len(1, await core.nodes(q))
 
-            nodes = await alist(core.eval('geo:place:latlong*near=((0, 0), 50m)'))
-            self.len(0, nodes)
+            q = 'geo:place:latlong*near=((0, 0), 50m)'
+            self.len(0, await core.nodes(q))
 
             # Use a radius to lift nodes which will be inside the bounding box,
             # but outside the cmpr implemented using haversine filtering.
-            nodes = await alist(core.eval('geo:place:latlong*near=(("34.118560", "-118.300370"), 2600m)'))
-            self.len(1, nodes)
+            q = 'geo:place:latlong*near=(("34.118560", "-118.300370"), 2600m)'
+            self.len(1, await core.nodes(q))
 
             # Storm variable use to lift nodes based on a given location.
             q = f'geo:place={guid1} $latlong=:latlong $radius=:radius ' \
                 f'tel:mob:telem:latlong*near=($latlong, 3km) +tel:mob:telem'
-            nodes = await alist(core.eval(q))
-            self.len(2, nodes)
+            self.len(2, await core.nodes(q))
 
             q = f'geo:place={guid1} $latlong=:latlong $radius=:radius ' \
                 f'tel:mob:telem:latlong*near=($latlong, $radius) +tel:mob:telem'
-            nodes = await alist(core.eval(q))
-            self.len(1, nodes)
+            self.len(1, await core.nodes(q))
 
         async with self.getTestCore() as core:
 
@@ -464,3 +497,67 @@ class GeoTest(s_t_utils.SynTest):
             self.eq('-3.0 cm', await core.callStorm('test:distoff return($node.repr())'))
             with self.raises(s_exc.BadTypeValu):
                 nodes = await core.nodes('[ test:distoff=-3km ]')
+
+    async def test_model_geospace_telem(self):
+
+        async with self.getTestCore() as core:
+
+            nodes = await core.nodes('''
+                [ geo:telem=*
+                    :time=20220618
+                    :latlong=(10.1, 3.0)
+                    :desc=foobar
+                    :accuracy=10m
+                    :node=(test:int, 1234)
+
+                    :place={[ geo:place=({"name": "Woot"}) ]}
+                    :place:loc=us.ny.woot
+                    :place:name=Woot
+                    :place:country={[ pol:country=({"iso2": "us"}) ]}
+                    :place:country:code=us
+                    :place:address="123 main street"
+
+                    :place:latlong=(10.1, 3.0)
+                    :place:latlong:accuracy=10m
+
+                    :phys:mass=10kg
+                    :phys:width=5m
+                    :phys:height=10m
+                    :phys:length=20m
+                    :phys:volume=1000m
+                ]
+            ''')
+            self.eq(1655510400000, nodes[0].get('time'))
+            self.eq((10.1, 3.0), nodes[0].get('latlong'))
+            self.eq('foobar', nodes[0].get('desc'))
+            self.eq('woot', nodes[0].get('place:name'))
+            self.eq(10000, nodes[0].get('accuracy'))
+            self.len(1, await core.nodes('geo:telem -> geo:place +:name=woot'))
+            self.eq(('test:int', 1234), nodes[0].get('node'))
+            self.len(1, await core.nodes('test:int=1234'))
+
+            self.nn(nodes[0].get('place'))
+            self.nn('us.ny.woot', nodes[0].get('place:loc'))
+            self.nn('woot', nodes[0].get('place:name'))
+            self.nn('123 main street', nodes[0].get('place:address'))
+            self.eq((10.1, 3.0), nodes[0].get('place:latlong'))
+            self.eq(10000, nodes[0].get('place:latlong:accuracy'))
+
+            self.eq('10000', nodes[0].get('phys:mass'))
+            self.eq(5000, nodes[0].get('phys:width'))
+            self.eq(10000, nodes[0].get('phys:height'))
+            self.eq(20000, nodes[0].get('phys:length'))
+            self.eq(1000000, nodes[0].get('phys:volume'))
+
+    async def test_model_geospace_area(self):
+
+        async with self.getTestCore() as core:
+            area = core.model.type('geo:area')
+            self.eq(1, area.norm(1)[0])
+            self.eq(1000000, area.norm('1 sq.km')[0])
+            self.eq('1.0 sq.km', area.repr(1000000))
+            self.eq('1 sq.mm', area.repr(1))
+            with self.raises(s_exc.BadTypeValu):
+                area.norm('asdf')
+            with self.raises(s_exc.BadTypeValu):
+                area.norm('-1sq.km')

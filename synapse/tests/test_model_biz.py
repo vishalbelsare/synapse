@@ -1,6 +1,5 @@
 import logging
 
-import synapse.common as s_common
 import synapse.tests.utils as s_t_utils
 
 logger = logging.getLogger(__name__)
@@ -52,6 +51,7 @@ class BizModelTest(s_t_utils.SynTest):
             nodes = await core.nodes('''
                 [ biz:deal=*
 
+                    :id = " 12345  "
                     :title = HeHeHaHa
                     :type = baz.faz
                     :status = foo.bar
@@ -75,6 +75,7 @@ class BizModelTest(s_t_utils.SynTest):
                 ]
             ''')
             self.len(1, nodes)
+            self.eq(nodes[0].get('id'), '12345')
             self.eq(nodes[0].get('title'), 'HeHeHaHa')
             self.eq(nodes[0].get('type'), 'baz.faz.')
             self.eq(nodes[0].get('status'), 'foo.bar.')
@@ -99,6 +100,13 @@ class BizModelTest(s_t_utils.SynTest):
             self.eq('lololol', nodes[0].get('seller:orgname'))
             self.eq('lololol.com', nodes[0].get('seller:orgfqdn'))
 
+            for side in ('buyer', 'seller'):
+                for name in ('org', 'orgname', 'orgfqdn'):
+                    self.true(core.model.prop(f'biz:deal:{side}:{name}').deprecated)
+
+            msgs = await core.stormlist('biz:deal [ :buyer:orgname=hahahehe ]')
+            self.stormIsInWarn('The property biz:deal:buyer:orgname is deprecated', msgs)
+
             self.len(2, await core.nodes('biz:dealtype'))
 
             self.len(1, await core.nodes('biz:deal -> biz:rfp'))
@@ -113,6 +121,7 @@ class BizModelTest(s_t_utils.SynTest):
                     :count = 10
                     :price = 299999
                     :product = {[ biz:product=* :name=LoLoLoL ]}
+                    :service = {[ biz:service=* :name=WoWoWow ]}
                     :deal = { biz:deal }
                     :purchase = *
                 ]
@@ -124,11 +133,14 @@ class BizModelTest(s_t_utils.SynTest):
 
             self.nn(nodes[0].get('deal'))
             self.nn(nodes[0].get('product'))
+            self.nn(nodes[0].get('service'))
             self.nn(nodes[0].get('purchase'))
 
             self.len(1, await core.nodes('biz:bundle -> biz:deal'))
+            self.len(1, await core.nodes('biz:bundle -> biz:deal +:id=12345'))
             self.len(1, await core.nodes('biz:bundle -> econ:purchase'))
             self.len(1, await core.nodes('biz:bundle -> biz:product +:name=LoLoLoL'))
+            self.len(1, await core.nodes('biz:bundle -> biz:service +:name=WoWoWoW'))
 
             nodes = await core.nodes('''
                 [ biz:product=*
@@ -199,3 +211,39 @@ class BizModelTest(s_t_utils.SynTest):
             self.len(1, await core.nodes('biz:stake -> inet:fqdn'))
             self.len(1, await core.nodes('biz:stake :owner -> ps:contact'))
             self.len(1, await core.nodes('biz:stake :purchase -> econ:purchase'))
+
+            nodes = await core.nodes('''
+                [ biz:listing=*
+                    :seller={ ps:contact:name=visi | limit 1 }
+                    :product={[ biz:product=* :name=wootprod ]}
+                    :service={[ biz:service=*
+                        :name=wootsvc
+                        :type=awesome
+                        :summary="hehe haha"
+                        :provider={ ps:contact:name=visi | limit 1}
+                        :launched=20230124
+                    ]}
+                    :current=1
+                    :time=20221221
+                    :expires=2023
+                    :price=1000000
+                    :currency=usd
+                ]
+            ''')
+            self.len(1, nodes)
+            self.nn(nodes[0].get('seller'))
+            self.nn(nodes[0].get('product'))
+            self.nn(nodes[0].get('service'))
+            self.eq(True, nodes[0].get('current'))
+            self.eq(1671580800000, nodes[0].get('time'))
+            self.eq(1672531200000, nodes[0].get('expires'))
+            self.eq('1000000', nodes[0].get('price'))
+            self.eq('usd', nodes[0].get('currency'))
+
+            self.len(1, await core.nodes('biz:listing -> ps:contact +:name=visi'))
+            self.len(1, await core.nodes('biz:listing -> biz:product +:name=wootprod'))
+            self.len(1, await core.nodes('biz:listing -> biz:service +:name=wootsvc'))
+
+            nodes = await core.nodes('biz:listing -> biz:service')
+            self.len(1, nodes)
+            self.eq(1674518400000, nodes[0].get('launched'))

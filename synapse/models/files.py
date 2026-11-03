@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import binascii
 
 import synapse.exc as s_exc
 import synapse.common as s_common
@@ -64,6 +65,9 @@ class FilePath(s_types.Str):
 
             path.append(part)
 
+        if len(path) == 0:
+            return '', {}
+
         fullpath = lead + '/'.join(path)
 
         base = path[-1]
@@ -97,50 +101,66 @@ class FileBytes(s_types.Str):
             return norm, {}
 
         if valu.find(':') == -1:
+            try:
+                # we're ok with un-adorned sha256s
+                if len(valu) == 64 and s_common.uhex(valu):
+                    valu = valu.lower()
+                    subs = {'sha256': valu}
+                    return f'sha256:{valu}', {'subs': subs}
 
-            # we're ok with un-adorned sha256s
-            if len(valu) == 64 and s_common.uhex(valu):
-                valu = valu.lower()
-                subs = {'sha256': valu}
-                return f'sha256:{valu}', {'subs': subs}
+            except binascii.Error as e:
+                mesg = f'invalid unadorned file:bytes value: {e} - valu={valu}'
+                raise s_exc.BadTypeValu(valu=valu, name=self.name, mesg=mesg) from None
 
-            raise s_exc.BadTypeValu(name=self.name, valu=valu,
-                                    mesg='unadorned file:bytes value is not a sha256')
+            mesg = f'unadorned file:bytes value is not a sha256 - valu={valu}'
+            raise s_exc.BadTypeValu(name=self.name, valu=valu, mesg=mesg)
 
         kind, kval = valu.split(':', 1)
 
         if kind == 'base64':
-            byts = base64.b64decode(kval)
-            return self._normPyBytes(byts)
+            try:
+                byts = base64.b64decode(kval)
+                return self._normPyBytes(byts)
+            except binascii.Error as e:
+                mesg = f'invalid file:bytes base64 value: {e} - valu={kval}'
+                raise s_exc.BadTypeValu(valu=valu, name=self.name, mesg=mesg) from None
 
         kval = kval.lower()
 
         if kind == 'hex':
-            byts = s_common.uhex(kval)
-            return self._normPyBytes(byts)
+            try:
+                byts = s_common.uhex(kval)
+                return self._normPyBytes(byts)
+            except binascii.Error as e:
+                mesg = f'invalid file:bytes hex value: {e} - valu={kval}'
+                raise s_exc.BadTypeValu(valu=valu, name=self.name, mesg=mesg) from None
 
         if kind == 'guid':
 
             kval = kval.lower()
             if not s_common.isguid(kval):
                 raise s_exc.BadTypeValu(name=self.name, valu=valu,
-                                        mesg='guid is not a guid')
+                                        mesg=f'guid is not a guid - valu={kval}')
 
             return f'guid:{kval}', {}
 
         if kind == 'sha256':
 
             if len(kval) != 64:
-                raise s_exc.BadTypeValu(name=self.name, valu=valu,
-                                        mesg='invalid length for sha256 valu')
+                mesg = f'invalid length for sha256 value - valu={kval}'
+                raise s_exc.BadTypeValu(name=self.name, valu=valu, mesg=mesg)
 
-            s_common.uhex(kval)
+            try:
+                s_common.uhex(kval)
+            except binascii.Error as e:
+                mesg = f'invalid file:bytes sha256 value: {e} - valu={kval}'
+                raise s_exc.BadTypeValu(valu=valu, name=self.name, mesg=mesg) from None
 
             subs = {'sha256': kval}
             return f'sha256:{kval}', {'subs': subs}
 
-        raise s_exc.BadTypeValu(name=self.name, valu=valu, kind=kind,
-                                mesg='unable to norm as file:bytes')
+        mesg = f'unable to norm as file:bytes - valu={valu}'
+        raise s_exc.BadTypeValu(name=self.name, valu=valu, kind=kind, mesg=mesg)
 
     def _normPyBytes(self, valu):
 
@@ -149,8 +169,8 @@ class FileBytes(s_types.Str):
         norm = f'sha256:{sha256}'
 
         subs = {
-            'md5': hashlib.md5(valu).hexdigest(),
-            'sha1': hashlib.sha1(valu).hexdigest(),
+            'md5': hashlib.md5(valu, usedforsecurity=False).hexdigest(),
+            'sha1': hashlib.sha1(valu, usedforsecurity=False).hexdigest(),
             'sha256': sha256,
             'sha512': hashlib.sha512(valu).hexdigest(),
             'size': len(valu),
@@ -166,8 +186,9 @@ class FileModule(s_module.CoreModule):
     async def _hookFileBytesSha256(self, node, prop, norm):
         # this gets called post-norm and curv checks
         if node.ndef[1].startswith('sha256:'):
-            mesg = "Can't change :sha256 on a file:bytes with sha256 based primary property."
-            raise s_exc.BadTypeValu(mesg=mesg)
+            if node.ndef[1] != f'sha256:{norm}':
+                mesg = "Can't change :sha256 on a file:bytes with sha256 based primary property."
+                raise s_exc.BadTypeValu(mesg=mesg)
 
     async def _onSetFileBytesMime(self, node, oldv):
         name = node.get('mime')
@@ -238,6 +259,8 @@ class FileModule(s_module.CoreModule):
                             'doc': 'MIME specific lat/long information extracted from metadata.'}),
                         ('altitude', ('geo:altitude', {}), {
                             'doc': 'MIME specific altitude information extracted from metadata.'}),
+                        ('text', ('str', {'lower': True, 'onespace': True}), {
+                            'doc': 'The text contained within the image.'}),
                     ),
                     'doc': 'Properties common to image file formats.',
                     'interfaces': ('file:mime:meta',),
@@ -247,7 +270,7 @@ class FileModule(s_module.CoreModule):
                         ('file', ('file:bytes', {}), {
                             'doc': 'The Mach-O file containing the load command.'}),
                         ('type', ('int', {'enums': s_l_macho.getLoadCmdTypes()}), {
-                            'doc': 'The type of the load command'}),
+                            'doc': 'The type of the load command.'}),
                         ('size', ('int', {}), {
                             'doc': 'The size of the load command structure in bytes.'}),
                     ),
@@ -261,6 +284,19 @@ class FileModule(s_module.CoreModule):
                     'doc': 'A parent file that fully contains the specified child file.',
                 }),
 
+                ('file:attachment', ('guid', {}), {
+                    'display': {
+                        'columns': (
+                            {'type': 'prop', 'opts': {'name': 'name'}},
+                            {'type': 'prop', 'opts': {'name': 'file'}},
+                            {'type': 'prop', 'opts': {'name': 'text'}},
+                        ),
+                    },
+                    'doc': 'A file attachment.'}),
+
+                ('file:archive:entry', ('guid', {}), {
+                    'doc': 'An archive entry representing a file and metadata within a parent archive file.'}),
+
                 ('file:filepath', ('comp', {'fields': (('file', 'file:bytes'), ('path', 'file:path'))}), {
                     'doc': 'The fused knowledge of the association of a file:bytes node and a file:path.',
                 }),
@@ -273,6 +309,10 @@ class FileModule(s_module.CoreModule):
                 ('file:ismime', ('comp', {'fields': (('file', 'file:bytes'), ('mime', 'file:mime'))}), {
                     'doc': 'Records one, of potentially multiple, mime types for a given file.',
                 }),
+
+                ('file:mime:pdf', ('guid', {}), {
+                    'interfaces': ('file:mime:meta',),
+                    'doc': 'Metadata extracted from a Portable Document Format (PDF) file.'}),
 
                 ('file:mime:msdoc', ('guid', {}), {
                     'doc': 'The GUID of a set of mime metadata for a Microsoft Word file.',
@@ -354,7 +394,7 @@ class FileModule(s_module.CoreModule):
                     'doc': 'The typecode for the resource.',
                 }),
 
-                ('pe:langid', ('int', {'enums': s_l_pe.getLangCodes()}), {
+                ('pe:langid', ('int', {'min': 0, 'max': 0xffff, 'enums': s_l_pe.getLangCodes(), 'enums:strict': False}), {
                     'doc': 'The PE language id.',
                 }),
 
@@ -382,8 +422,14 @@ class FileModule(s_module.CoreModule):
                     'doc': 'A section inside a Mach-O binary denoting a named region of bytes inside a segment.',
                 }),
 
+                ('file:mime:lnk', ('guid', {}), {
+                    'doc': 'The GUID of the metadata pulled from a Windows shortcut or LNK file.',
+                }),
             ),
-
+            'edges': (
+                (('file:bytes', 'refs', 'it:dev:str'), {
+                    'doc': 'The source file contains the target string.'}),
+            ),
             'forms': (
 
                 ('file:bytes', {}, (
@@ -398,6 +444,9 @@ class FileModule(s_module.CoreModule):
 
                     ('sha512', ('hash:sha512', {}), {'doc': 'The sha512 hash of the file.'}),
 
+                    ('ssdeeps', ('array', {'type': 'hash:ssdeep', 'uniq': True, 'sorted': True}), {
+                        'doc': 'The ssdeep fuzzy hashes of the file.'}),
+
                     ('name', ('file:base', {}), {
                         'doc': 'The best known base name for the file.'}),
 
@@ -410,7 +459,7 @@ class FileModule(s_module.CoreModule):
                     ('mime:pe:size', ('int', {}), {
                         'doc': 'The size of the executable file according to the PE file header.'}),
 
-                    ('mime:pe:imphash', ('guid', {}), {
+                    ('mime:pe:imphash', ('hash:md5', {}), {
                         'doc': 'The PE import hash of the file as calculated by pefile; '
                                'https://github.com/erocarrera/pefile .'}),
 
@@ -429,6 +478,11 @@ class FileModule(s_module.CoreModule):
                     ('mime:pe:richhdr', ('hash:sha256', {}), {
                         'doc': 'The sha256 hash of the rich header bytes.'}),
 
+                    ('exe:compiler', ('it:prod:softver', {}), {
+                        'doc': 'The software used to compile the file.'}),
+
+                    ('exe:packer', ('it:prod:softver', {}), {
+                        'doc': 'The packer software used to encode the file.'}),
                 )),
 
                 ('file:mime', {}, ()),
@@ -442,6 +496,39 @@ class FileModule(s_module.CoreModule):
                         'ro': True,
                         'doc': 'The mime type of the file.',
                     }),
+                )),
+
+                ('file:mime:pdf', {}, (
+
+                    ('id', ('str', {'strip': True}), {
+                        'doc': 'The "DocumentID" field extracted from PDF metadata.'}),
+
+                    ('title', ('str', {}), {
+                        'doc': 'The "Title" field extracted from PDF metadata.'}),
+
+                    ('author:name', ('entity:name', {}), {
+                        'doc': 'The "Author" field extracted from PDF metadata.'}),
+
+                    ('language:name', ('lang:name', {}), {
+                        'doc': 'The "Language" field extracted from PDF metadata.'}),
+
+                    ('created', ('time', {}), {
+                        'doc': 'The "CreatedDate" field extracted from PDF metadata.'}),
+
+                    ('updated', ('time', {}), {
+                        'doc': 'The "ModifyDate" field extracted from PDF metadata.'}),
+
+                    ('producer:name', ('it:prod:softname', {}), {
+                        'doc': 'The "Producer" field extracted from PDF metadata.'}),
+
+                    ('tool:name', ('it:prod:softname', {}), {
+                        'doc': 'The "CreatorTool" field extracted from PDF metadata.'}),
+
+                    ('subject', ('str', {}), {
+                        'doc': 'The "Subject" field extracted from PDF metadata.'}),
+
+                    ('keywords', ('array', {'type': 'media:topic', 'uniq': True, 'sorted': True}), {
+                        'doc': 'The "Keywords" field extracted from PDF metadata.'}),
                 )),
 
                 ('file:mime:msdoc', {}, ()),
@@ -564,6 +651,57 @@ class FileModule(s_module.CoreModule):
                     }),
                 )),
 
+                ('file:attachment', {}, (
+
+                    ('name', ('file:path', {}), {
+                        'doc': 'The name of the attached file.'}),
+
+                    ('text', ('str', {}), {
+                        'doc': 'Any text associated with the file such as alt-text for images.'}),
+
+                    ('file', ('file:bytes', {}), {
+                        'doc': 'The file which was attached.'}),
+                )),
+
+                ('file:archive:entry', {}, (
+
+                    ('parent', ('file:bytes', {}), {
+                        'doc': 'The parent archive file.'}),
+
+                    ('file', ('file:bytes', {}), {
+                        'doc': 'The file contained within the archive.'}),
+
+                    ('path', ('file:path', {}), {
+                        'doc': 'The file path of the archived file.'}),
+
+                    ('user', ('inet:user', {}), {
+                        'doc': 'The name of the user who owns the archived file.'}),
+
+                    ('added', ('time', {}), {
+                        'doc': 'The time that the file was added to the archive.'}),
+
+                    ('created', ('time', {}), {
+                        'doc': 'The created time of the archived file.'}),
+
+                    ('modified', ('time', {}), {
+                        'doc': 'The modified time of the archived file.'}),
+
+                    ('comment', ('str', {}), {
+                        'doc': 'The comment field for the file entry within the archive.'}),
+
+                    ('posix:uid', ('int', {}), {
+                        'doc': 'The POSIX UID of the user who owns the archived file.'}),
+
+                    ('posix:gid', ('int', {}), {
+                        'doc': 'The POSIX GID of the group who owns the archived file.'}),
+
+                    ('posix:perms', ('int', {}), {
+                        'doc': 'The POSIX permissions mask of the archived file.'}),
+
+                    ('archived:size', ('int', {}), {
+                        'doc': 'The encoded or compressed size of the archived file within the parent.'}),
+                )),
+
                 ('file:subfile', {}, (
                     ('parent', ('file:bytes', {}), {
                         'ro': True,
@@ -612,7 +750,7 @@ class FileModule(s_module.CoreModule):
                     ('sha256', ('hash:sha256', {}), {
                         'doc': 'The sha256 hash of the bytes of the segment.'}),
                     ('offset', ('int', {}), {
-                        'doc': 'The file offset to the begining of the segment.'}),
+                        'doc': 'The file offset to the beginning of the segment.'}),
                 )),
                 ('file:mime:macho:section', {}, (
                     ('segment', ('file:mime:macho:segment', {}), {
@@ -626,9 +764,53 @@ class FileModule(s_module.CoreModule):
                     ('sha256', ('hash:sha256', {}), {
                         'doc': 'The sha256 hash of the bytes of the Mach-O section.'}),
                     ('offset', ('int', {}), {
-                        'doc': 'The file offset to the begining of the section'}),
+                        'doc': 'The file offset to the beginning of the section.'}),
                 )),
 
+                ('file:mime:lnk', {}, (
+                    ('flags', ('int', {}), {
+                        'doc': 'The flags specified by the LNK header that control the structure of the LNK file.'}),
+                    ('entry:primary', ('file:path', {}), {
+                        'doc': 'The primary file path contained within the FileEntry structure of the LNK file.'}),
+                    ('entry:secondary', ('file:path', {}), {
+                        'doc': 'The secondary file path contained within the FileEntry structure of the LNK file.'}),
+                    ('entry:extended', ('file:path', {}), {
+                        'doc': 'The extended file path contained within the extended FileEntry structure of the LNK file.'}),
+                    ('entry:localized', ('file:path', {}), {
+                        'doc': 'The localized file path reconstructed from references within the extended FileEntry structure of the LNK file.'}),
+                    ('entry:icon', ('file:path', {}), {
+                        'doc': 'The icon file path contained within the StringData structure of the LNK file.'}),
+                    ('environment:path', ('file:path', {}), {
+                        'doc': 'The target file path contained within the EnvironmentVariableDataBlock structure of the LNK file.'}),
+                    ('environment:icon', ('file:path', {}), {
+                        'doc': 'The icon file path contained within the IconEnvironmentDataBlock structure of the LNK file.'}),
+                    ('iconindex', ('int', {}), {
+                        'doc': 'A resource index for an icon within an icon location.'}),
+                    ('working', ('file:path', {}), {
+                        'doc': 'The working directory used when activating the link target.'}),
+                    ('relative', ('str', {'strip': True}), {
+                        'doc': 'The relative target path string contained within the StringData structure of the LNK file.'}),
+                    ('arguments', ('it:cmd', {}), {
+                        'doc': 'The command line arguments passed to the target file when the LNK file is activated.'}),
+                    ('desc', ('str', {}), {
+                        'disp': {'hint': 'text'},
+                        'doc': 'The description of the LNK file contained within the StringData section of the LNK file.'}),
+                    ('target:attrs', ('int', {}), {
+                        'doc': 'The attributes of the target file according to the LNK header.'}),
+                    ('target:size', ('int', {}), {
+                        'doc': 'The size of the target file according to the LNK header. The LNK format specifies that this is only the lower 32 bits of the target file size.'}),
+                    ('target:created', ('time', {}), {
+                        'doc': 'The creation time of the target file according to the LNK header.'}),
+                    ('target:accessed', ('time', {}), {
+                        'doc': 'The access time of the target file according to the LNK header.'}),
+                    ('target:written', ('time', {}), {
+                        'doc': 'The write time of the target file according to the LNK header.'}),
+
+                    ('driveserial', ('int', {}), {
+                        'doc': 'The drive serial number of the volume the link target is stored on.'}),
+                    ('machineid', ('it:hostname', {}), {
+                        'doc': 'The NetBIOS name of the machine where the link target was last located.'}),
+                )),
             ),
 
         }

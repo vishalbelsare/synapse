@@ -66,7 +66,7 @@ class FixedCache:
 
     def get(self, key):
         if self.iscorocall:
-            raise s_exc.BadArg('cache was initialized with coroutine.  Must use aget')
+            raise s_exc.BadArg(mesg='cache was initialized with coroutine.  Must use aget')
 
         valu = self.cache.get(key, s_common.novalu)
         if valu is not s_common.novalu:
@@ -81,7 +81,7 @@ class FixedCache:
 
     async def aget(self, key):
         if not self.iscorocall:
-            raise s_exc.BadOperArg('cache was initialized with non coroutine.  Must use get')
+            raise s_exc.BadOperArg(mesg='cache was initialized with non coroutine.  Must use get')
 
         valu = self.cache.get(key, s_common.novalu)
         if valu is not s_common.novalu:
@@ -179,6 +179,14 @@ def getTagGlobRegx(name):
     regq = regexizeTagGlob(name)
     return regex.compile(regq)
 
+def regexizeEdgeGlob(edge):
+    return ReRegex.sub(r'(.+)', regex.escape(edge))
+
+@memoize()
+def getEdgeGlobRegx(name):
+    regq = regexizeEdgeGlob(name)
+    return regex.compile(regq)
+
 class TagGlobs:
     '''
     An object that manages multiple tag globs and values for caching.
@@ -191,7 +199,7 @@ class TagGlobs:
 
         self.cache.clear()
 
-        regx = getTagGlobRegx(name)
+        regx = self._getGlobRegex(name)
 
         glob = (regx, (name, valu))
 
@@ -213,5 +221,12 @@ class TagGlobs:
     def get(self, name):
         return self.cache.get(name)
 
+    def _getGlobRegex(self, name):
+        return getTagGlobRegx(name)
+
     def _getGlobMatches(self, name):
         return [g[1] for g in self.globs if g[0].fullmatch(name) is not None]
+
+class EdgeGlobs(TagGlobs):
+    def _getGlobRegex(self, name):
+        return getEdgeGlobRegx(name)

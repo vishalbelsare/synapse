@@ -1,4 +1,5 @@
 import os
+import sys
 
 import vcr
 
@@ -21,7 +22,7 @@ HI
 .. storm-pre:: [ inet:ipv6=0 ]
 .. storm-pkg:: synapse/tests/files/stormpkg/testpkg.yaml
 .. storm:: --hide-props testpkgcmd foo
-.. storm:: --hide-query $lib.print(secret)
+.. storm:: --hide-query $lib.print(secret) $lib.print($lib.globals.get(testpkg))
 .. storm:: --hide-query file:bytes
 .. storm-svc:: synapse.tests.files.rstorm.testsvc.Testsvc test {"secret": "jupiter"}
 .. storm:: testsvc.test
@@ -44,6 +45,7 @@ HI
 ::
 
     secret
+    testpkg-done
 
 ::
 
@@ -53,6 +55,7 @@ HI
 
     > testsvc.test
     jupiter
+    testsvc-done
 
 '''
 
@@ -104,7 +107,7 @@ multi_rst_in_http_opts = '''
 .. storm-vcr-opts:: {"record_mode": "none"}
 .. storm-vcr-callback:: synapse.tests.test_lib_rstorm.vcrcallbacktst
 .. storm-mock-http:: /this/path/does/not/exist.yaml
-.. storm:: $resp = $lib.inet.http.get("http://example.com") if $resp.body { $lib.print('unexpected results') } else { $lib.print($lib.str.concat('this', ' test', ' passed')) }
+.. storm:: $resp = $lib.inet.http.get("http://example.com") if $resp.body { $lib.print('unexpected results') } else { $lib.print('this test passed') }
 '''
 
 storm_http_sadpath_callback = '''
@@ -117,7 +120,7 @@ clear_storm_opts = '''
 .. storm-cortex:: default
 .. storm-opts:: {"vars": {"foobar": "bar"}}
 .. storm-clear-http:: true
-.. storm:: $lib.print($lib.str.concat($foobar, "bizboz"))
+.. storm:: $lib.print(`{$foobar}bizboz`)
 '''
 
 stormenv = '''
@@ -204,7 +207,7 @@ multiline00_input = '''
 A multiline secondary property.
 .. storm-cortex:: default
 .. storm-opts:: {"vars": {"name": "Node\\nWith a\\nweird name"}}
-.. storm:: [graph:node=(n1,) :name=$name]
+.. storm:: [meta:note=(n1,) :text=$name]
 Bye!
 '''
 
@@ -212,13 +215,109 @@ multiline00_output = '''
 A multiline secondary property.
 ::
 
-    > [graph:node=(n1,) :name=$name]
-    graph:node=85d3511b97098d7fd9e07be21f6390de
-            :name = Node
+    > [meta:note=(n1,) :text=$name]
+    meta:note=85d3511b97098d7fd9e07be21f6390de
+            :text = Node
                     With a
                     weird name
 
 Bye!
+'''
+
+shell_input00 = '''
+Shell with environment variable.
+
+.. shell-env:: SYN_HEHE_HAHA=BEEP SYN_FOO=BAR
+.. shell:: python3 -c "import os; print('HEHE_HAHA', os.environ.get('SYN_HEHE_HAHA')); print('FOO', os.environ.get('SYN_FOO'))"
+.. shell-env::
+.. shell:: python3 -c "import os; print('HEHE_HAHA', os.environ.get('SYN_HEHE_HAHA')); print('FOO', os.environ.get('SYN_FOO'))"
+'''
+
+shell_output00 = '''
+Shell with environment variable.
+
+::
+
+  python3 -c "import os; print('HEHE_HAHA', os.environ.get('SYN_HEHE_HAHA')); print('FOO', os.environ.get('SYN_FOO'))"
+
+  HEHE_HAHA BEEP
+  FOO BAR
+
+
+::
+
+  python3 -c "import os; print('HEHE_HAHA', os.environ.get('SYN_HEHE_HAHA')); print('FOO', os.environ.get('SYN_FOO'))"
+
+  HEHE_HAHA None
+  FOO None
+
+
+'''
+
+shell_input01 = '''
+Shell hide query.
+
+.. shell:: --hide-query python3 -c "print('WOOT')"
+'''
+
+shell_output01 = '''
+Shell hide query.
+
+::
+
+  WOOT
+
+
+'''
+
+shell_input02 = '''
+Shell include stderr.
+
+.. shell:: --hide-query \
+    python3 -c "import sys; print('FOO00'); sys.stdout.flush(); print('BAR00', file=sys.stderr); print('BAZ00')"
+.. shell:: --hide-query --include-stderr \
+    python3 -c "import sys; print('FOO01'); sys.stdout.flush(); print('BAR01', file=sys.stderr); print('BAZ01')"
+'''
+
+shell_output02 = '''
+Shell include stderr.
+
+::
+
+  FOO00
+  BAZ00
+
+
+::
+
+  FOO01
+  BAR01
+  BAZ01
+
+
+'''
+
+shell_text03 = '''--hide-query python3 -c "import sys; print('WOOT'); sys.exit(1)"'''
+shell_input03 = f'''
+Shell non-zero exit.
+
+.. shell:: {shell_text03}
+'''
+
+shell_text04 = '''--hide-query --fail-ok python3 -c "import sys; print('WOOT'); sys.exit(1)"'''
+shell_input04 = f'''
+Shell non-zero exit.
+
+.. shell:: {shell_text04}
+'''
+shell_output04 = '''
+Shell non-zero exit.
+
+::
+
+  WOOT
+
+
 '''
 
 fail00 = '''
@@ -259,6 +358,37 @@ HI
 .. storm-cortex:: path.to.NewpCell
 '''
 
+pkg_onload_timeout = '''
+.. storm-cortex:: default
+.. storm-pre:: $lib.globals.set(onload_sleep, 2)
+.. storm-pkg:: synapse/tests/files/stormpkg/testpkg.yaml
+'''
+
+svc_onload_timeout = '''
+.. storm-cortex:: default
+.. storm-pre:: $lib.globals.set(onload_sleep, 2)
+.. storm-svc:: synapse.tests.files.rstorm.testsvc.Testsvc test {"secret": "jupiter"}
+'''
+
+initpkg_yaml = '''
+name: initpkg
+version: 0.0.1
+inits:
+  versions:
+    - name: first
+      version: 0
+      inaugural: true
+      query: |
+        $lib.time.sleep($lib.globals.get(init_sleep, 0))
+        $lib.globals.set(initpkg, initpkg-done)
+'''
+
+svc_inits_wait = '''
+.. storm-cortex:: default
+.. storm-pre:: $lib.globals.set(init_sleep, 1)
+.. storm-svc:: synapse.tests.files.rstorm.testsvc.Testsvc test {"secret": "jupiter"}
+.. storm:: --hide-query $lib.print($lib.globals.get(testsvcinits))
+'''
 
 async def get_rst_text(rstfile):
     async with await s_rstorm.StormRst.anit(rstfile) as rstorm:
@@ -329,6 +459,42 @@ class RStormLibTest(s_test.SynTest):
             text_nocrt = '\n'.join(line for line in text.split('\n') if '.created =' not in line)
             self.eq(text_nocrt, multiline_storm_output)
 
+            # shell and shell-env
+            path = s_common.genpath(dirn, 'shell00.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(shell_input00.encode())
+            text = await get_rst_text(path)
+            self.eq(text, shell_output00)
+
+            # shell --hide-query
+            path = s_common.genpath(dirn, 'shell01.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(shell_input01.encode())
+            text = await get_rst_text(path)
+            self.eq(text, shell_output01)
+
+            # shell --include-stderr
+            path = s_common.genpath(dirn, 'shell02.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(shell_input02.encode())
+            text = await get_rst_text(path)
+            self.eq(text, shell_output02)
+
+            # shell non-zero exit
+            path = s_common.genpath(dirn, 'shell03.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(shell_input03.encode())
+            with self.raises(s_exc.SynErr) as exc:
+                await get_rst_text(path)
+            self.eq(exc.exception.get('mesg'), f'Error when executing shell directive: {shell_text03} (rv: 1)')
+
+            # shell non-zero exit --fail-ok
+            path = s_common.genpath(dirn, 'shell04.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(shell_input04.encode())
+            text = await get_rst_text(path)
+            self.eq(text, shell_output04)
+
             # http
             path = s_common.genpath(dirn, 'http.rst')
             with s_common.genfile(path) as fd:
@@ -339,7 +505,7 @@ class RStormLibTest(s_test.SynTest):
             self.isin('inet:ipv4=5.6.7.8', text)  # one mock at a time
             self.isin('it:dev:str=notjson', text)  # one mock at a time
 
-            # multi reqest in 1 rstorm command
+            # multi request in 1 rstorm command
             path = s_common.genpath(dirn, 'http_multi.rst')
             with s_common.genfile(path) as fd:
                 fd.write(multi_rst_in_http.encode())
@@ -368,8 +534,9 @@ class RStormLibTest(s_test.SynTest):
             path = s_common.genpath(dirn, 'clear_storm_opts.rst')
             with s_common.genfile(path) as fd:
                 fd.write(clear_storm_opts.encode())
-            with self.raises(s_exc.StormRuntimeError):
-                text = await get_rst_text(path)
+            with self.raises(s_exc.StormRuntimeError) as cm:
+                await get_rst_text(path)
+            self.eq('Missing variable: foobar', cm.exception.get('mesg'))
 
             # boom1 test
             path = s_common.genpath(dirn, 'boom1.rst')
@@ -496,6 +663,64 @@ class RStormLibTest(s_test.SynTest):
             with self.raises(s_exc.NoSuchCtor):
                 await get_rst_text(path)
 
+            # packages with inits but no onload are waited on
+
+            initpkg = s_common.genpath(dirn, 'initpkg.yaml')
+            with s_common.genfile(initpkg) as fd:
+                fd.write(initpkg_yaml.encode())
+
+            pkg_inits_wait = f'''
+.. storm-cortex:: default
+.. storm-pre:: $lib.globals.set(init_sleep, 1)
+.. storm-pkg:: {initpkg}
+.. storm:: --hide-query $lib.print($lib.globals.get(initpkg))
+'''
+            path = s_common.genpath(dirn, 'pkg_inits_wait.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(pkg_inits_wait.encode())
+            text = await get_rst_text(path)
+            self.isin('initpkg-done', text)
+
+            path = s_common.genpath(dirn, 'svc_inits_wait.rst')
+            with s_common.genfile(path) as fd:
+                fd.write(svc_inits_wait.encode())
+            text = await get_rst_text(path)
+            self.isin('testsvcinits-done', text)
+
+            # onload failures
+
+            try:
+                oldv = s_rstorm.ONLOAD_TIMEOUT
+                s_rstorm.ONLOAD_TIMEOUT = 0.1
+
+                path = s_common.genpath(dirn, 'pkg_onload_timeout.rst')
+                with s_common.genfile(path) as fd:
+                    fd.write(pkg_onload_timeout.encode())
+                with self.raises(s_exc.SynErr) as ectx:
+                    await get_rst_text(path)
+                self.eq('Package onload failed to run for testpkg', ectx.exception.errinfo['mesg'])
+
+                path = s_common.genpath(dirn, 'svc_onload_timeout.rst')
+                with s_common.genfile(path) as fd:
+                    fd.write(svc_onload_timeout.encode())
+                with self.raises(s_exc.SynErr) as ectx:
+                    await get_rst_text(path)
+                self.eq('Package onload failed to run for service test', ectx.exception.errinfo['mesg'])
+
+                # inits without an onload time out the same way
+                path = s_common.genpath(dirn, 'pkg_inits_wait.rst')
+                with self.raises(s_exc.SynErr) as ectx:
+                    await get_rst_text(path)
+                self.eq('Package onload failed to run for initpkg', ectx.exception.errinfo['mesg'])
+
+                path = s_common.genpath(dirn, 'svc_inits_wait.rst')
+                with self.raises(s_exc.SynErr) as ectx:
+                    await get_rst_text(path)
+                self.eq('Package onload failed to run for service test', ectx.exception.errinfo['mesg'])
+
+            finally:
+                s_rstorm.ONLOAD_TIMEOUT = oldv
+
     async def test_rstorm_cli(self):
 
         with self.getTestDir() as dirn:
@@ -607,3 +832,50 @@ class RStormLibTest(s_test.SynTest):
                 fd.write(fix_input_for_cli(fail02).encode())
             with self.raises(s_exc.StormRuntimeError):
                 await get_rst_text(path)
+
+    async def test_rstorm_python_path(self):
+        content = '''#comment
+import synapse.lib.cell as s_cell
+import synapse.lib.stormsvc as s_stormsvc
+
+class SomeApi(s_stormsvc.StormSvc, s_cell.CellApi):
+    _storm_svc_name = 'someservice'
+    _storm_svc_vers = '0.1.0',
+    _storm_svc_pkgs = ()
+
+class SomeService(s_cell.Cell):
+    cellapi = SomeApi
+'''
+        with self.getTestDir() as dirn:
+            with s_common.genfile(dirn, 'somefile.py') as fd:
+                fd.write(content.encode())
+            pythonpath_rst_in = f'''
+.. storm-cortex:: default
+.. storm-python-path:: {dirn}
+.. storm-svc:: somefile.SomeService fooservice {{"https:port": 0}}
+.. storm:: service.list
+
+hello world
+            '''
+            rst_path = s_common.genpath(dirn, 'test.rst')
+
+            with s_common.genfile(rst_path) as fd:
+                fd.write(pythonpath_rst_in.encode())
+
+            pythonpath_rst_out = await get_rst_text(rst_path)
+            self.notin('storm-python-path', pythonpath_rst_out)
+            self.isin('(fooservice) (someservice @ 0.1.0)', pythonpath_rst_out)
+            self.isin('hello world', pythonpath_rst_out)
+            # Fini handler cleaned up the path manipulation
+            self.notin(dirn, sys.path)
+
+            # Sad path
+            pythonpath_rst_in = f'''
+.. storm-python-path:: {dirn}/{s_common.guid()}
+hello world
+            '''
+            rst_path = s_common.genpath(dirn, 'test.rst')
+            with s_common.genfile(rst_path) as fd:
+                fd.write(pythonpath_rst_in.encode())
+            with self.raises(s_exc.NoSuchDir):
+                await get_rst_text(rst_path)

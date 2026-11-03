@@ -1,7 +1,6 @@
 import logging
 
 import synapse.exc as s_exc
-import synapse.common as s_common
 
 import synapse.lib.stormtypes as s_stormtypes
 
@@ -116,6 +115,16 @@ class LoggerLib(s_stormtypes.Lib):
     )
 
     _storm_lib_path = ('log',)
+    _storm_lib_perms = (
+        {'perm': ('storm', 'lib', 'log', 'debug'), 'gate': 'cortex',
+            'desc': 'Controls the ability to log a debug level message.'},
+        {'perm': ('storm', 'lib', 'log', 'error'), 'gate': 'cortex',
+            'desc': 'Controls the ability to log a error level message.'},
+        {'perm': ('storm', 'lib', 'log', 'info'), 'gate': 'cortex',
+            'desc': 'Controls the ability to log a info level message.'},
+        {'perm': ('storm', 'lib', 'log', 'warning'), 'gate': 'cortex',
+            'desc': 'Controls the ability to log a warning level message.'},
+    )
 
     def getObjLocals(self):
         return {
@@ -126,15 +135,17 @@ class LoggerLib(s_stormtypes.Lib):
         }
 
     async def _getExtra(self, extra=None):
+
         if extra is None:
-            return extra
+            extra = {}
+
         extra = await s_stormtypes.toprim(extra)
         if extra and not isinstance(extra, dict):
             mesg = f'extra provided to log call must be a dictionary compatible type. Got {extra.__class__.__name__} ' \
                    f'instead.'
             raise s_exc.BadArg(mesg=mesg, arg='extra')
-        extra = {'synapse': extra}
-        return extra
+
+        return self.runt.snap.core.getLogExtra(**extra)
 
     @s_stormtypes.stormfunc(readonly=True)
     async def _logDebug(self, mesg, extra=None):

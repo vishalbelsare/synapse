@@ -1,5 +1,4 @@
 import synapse.exc as s_exc
-import synapse.common as s_common
 
 import synapse.lib.version as s_version
 import synapse.lib.stormtypes as s_stormtypes
@@ -46,12 +45,15 @@ class VersionLib(s_stormtypes.Lib):
             'synapse': self._getSynVersion,
         }
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getSynVersion(self):
         return s_version.version
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getSynCommit(self):
         return s_version.commit
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def matches(self, vertup, reqstr):
         reqstr = await s_stormtypes.tostr(reqstr)
         vertup = tuple(await s_stormtypes.toprim(vertup))

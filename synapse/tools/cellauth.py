@@ -1,14 +1,10 @@
-import os
-import sys
 import asyncio
 import logging
 import functools
 import traceback
-import contextlib
 import synapse.exc as s_exc
 import synapse.common as s_common
 
-import synapse.glob as s_glob
 import synapse.telepath as s_telepath
 
 import synapse.lib.cmd as s_cmd
@@ -20,7 +16,7 @@ logger = logging.getLogger(__name__)
 desc = '''
 Manage permissions of users, roles, and objects in a remote cell.
 '''
-outp = None
+outp = None  # type: s_output.OutPut
 
 min_authgate_vers = (0, 1, 33)
 reqver = '>=0.2.0,<3.0.0'
@@ -92,7 +88,7 @@ async def handleModify(opts):
 
     if opts.object and not opts.addrule:
         outp.printf('--object option only valid with --addrule')
-        return -1
+        return 1
 
     try:
         async with await s_telepath.openurl(opts.cellurl) as cell:
@@ -201,7 +197,7 @@ async def handleModify(opts):
                 if delrule is not None:
                     await cell.delAuthRule(opts.name, delrule, gateiden=delgate)
                 else:
-                    outp.printf(f'rule index is out of range')
+                    outp.printf('rule index is out of range')
 
             try:
                 user = await cell.getAuthInfo(opts.name)
@@ -241,7 +237,7 @@ async def handleList(opts):
                 await printuser(user, cell=cell, details=opts.detail)
                 return 0
 
-            outp.printf(f'getting users and roles')
+            outp.printf('getting users and roles')
 
             outp.printf('users:')
             for user in await cell.getAuthUsers():
@@ -268,24 +264,20 @@ async def handleList(opts):
     else:
         return 0
 
-async def main(argv, outprint=None):
-    if outprint is None:   # pragma: no cover
-        outprint = s_output.OutPut()
+async def main(argv, outprint=s_output.stdout):
     global outp
     outp = outprint
 
-    async with contextlib.AsyncExitStack() as cm:
+    mesg = s_common.deprecated('synapse.tools.cellauth', curv='2.164.0')
+    outp.printf(f'WARNING: {mesg}')
 
-        teleyaml = s_common.getSynPath('telepath.yaml')
-        if os.path.isfile(teleyaml):
-            fini = await s_telepath.loadTeleEnv(teleyaml)
-            cm.push_async_callback(fini)
+    async with s_telepath.withTeleEnv():
 
         pars = makeargparser()
         try:
             opts = pars.parse_args(argv)
         except s_exc.ParserExit:
-            return -1
+            return 1
 
         retn = await opts.func(opts)
 
@@ -293,7 +285,7 @@ async def main(argv, outprint=None):
 
 def makeargparser():
     global outp
-    pars = s_cmd.Parser('synapse.tools.cellauth', outp=outp, description=desc)
+    pars = s_cmd.Parser(prog='synapse.tools.cellauth', outp=outp, description=desc)
 
     pars.add_argument('--debug', action='store_true', help='Show debug traceback on error.')
     pars.add_argument('cellurl', help='The telepath URL to connect to a cell.')
@@ -341,9 +333,5 @@ def makeargparser():
     pars_mod.set_defaults(func=handleModify)
     return pars
 
-async def _main():  # pragma: no cover
-    s_common.setlogging(logger, 'DEBUG')
-    return await main(sys.argv[1:])
-
 if __name__ == '__main__':  # pragma: no cover
-    sys.exit(s_glob.sync(_main()))
+    s_cmd.exitmain(main)

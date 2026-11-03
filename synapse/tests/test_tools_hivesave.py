@@ -6,7 +6,6 @@ import synapse.common as s_common
 import synapse.tests.utils as s_test
 
 import synapse.lib.cell as s_cell
-import synapse.lib.hive as s_hive
 import synapse.lib.msgpack as s_msgpack
 
 import synapse.tools.hive.save as s_hivesave
@@ -18,8 +17,8 @@ class HiveSaveTest(s_test.SynTest):
 
             hivepath0 = os.path.join(dirn, 'hivesave0.mpk')
 
-            async with self.getTestHiveDmon() as dmon:
-                hurl = self.getTestUrl(dmon, 'hive')
+            async with self.getTestCell() as cell:
+                hurl = cell.getLocalUrl()
 
                 argv = [hurl, hivepath0]
 
@@ -29,6 +28,7 @@ class HiveSaveTest(s_test.SynTest):
                 with mock.patch('synapse.telepath.Proxy._getSynVers', _getOldSynVers):
                     outp = self.getTestOutp()
                     retn = await s_hivesave.main(argv, outp=outp)
+                    outp.expect('WARNING: synapse.tools.hive.save is deprecated in 2.167.0 and will be removed in 3.0.0')
                     outp.expect('Hive version 0.0.0 is outside of the hive.save supported range')
                     self.eq(1, retn)
 
@@ -39,12 +39,10 @@ class HiveSaveTest(s_test.SynTest):
             hivepath0 = os.path.join(dirn, 'hivesave0.mpk')
             yamlpath0 = os.path.join(dirn, 'hivesave0.yaml')
 
-            async with self.getTestHiveDmon() as dmon:
+            async with self.getTestCell() as cell:
+                hurl = cell.getLocalUrl()
 
-                hive = dmon.shared.get('hive')
-                await hive.set(('baz', 'faz'), 'visi')
-
-                hurl = self.getTestUrl(dmon, 'hive')
+                await cell.hive.set(('baz', 'faz'), 'visi')
 
                 retn = await s_hivesave.main([hurl, hivepath0])
                 self.eq(0, retn)

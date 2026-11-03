@@ -1,6 +1,3 @@
-import synapse.exc as s_exc
-import synapse.common as s_common
-
 import synapse.lib.crypto.coin as s_coin
 import synapse.lib.stormtypes as s_stormtypes
 
@@ -16,7 +13,7 @@ class EthereumLib(s_stormtypes.Lib):
                       {'name': 'addr', 'type': 'str', 'desc': 'The Ethereum address to be converted.'},
                   ),
                   'returns': {'type': 'list',
-                              'desc': 'A list of (<bool>, <addr>) for status and checksummed address.', },
+                              'desc': 'A list of (<boolean>, <addr>) for status and checksummed address.', },
         }},
     )
 
@@ -27,6 +24,7 @@ class EthereumLib(s_stormtypes.Lib):
             'eip55': self.eip55,
         }
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def eip55(self, addr):
         addr = await s_stormtypes.tostr(addr)
         addr = addr.lower()

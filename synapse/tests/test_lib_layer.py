@@ -4,17 +4,23 @@ import asyncio
 
 import synapse.exc as s_exc
 import synapse.common as s_common
+import synapse.cortex as s_cortex
 import synapse.telepath as s_telepath
 
+import synapse.lib.auth as s_auth
 import synapse.lib.time as s_time
 import synapse.lib.layer as s_layer
+import synapse.lib.config as s_config
 import synapse.lib.msgpack as s_msgpack
+import synapse.lib.spooled as s_spooled
 
-import synapse.tools.backup as s_tools_backup
+import synapse.tools.service.backup as s_tools_backup
 
 import synapse.tests.utils as s_t_utils
 
 from synapse.tests.utils import alist
+
+from unittest import mock
 
 async def iterPropForm(self, form=None, prop=None):
     bad_valu = [(b'foo', "bar"), (b'bar', ('bar',)), (b'biz', 4965), (b'baz', (0, 56))]
@@ -26,7 +32,7 @@ class LayerTest(s_t_utils.SynTest):
 
     def checkLayrvers(self, core):
         for layr in core.layers.values():
-            self.eq(layr.layrvers, 8)
+            self.eq(layr.layrvers, 11)
 
     async def test_layer_verify(self):
 
@@ -49,7 +55,7 @@ class LayerTest(s_t_utils.SynTest):
             self.eq(errors[1][0], 'NoPropIndex')
 
             errors = await core.callStorm('''
-                $retn = $lib.list()
+                $retn = ()
                 for $mesg in $lib.layer.get().verify() {
                     $retn.append($mesg)
                 }
@@ -377,24 +383,15 @@ class LayerTest(s_t_utils.SynTest):
             path01 = s_common.gendir(dirn, 'core01')
 
             async with self.getTestCore(dirn=path00) as core00:
+                await core00.addTagProp('score', ('int', {}), {})
 
                 layriden = core00.view.layers[0].iden
 
                 await core00.nodes('[test:str=foobar +#hehe.haha]')
                 await core00.nodes('[ inet:ipv4=1.2.3.4 ]')
-                await core00.addTagProp('score', ('int', {}), {})
-
-                async with await core00.snap() as snap:
-
-                    props = {'tick': 12345}
-                    node1 = await snap.addNode('test:str', 'foo', props=props)
-                    await node1.setTagProp('bar', 'score', 10)
-                    await node1.setData('baz', 'nodedataiscool')
-
-                    node2 = await snap.addNode('test:str', 'bar', props=props)
-                    await node2.setData('baz', 'nodedataiscool')
-
-                    await node1.addEdge('refs', node2.iden())
+                await core00.nodes('[test:str=foo :tick=(12345) +#bar:score=10] $node.data.set(baz, nodedataiscool)')
+                await core00.nodes('[test:str=bar :tick=(12345)] $node.data.set(baz, nodedataiscool)')
+                await core00.nodes('test:str=foo [ +(refs)> { test:str=bar }]')
 
                 async with self.getTestCore(dirn=path01) as core01:
 
@@ -418,13 +415,14 @@ class LayerTest(s_t_utils.SynTest):
                     self.len(1, nodes)
                     self.nn(nodes[0].tags.get('hehe.haha'))
 
-                    async with await core01.snap() as snap:
-                        node = await snap.getNodeByNdef(('test:str', 'foo'))
-                        self.nn(node)
-                        self.eq(node.props.get('tick'), 12345)
-                        self.eq(node.getTagProp('bar', 'score'), 10)
-                        self.eq(await node.getData('baz'), 'nodedataiscool')
-                        self.len(1, await alist(node.iterEdgesN1()))
+                    nodes = await core01.nodes('test:str=foo')
+                    self.len(1, nodes)
+                    node = nodes[0]
+                    self.nn(node)
+                    self.eq(node.props.get('tick'), 12345)
+                    self.eq(node.getTagProp('bar', 'score'), 10)
+                    self.eq(await node.getData('baz'), 'nodedataiscool')
+                    self.len(1, await alist(node.iterEdgesN1()))
 
                     # make sure updates show up
                     await core00.nodes('[ inet:fqdn=vertex.link ]')
@@ -456,16 +454,15 @@ class LayerTest(s_t_utils.SynTest):
 
                     self.len(1, await core01.nodes('inet:ipv4=5.6.7.8'))
 
-                    # make sure time and user are set on the downstream splices
+                    # make sure time and user are set on the downstream changes
                     root = await core01.auth.getUserByName('root')
 
-                    splices = await alist(layr.splicesBack(size=1))
-                    self.len(1, splices)
-
-                    splice = splices[0][1][1]
-                    self.nn(splice.get('time'))
-                    self.eq(splice.get('user'), root.iden)
-                    self.none(splice.get('prov'))
+                    nedits = await alist(layr.syncNodeEdits2(0, wait=False))
+                    last_edit = nedits[-1]
+                    offs, edit, meta = last_edit
+                    self.gt(meta.get('time'), 0)
+                    self.eq(meta.get('user'), root.iden)
+                    self.notin('prov', meta)
 
     async def test_layer_upstream_with_mirror(self):
 
@@ -626,223 +623,6 @@ class LayerTest(s_t_utils.SynTest):
 
                         self.len(1, await core02.nodes('inet:ipv4=8.7.6.5'))
 
-    async def test_layer_splices(self):
-
-        self.skip('fragile order and deprecated')
-        async with self.getTestCore() as core:
-
-            layr = core.view.layers[0]
-            root = await core.auth.getUserByName('root')
-
-            splices = await alist(layr.splices(None, 10))
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            await core.addTagProp('risk', ('int', {'min': 0, 'max': 100}), {'doc': 'risk score'})
-
-            # Convert a node:add splice
-            await core.nodes('[ test:str=foo ]')
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'node:add')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a prop:set splice with no oldv
-            await core.nodes("test:str=foo [ :tick=2000 ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'prop:set')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['prop'], 'tick')
-            self.eq(splice[1]['valu'], 946684800000)
-            self.eq(splice[1]['oldv'], None)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a prop:set splice with an oldv
-            await core.nodes("test:str=foo [ :tick=2001 ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'prop:set')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['prop'], 'tick')
-            self.eq(splice[1]['valu'], 978307200000)
-            self.eq(splice[1]['oldv'], 946684800000)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a prop:del splice
-            await core.nodes("test:str=foo [ -:tick ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'prop:del')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['prop'], 'tick')
-            self.eq(splice[1]['valu'], 978307200000)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a tag:add splice with no oldv
-            await core.nodes("test:str=foo [ +#haha=2000 ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[4][1]
-            self.eq(splice[0], 'tag:add')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['tag'], 'haha')
-            self.eq(splice[1]['valu'], (946684800000, 946684800001))
-            self.eq(splice[1]['oldv'], None)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a tag:add splice with an oldv
-            await core.nodes("test:str=foo [ +#haha=2001 ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'tag:add')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['tag'], 'haha')
-            self.eq(splice[1]['valu'], (946684800000, 978307200001))
-            self.eq(splice[1]['oldv'], (946684800000, 946684800001))
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a tag:del splice
-            await core.nodes("test:str=foo [ -#haha ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'tag:del')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['tag'], 'haha')
-            self.eq(splice[1]['valu'], (946684800000, 978307200001))
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a tag:prop:add splice with no oldv
-            await core.nodes("test:str=foo [ +#rep:risk=50 ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[5][1]
-            self.eq(splice[0], 'tag:prop:set')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['tag'], 'rep')
-            self.eq(splice[1]['prop'], 'risk')
-            self.eq(splice[1]['valu'], 50)
-            self.eq(splice[1]['oldv'], None)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a tag:prop:add splice with an oldv
-            await core.nodes("test:str=foo [ +#rep:risk=0 ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'tag:prop:set')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['tag'], 'rep')
-            self.eq(splice[1]['prop'], 'risk')
-            self.eq(splice[1]['valu'], 0)
-            self.eq(splice[1]['oldv'], 50)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Convert a tag:prop:del splice
-            await core.nodes("test:str=foo [ -#rep:risk ]")
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[0][1]
-            self.eq(splice[0], 'tag:prop:del')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['tag'], 'rep')
-            self.eq(splice[1]['prop'], 'risk')
-            self.eq(splice[1]['valu'], 0)
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            spliceoffs = (splices[-1][0][0] + 1, 0, 0)
-
-            # Nodedata edits don't make splices
-            nodes = await core.nodes('test:str=foo')
-            await nodes[0].setData('baz', 'nodedataiscool')
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-            self.len(0, splices)
-
-            # Make sure nodedata edits have oldv set
-            nedit = await layr.iterNodeEditLog(spliceoffs[0]).__anext__()
-            self.eq(nedit[1][0][2][0][1], ('baz', 'nodedataiscool', None))
-
-            spliceoffs = (spliceoffs[0] + 1, 0, 0)
-
-            await nodes[0].setData('baz', 'stillcool')
-            nedit = await layr.iterNodeEditLog(spliceoffs[0]).__anext__()
-            self.eq(nedit[1][0][2][0][1], ('baz', 'stillcool', 'nodedataiscool'))
-
-            # Convert a node:del splice
-            await core.nodes('test:str=foo | delnode')
-
-            splices = await alist(layr.splices(spliceoffs, 10))
-
-            splice = splices[2][1]
-            self.eq(splice[0], 'node:del')
-            self.eq(splice[1]['ndef'], ('test:str', 'foo'))
-            self.eq(splice[1]['user'], root.iden)
-            self.nn(splice[1].get('time'))
-
-            # Get all the splices
-            splices = [x async for x in layr.splices()]
-            self.len(26, splices)
-
-            # Get all but the first splice
-            await self.agenlen(25, layr.splices(splices[1][0]))
-
-            await self.agenlen(4, layr.splicesBack(splices[3][0]))
-
-            # Make sure we still get two splices when
-            # offset is not at the beginning of a nodeedit
-            await self.agenlen(2, layr.splices((1, 0, 200), 2))
-            await self.agenlen(2, layr.splicesBack((3, 0, -1), 2))
-
-            # Use the layer api to get the splices
-            url = core.getLocalUrl('*/layer')
-            async with await s_telepath.openurl(url) as layrprox:
-                await self.agenlen(26, layrprox.splices())
-
     async def test_layer_stortype_hier(self):
         stor = s_layer.StorTypeHier(None, None)
 
@@ -875,7 +655,8 @@ class LayerTest(s_t_utils.SynTest):
         stor = s_layer.StorTypeHugeNum(self, None)
 
         vals = ['-99999.9', '-0.00000000000000000001', '-42.1', '0', '0.000001', '42.1',
-                '99999.9', '730750818665451459101842', '-730750818665451459101842']
+                '99999.9', '730750818665451459101842', '-730750818665451459101842',
+                '730750818665451459101841.000000000000000000000001']
 
         for valu, indx in ((v, stor.indx(v)) for v in vals):
             self.eq(valu, stor.decodeIndx(indx[0]))
@@ -1047,13 +828,16 @@ class LayerTest(s_t_utils.SynTest):
             self.eq(retn, [-99999.9, -42.1])
 
             # <= NaN
-            await self.agenraises(s_exc.NotANumberCompared, stor.indxBy(indxby, '<=', math.nan))
+            with self.raises(s_exc.NotANumberCompared):
+                await alist(stor.indxBy(indxby, '<=', math.nan))
 
             # >= NaN
-            await self.agenraises(s_exc.NotANumberCompared, stor.indxBy(indxby, '>=', math.nan))
+            with self.raises(s_exc.NotANumberCompared):
+                await alist(stor.indxBy(indxby, '>=', math.nan))
 
             # 1.0 to NaN
-            await self.agenraises(s_exc.NotANumberCompared, stor.indxBy(indxby, 'range=', (1.0, math.nan)))
+            with self.raises(s_exc.NotANumberCompared):
+                await alist(stor.indxBy(indxby, 'range=', (1.0, math.nan)))
 
     async def test_layer_stortype_guid(self):
         stor = s_layer.StorTypeGuid(None)
@@ -1126,6 +910,26 @@ class LayerTest(s_t_utils.SynTest):
 
             nodes = await core.nodes('inet:ipv4=1.2.3.4 [ +#foo.bar=2015 ]')
             self.eq((1325376000000, 1420070400001), nodes[0].getTag('foo.bar'))
+
+            await core.addTagProp('tval', ('ival', {}), {})
+            await core.addTagProp('mintime', ('time', {'ismin': True}), {})
+            await core.addTagProp('maxtime', ('time', {'ismax': True}), {})
+
+            await core.nodes('[test:str=tagprop +#foo:tval=2021]')
+            await core.nodes('test:str=tagprop [+#foo:tval=2023]')
+
+            self.eq(1, await core.count('#foo:tval@=2022'))
+
+            await core.nodes('test:str=tagprop [+#foo:mintime=2021 +#foo:maxtime=2013]')
+            await core.nodes('test:str=tagprop [+#foo:mintime=2023 +#foo:maxtime=2011]')
+
+            self.eq(1, await core.count('#foo:mintime=2021'))
+            self.eq(1, await core.count('#foo:maxtime=2013'))
+
+            await core.nodes('test:str=tagprop [+#foo:mintime=2020 +#foo:maxtime=2015]')
+
+            self.eq(1, await core.count('#foo:mintime=2020'))
+            self.eq(1, await core.count('#foo:maxtime=2015'))
 
     async def test_layer_nodeedits_created(self):
 
@@ -1219,6 +1023,20 @@ class LayerTest(s_t_utils.SynTest):
                 if offs == layr.nodeeditlog.index() - 1:
                     break
 
+            fwdedits = [item async for item in core0.getLayer().syncNodeEdits(0, wait=False)]
+            revedits = [item async for item in core0.getLayer().syncNodeEdits(0xffffffff, wait=False, reverse=True)]
+
+            self.eq(fwdedits, list(reversed(revedits)))
+
+            fwdedit = await core0.callStorm('for $item in $lib.layer.get().edits() { return($item) }')
+            revedit = await core0.callStorm('for $item in $lib.layer.get().edits(reverse=(true)) { return($item) }')
+
+            self.nn(await core0.callStorm('return($lib.layer.get().edited())'))
+
+            self.ne(fwdedit, revedit)
+            self.eq(fwdedits[0], fwdedit)
+            self.eq(revedits[0], revedit)
+
             async with self.getTestCore() as core1:
 
                 url = core1.getLocalUrl('*/layer')
@@ -1235,11 +1053,15 @@ class LayerTest(s_t_utils.SynTest):
                     nodelist1 = [node.pack() for node in nodelist1]
                     self.eq(nodelist0, nodelist1)
 
-                layr = core1.view.layers[0]
+                layr = core1.view.layers[0]  # type: s_layer.Layer
 
-                # Empty the layer to try again
+                ############################################################################
+                # TEST ONLY - Force the layer nexus handler to consume a truncate event.
+                # This is for backwards compatibility for a mirror that consumes a truncate
+                # event.
+                # This can be removed in 3.0.0.
 
-                await layr.truncate()
+                await layr._push('layer:truncate')
 
                 async with await s_telepath.openurl(url) as layrprox:
 
@@ -1257,7 +1079,7 @@ class LayerTest(s_t_utils.SynTest):
                             'time': 0,
                             }
 
-                    await layr.truncate()
+                    await layr._push('layer:truncate')
 
                     for nodeedits in editlist:
                         self.none(await layrprox.storNodeEditsNoLift(nodeedits, meta=meta))
@@ -1279,6 +1101,8 @@ class LayerTest(s_t_utils.SynTest):
                     core1.schedCoro(doEdit())
                     await asyncio.wait_for(waitForEdit(), timeout=6)
 
+                ############################################################################
+
     async def test_layer_stornodeedits_nonexus(self):
         # test for migration methods that store nodeedits bypassing nexus
 
@@ -1298,62 +1122,6 @@ class LayerTest(s_t_utils.SynTest):
             self.len(2, flatedits)
 
             self.len(2, await core0.nodes('.created'))
-
-    async def test_layer_syncindexevents(self):
-
-        async with self.getTestCore() as core:
-            layr = core.getLayer()
-            await core.addTagProp('score', ('int', {}), {})
-            baseoff = await core.getNexsIndx()
-
-            nodes = await core.nodes('[ test:str=foo ]')
-            strnode = nodes[0]
-            q = '[ inet:ipv4=1.2.3.4 :asn=42 .seen=(2012,2014) +#mytag:score=99 +#foo.bar=(2012, 2014) ]'
-            nodes = await core.nodes(q)
-            ipv4node = nodes[0]
-
-            await core.nodes('inet:ipv4=1.2.3.4 test:str=foo | delnode')
-
-            mdef = {'forms': ['test:str']}
-            events = [e[1] for e in await alist(layr.syncIndexEvents(baseoff, mdef, wait=False))]
-            self.eq(events, [
-                (strnode.buid, 'test:str', s_layer.EDIT_NODE_ADD, ('foo', s_layer.STOR_TYPE_UTF8), ()),
-                (strnode.buid, 'test:str', s_layer.EDIT_NODE_DEL, ('foo', s_layer.STOR_TYPE_UTF8), ()),
-            ])
-
-            mdef = {'props': ['.seen']}
-            events = [e[1] for e in await alist(layr.syncIndexEvents(baseoff, mdef, wait=False))]
-            ival = tuple([s_time.parse(x) for x in ('2012', '2014')])
-            self.eq(events, [
-                (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_PROP_SET, ('.seen', ival, None, s_layer.STOR_TYPE_IVAL), ()),
-                (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_PROP_DEL, ('.seen', ival, s_layer.STOR_TYPE_IVAL), ()),
-            ])
-
-            mdef = {'props': ['inet:ipv4:asn']}
-            events = [e[1] for e in await alist(layr.syncIndexEvents(baseoff, mdef, wait=False))]
-            self.len(2, events)
-            self.eq(events, [
-                (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_PROP_SET, ('asn', 42, None, s_layer.STOR_TYPE_I64), ()),
-                (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_PROP_DEL, ('asn', 42, s_layer.STOR_TYPE_I64), ()),
-            ])
-
-            mdef = {'tags': ['foo.bar']}
-            events = [e[1] for e in await alist(layr.syncIndexEvents(baseoff, mdef, wait=False))]
-            self.eq(events, [
-                (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_TAG_SET, ('foo.bar', ival, None), ()),
-                (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_TAG_DEL, ('foo.bar', ival), ()),
-            ])
-
-            mdefs = ({'tagprops': ['score']}, {'tagprops': ['mytag:score']})
-            events = [e[1] for e in await alist(layr.syncIndexEvents(baseoff, mdef, wait=False))]
-            for mdef in mdefs:
-                events = [e[1] for e in await alist(layr.syncIndexEvents(baseoff, mdef, wait=False))]
-                self.eq(events, [
-                    (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_TAGPROP_SET,
-                        ('mytag', 'score', 99, None, s_layer.STOR_TYPE_I64), ()),
-                    (ipv4node.buid, 'inet:ipv4', s_layer.EDIT_TAGPROP_DEL,
-                        ('mytag', 'score', 99, s_layer.STOR_TYPE_I64), ()),
-                ])
 
     async def test_layer_form_by_buid(self):
 
@@ -1446,6 +1214,31 @@ class LayerTest(s_t_utils.SynTest):
             nodes = await core.nodes('[test:str=bar +#test:score=100]')
             self.true(await layr.hasTagProp('score'))
 
+            iden = s_common.guid()
+            with self.raises(ValueError) as cm:
+                with layr.getIdenFutu(iden=iden):
+                    raise ValueError('oops')
+            self.none(layr.futures.get(iden))
+
+            await core.nodes('[ test:str=data ] $node.data.set(foodata, bar)')
+
+            abrv = layr.getPropAbrv('foodata', None)
+            self.len(1, list(layr.dataslab.scanByDups(abrv, db=layr.dataname)))
+
+            await core.nodes('test:str=data | delnode')
+
+            self.len(0, list(layr.dataslab.scanByDups(abrv, db=layr.dataname)))
+
+            await core.addTagProp('score2', ('int', {}), {})
+            nodes = await core.nodes('[test:str=multi +#foo:score=5 +#foo:score2=6]')
+            self.eq(('score', 'score2'), nodes[0].getTagProps('foo'))
+
+            nodes = await core.nodes('test:str=multi [-#foo:score]')
+            self.eq(('score2',), nodes[0].getTagProps('foo'))
+
+            nodes = await core.nodes('test:str=multi')
+            self.eq(('score2',), nodes[0].getTagProps('foo'))
+
     async def test_layer_waitForHot(self):
         self.thisHostMust(hasmemlocking=True)
 
@@ -1467,9 +1260,9 @@ class LayerTest(s_t_utils.SynTest):
             '''
             await core.nodes('[test:str=foo .seen=(2015, 2016)]')
             layr = core.getLayer(None)
-            lbefore = len(await alist(layr.splices()))
+            lbefore = len(await alist(layr.syncNodeEdits2(0, wait=False)))
             await core.nodes('[test:str=foo .seen=(2015, 2016)]')
-            lafter = len(await alist(layr.splices()))
+            lafter = len(await alist(layr.syncNodeEdits2(0, wait=False)))
             self.eq(lbefore, lafter)
 
     async def test_layer_del_then_lift(self):
@@ -1522,7 +1315,8 @@ class LayerTest(s_t_utils.SynTest):
             cdir = s_common.gendir(copylayr.dirn, 'adir')
             self.true(os.path.exists(cdir))
 
-            await self.asyncraises(s_exc.NoSuchLayer, prox.cloneLayer('newp'))
+            with self.raises(s_exc.NoSuchLayer):
+                await prox.cloneLayer('newp')
 
             self.false(layr.readonly)
 
@@ -1534,6 +1328,28 @@ class LayerTest(s_t_utils.SynTest):
             readlayr = core.getLayer(readlayrinfo.get('iden'))
             self.true(readlayr.readonly)
 
+            self.none(await core._cloneLayer(readlayrinfo['iden'], readlayrinfo, None))
+
+    async def test_layer_ro(self):
+        with self.getTestDir() as dirn:
+            async with self.getTestCore(dirn=dirn) as core:
+                msgs = await core.stormlist('$lib.layer.add(({"readonly": $lib.true}))')
+                self.stormHasNoWarnErr(msgs)
+
+                ldefs = await core.callStorm('return($lib.layer.list())')
+                self.len(2, ldefs)
+
+                readonly = [ldef for ldef in ldefs if ldef.get('readonly')]
+                self.len(1, readonly)
+
+                layriden = readonly[0].get('iden')
+                layr = core.getLayer(layriden)
+
+                view = await core.callStorm(f'return($lib.view.add(layers=({layriden},)))')
+
+                with self.raises(s_exc.IsReadOnly):
+                    await core.nodes('[inet:fqdn=vertex.link]', opts={'view': view['iden']})
+
     async def test_layer_v3(self):
 
         async with self.getRegrCore('2.0-layerv2tov3') as core:
@@ -1542,8 +1358,8 @@ class LayerTest(s_t_utils.SynTest):
             self.len(1, nodes)
             self.eq(nodes[0].ndef, ('inet:ipv4', 0x01020304))
             self.eq(nodes[0].get('asn'), 33)
-            self.true(nodes[0].getTag('foo.bar'), (None, None))
-            self.true(nodes[0].getTagProp('foo.bar', 'confidence'), 22)
+            self.eq(nodes[0].getTag('foo.bar'), (None, None))
+            self.eq(nodes[0].getTagProp('foo.bar', 'confidence'), 100)
 
             self.eq(10004, await core.count('.created'))
             self.len(2, await core.nodes('syn:tag~=foo'))
@@ -1655,6 +1471,96 @@ class LayerTest(s_t_utils.SynTest):
 
             self.checkLayrvers(core)
 
+    async def test_layer_v10(self):
+
+        async with self.getRegrCore('layer-v10') as core:
+
+            nodes = await core.nodes('file:bytes inet:user')
+            verbs = [verb async for verb in nodes[0].iterEdgeVerbs(nodes[1].buid)]
+            self.eq(('refs',), verbs)
+
+            nodes0 = await core.nodes('[ ps:contact=* :name=visi +(has)> {[ mat:item=* :name=laptop ]} ]')
+            self.len(1, nodes0)
+            buid1 = nodes0[0].buid
+
+            nodes1 = await core.nodes('mat:item')
+            self.len(1, nodes1)
+            buid2 = nodes1[0].buid
+
+            layr = core.getView().layers[0]
+            self.true(layr.layrslab.hasdup(buid1 + buid2, b'has', db=layr.edgesn1n2))
+            verbs = [verb async for verb in nodes0[0].iterEdgeVerbs(buid2)]
+            self.eq(('has',), verbs)
+
+            await core.nodes('ps:contact:name=visi [ -(has)> { mat:item:name=laptop } ]')
+
+            self.false(layr.layrslab.hasdup(buid1 + buid2, b'has', db=layr.edgesn1n2))
+            verbs = [verb async for verb in nodes0[0].iterEdgeVerbs(buid2)]
+            self.len(0, verbs)
+
+            await core.nodes('ps:contact:name=visi [ +(has)> { mat:item:name=laptop } ]')
+
+            self.true(layr.layrslab.hasdup(buid1 + buid2, b'has', db=layr.edgesn1n2))
+            verbs = [verb async for verb in nodes0[0].iterEdgeVerbs(buid2)]
+            self.eq(('has',), verbs)
+
+            await core.nodes('ps:contact:name=visi | delnode --force')
+
+            self.false(layr.layrslab.hasdup(buid1 + buid2, b'has', db=layr.edgesn1n2))
+            verbs = [verb async for verb in nodes0[0].iterEdgeVerbs(buid2)]
+            self.len(0, verbs)
+
+    async def test_layer_v11(self):
+
+        try:
+
+            oldv = s_layer.MIGR_COMMIT_SIZE
+            s_layer.MIGR_COMMIT_SIZE = 1
+
+            async with self.getRegrCore('layer-v11') as core:
+
+                wlyrs_byview = await core.callStorm('''
+                    $wlyrs = ({})
+                    for $view in $lib.view.list() {
+                        $wlyrs.($view.get(name)) = $view.layers.0.iden
+                    }
+                    return($wlyrs)
+                ''')
+                self.len(8, wlyrs_byview)
+
+                layr = core.getLayer(iden=wlyrs_byview['default'])
+                await self.agenlen(2, layr.getStorNodesByForm('test:str'))
+                await self.agenlen(1, layr.getStorNodesByForm('syn:tag'))
+
+                layr = core.getLayer(iden=wlyrs_byview['prop'])
+                await self.agenlen(1, layr.getStorNodesByForm('test:str'))
+
+                layr = core.getLayer(iden=wlyrs_byview['tags'])
+                await self.agenlen(1, layr.getStorNodesByForm('test:str'))
+                await self.agenlen(1, layr.getStorNodesByForm('syn:tag'))
+
+                layr = core.getLayer(iden=wlyrs_byview['tagp'])
+                await self.agenlen(1, layr.getStorNodesByForm('test:str'))
+                await self.agenlen(0, layr.getStorNodesByForm('syn:tag'))
+
+                layr = core.getLayer(iden=wlyrs_byview['n1eg'])
+                await self.agenlen(1, layr.getStorNodesByForm('test:str'))
+                await self.agenlen(1, layr.getStorNodesByForm('test:int'))
+
+                layr = core.getLayer(iden=wlyrs_byview['n2eg'])
+                await self.agenlen(0, layr.getStorNodesByForm('test:str'))
+                await self.agenlen(1, layr.getStorNodesByForm('test:int'))
+
+                layr = core.getLayer(iden=wlyrs_byview['data'])
+                await self.agenlen(1, layr.getStorNodesByForm('test:str'))
+
+                layr = core.getLayer(iden=wlyrs_byview['noop'])
+                await self.agenlen(0, layr.getStorNodes())
+                await self.agenlen(0, layr.getStorNodesByForm('test:str'))
+
+        finally:
+            s_layer.MIGR_COMMIT_SIZE = oldv
+
     async def test_layer_logedits_default(self):
         async with self.getTestCore() as core:
             self.true(core.getLayer().logedits)
@@ -1672,31 +1578,25 @@ class LayerTest(s_t_utils.SynTest):
         async with self.getTestCore() as core:
             await core.addTagProp('score', ('int', {}), {})
 
-            async with await core.snap() as snap:
+            nodes = await core.nodes('[inet:ipv4=1 :asn=10 .seen=(2016, 2017) +#foo=(2020, 2021) +#foo:score=42]')
+            self.len(1, nodes)
+            buid1 = nodes[0].buid
 
-                props = {'asn': 10, '.seen': ('2016', '2017')}
-                node = await snap.addNode('inet:ipv4', 1, props=props)
-                buid1 = node.buid
-                await node.addTag('foo', ('2020', '2021'))
-                await node.setTagProp('foo', 'score', 42)
+            nodes = await core.nodes('[inet:ipv4=2 :asn=20 .seen=(2015, 2016) +#foo=(2019, 2020) +#foo:score=41]')
+            self.len(1, nodes)
+            buid2 = nodes[0].buid
 
-                props = {'asn': 20, '.seen': ('2015', '2016')}
-                node = await snap.addNode('inet:ipv4', 2, props=props)
-                buid2 = node.buid
-                await node.addTag('foo', ("2019", "2020"))
-                await node.setTagProp('foo', 'score', 41)
+            nodes = await core.nodes('[inet:ipv4=3 :asn=30 .seen=(2015, 2016) +#foo=(2018, 2020) +#foo:score=99]')
+            self.len(1, nodes)
+            buid3 = nodes[0].buid
 
-                props = {'asn': 30, '.seen': ('2015', '2016')}
-                node = await snap.addNode('inet:ipv4', 3, props=props)
-                buid3 = node.buid
-                await node.addTag('foo', ("2018", "2020"))
-                await node.setTagProp('foo', 'score', 99)
+            nodes = await core.nodes('[test:str=yolo]')
+            self.len(1, nodes)
+            strbuid = nodes[0].buid
 
-                node = await snap.addNode('test:str', 'yolo')
-                strbuid = node.buid
-
-                node = await snap.addNode('test:str', 'z' * 500)
-                strbuid2 = node.buid
+            nodes = await core.nodes('[test:str=$valu]', opts={'vars': {'valu': 'z' * 500}})
+            self.len(1, nodes)
+            strbuid2 = nodes[0].buid
 
             # rows are (buid, valu) tuples
             layr = core.view.layers[0]
@@ -1784,25 +1684,157 @@ class LayerTest(s_t_utils.SynTest):
 
     async def test_layer_setinfo(self):
 
+        with self.getTestDir() as dirn:
+
+            async with self.getTestCore(dirn=dirn) as core:
+
+                layer = core.getView().layers[0]
+
+                self.eq('hehe', await core.callStorm('$layer = $lib.layer.get() $layer.set(name, hehe) return($layer.get(name))'))
+
+                self.eq(False, await core.callStorm('$layer = $lib.layer.get() $layer.set(logedits, $lib.false) return($layer.get(logedits))'))
+                edits0 = [e async for e in layer.syncNodeEdits(0, wait=False)]
+                await core.callStorm('[inet:ipv4=1.2.3.4]')
+                edits1 = [e async for e in layer.syncNodeEdits(0, wait=False)]
+                self.eq(len(edits0), len(edits1))
+
+                self.eq(True, await core.callStorm('$layer = $lib.layer.get() $layer.set(logedits, $lib.true) return($layer.get(logedits))'))
+                await core.callStorm('[inet:ipv4=5.5.5.5]')
+                edits2 = [e async for e in layer.syncNodeEdits(0, wait=False)]
+                self.gt(len(edits2), len(edits1))
+
+                self.true(await core.callStorm('$layer=$lib.layer.get() $layer.set(readonly, $lib.true) return($layer.get(readonly))'))
+                with self.raises(s_exc.IsReadOnly):
+                    await core.nodes('[inet:ipv4=7.7.7.7]')
+
+                with self.raises(s_exc.IsReadOnly):
+                    await core.nodes('$lib.layer.get().set(logedits, $lib.false)')
+
+                self.false(await core.callStorm('$layer=$lib.layer.get() $layer.set(readonly, $lib.false) return($layer.get(readonly))'))
+                self.len(1, await core.nodes('[inet:ipv4=7.7.7.7]'))
+
+                msgs = []
+                didset = False
+                async for mesg in core.storm('[( test:guid=(rotest00,) )] $lib.time.sleep(1) [( test:guid=(rotest01,) )]'):
+                    msgs.append(mesg)
+                    if mesg[0] == 'node:edits' and not didset:
+                        self.true(await core.callStorm('$layer=$lib.layer.get() $layer.set(readonly, $lib.true) return($layer.get(readonly))'))
+                        didset = True
+
+                self.stormIsInErr(f'Layer {layer.iden} is read only!', msgs)
+                self.len(1, [mesg for mesg in msgs if mesg[0] == 'node'])
+
+                with self.raises(s_exc.BadOptValu):
+                    await core.callStorm('$layer = $lib.layer.get() $layer.set(newp, hehe)')
+
+                await core.nodes('''
+                    $layer = $lib.layer.get()
+                    $layer.set(readonly, $lib.false)  // so we can set everything else
+                    $layer.set(name, foo)
+                    $layer.set(desc, foodesc)
+                    $layer.set(logedits, $lib.false)
+                    $layer.set(readonly, $lib.true)
+                ''')
+
+                info00 = await core.callStorm('return($lib.layer.get().pack())')
+                self.eq('foo', info00['name'])
+                self.eq('foodesc', info00['desc'])
+                self.false(info00['logedits'])
+                self.true(info00['readonly'])
+
+            async with self.getTestCore(dirn=dirn) as core:
+
+                self.eq(info00, await core.callStorm('return($lib.layer.get().pack())'))
+
+    async def test_layer_cachesize(self):
+
+        # Test default cache size
         async with self.getTestCore() as core:
+            layr = core.getView().layers[0]
+            self.eq(layr.buidcache.maxsize, s_layer.BUID_CACHE_SIZE)
 
-            layer = core.getView().layers[0]
+        # Verify the env var name maps correctly
+        envar = s_config.make_envar_name('layers:cache:size', prefix='SYN_CORTEX')
+        self.eq(envar, 'SYN_CORTEX_LAYERS_CACHE_SIZE')
 
-            self.eq('hehe', await core.callStorm('$layer = $lib.layer.get() $layer.set(name, hehe) return($layer.get(name))'))
+        # Test Cortex conf override
+        async with self.getTestCore(conf={'layers:cache:size': 15000}) as core:
+            layr = core.getView().layers[0]
+            self.eq(layr.buidcache.maxsize, 15000)
 
-            self.eq(False, await core.callStorm('$layer = $lib.layer.get() $layer.set(logedits, $lib.false) return($layer.get(logedits))'))
-            edits0 = [e async for e in layer.syncNodeEdits(0, wait=False)]
-            await core.callStorm('[inet:ipv4=1.2.3.4]')
-            edits1 = [e async for e in layer.syncNodeEdits(0, wait=False)]
-            self.eq(len(edits0), len(edits1))
+        # Test layer config override (takes priority over Cortex conf)
+        async with self.getTestCore(conf={'layers:cache:size': 20000}) as core:
+            ldef = await core.addLayer({'cache:size': 5000})
+            layr = core.getLayer(ldef['iden'])
+            self.eq(layr.buidcache.maxsize, 5000)
 
-            self.eq(True, await core.callStorm('$layer = $lib.layer.get() $layer.set(logedits, $lib.true) return($layer.get(logedits))'))
-            await core.callStorm('[inet:ipv4=5.5.5.5]')
-            edits2 = [e async for e in layer.syncNodeEdits(0, wait=False)]
-            self.gt(len(edits2), len(edits1))
+        # Test Storm set/get for cache:size
+        with self.getTestDir() as dirn:
 
+            async with self.getTestCore(dirn=dirn) as core:
+
+                layr = core.getView().layers[0]
+
+                # Set cache:size via Storm
+                self.eq(50000, await core.callStorm('''
+                    $layer = $lib.layer.get()
+                    $layer.set(cache:size, 50000)
+                    return($layer.get(cache:size))
+                '''))
+
+                # Verify the buidcache was resized
+                self.eq(layr.buidcache.maxsize, 50000)
+
+                # Verify it persists in pack
+                info = await core.callStorm('return($lib.layer.get().pack())')
+                self.eq(info['cache:size'], 50000)
+
+            # Verify persistence across restart
+            async with self.getTestCore(dirn=dirn) as core:
+
+                layr = core.getView().layers[0]
+                self.eq(layr.buidcache.maxsize, 50000)
+
+                info = await core.callStorm('return($lib.layer.get().pack())')
+                self.eq(info['cache:size'], 50000)
+
+        # Test cache:size via layer.add Storm command
+        async with self.getTestCore() as core:
+            msgs = await core.stormlist('layer.add --cache-size 30000')
+            self.stormHasNoWarnErr(msgs)
+
+            ldef = [m[1] for m in msgs if m[0] == 'print'][0]
+            # Get the layer and verify the cache:size
+            layers = await core.callStorm('return($lib.layer.list())')
+            newlayr = [lyr for lyr in layers if lyr.get('cache:size') == 30000]
+            self.len(1, newlayr)
+
+        # Test invalid cache:size
+        async with self.getTestCore() as core:
             with self.raises(s_exc.BadOptValu):
-                await core.callStorm('$layer = $lib.layer.get() $layer.set(newp, hehe)')
+                await core.callStorm('$layer = $lib.layer.get() $layer.set(cache:size, 0)')
+
+        # Test that view forks use default cache size
+        async with self.getTestCore(conf={'layers:cache:size': 25000}) as core:
+            fork = await core.view.fork()
+            forklayr = core.getLayer(fork['layers'][0]['iden'])
+            self.eq(forklayr.buidcache.maxsize, 25000)
+
+            view01 = core.getView(fork['iden'])
+            fork01 = await view01.insertParentFork(core.auth.rootuser.iden)
+            fork01layr = core.getLayer(fork01['layers'][0]['iden'])
+            self.eq(fork01layr.buidcache.maxsize, 25000)
+
+        # Test that cortex conf is resolved at runtime (restart with different value)
+        with self.getTestDir() as dirn:
+
+            async with self.getTestCore(dirn=dirn, conf={'layers:cache:size': 15000}) as core:
+                layr = core.getView().layers[0]
+                self.eq(layr.buidcache.maxsize, 15000)
+
+            async with self.getTestCore(dirn=dirn, conf={'layers:cache:size': 25000}) as core:
+                layr = core.getView().layers[0]
+                self.eq(layr.buidcache.maxsize, 25000)
 
     async def test_reindex_byarray(self):
 
@@ -1938,7 +1970,172 @@ class LayerTest(s_t_utils.SynTest):
 
     async def test_layer_edit_perms(self):
 
+        class Dict(s_spooled.Dict):
+            async def __anit__(self, dirn=None, size=1, cell=None):
+                await super().__anit__(dirn=dirn, size=size, cell=cell)
+
+        seen = set()
+        def confirm(self, perm, default=None, gateiden=None):
+            seen.add(perm)
+            return True
+
+        def confirmPropSet(self, user, prop, layriden):
+            seen.add(prop.setperms[0])
+            seen.add(prop.setperms[1])
+
+        def confirmPropDel(self, user, prop, layriden):
+            seen.add(prop.delperms[0])
+            seen.add(prop.delperms[1])
+
+        with mock.patch('synapse.lib.spooled.Dict', Dict):
+            async with self.getTestCore() as core:
+
+                user = await core.auth.addUser('blackout@vertex.link')
+
+                viewiden = await core.callStorm('''
+                    $lyr = $lib.layer.add()
+                    $view = $lib.view.add(($lyr.iden,))
+                    return($view.iden)
+                ''')
+
+                layr = core.views[viewiden].layers[0]
+
+                opts = {'view': viewiden}
+
+                await core.addTagProp('score', ('int', {}), {})
+
+                await core.nodes('[ test:str=bar +#foo.bar ]', opts=opts)
+
+                await core.nodes('''
+                    [ test:str=foo
+                        :hehe=bar
+                        +#foo:score=2
+                        +#foo.bar.baz
+                        +#bar:score=2
+                        <(refs)+ { test:str=bar }
+                    ]
+                    $node.data.set(foo, bar)
+                ''', opts=opts)
+
+                parent = core.view.layers[0]
+
+                seen.clear()
+                with mock.patch.object(s_auth.User, 'confirm', confirm):
+                    with mock.patch.object(s_cortex.Cortex, 'confirmPropSet', confirmPropSet):
+                        with mock.patch.object(s_cortex.Cortex, 'confirmPropDel', confirmPropDel):
+                            await layr.confirmLayerEditPerms(user, parent.iden)
+
+                self.eq(seen, {
+                    # Node add
+                    ('node', 'add', 'syn:tag'),
+                    ('node', 'add', 'test:str'),
+
+                    # Old style prop set
+                    ('node', 'prop', 'set', 'test:str:hehe'),
+                    ('node', 'prop', 'set', 'test:str.created'),
+
+                    ('node', 'prop', 'set', 'syn:tag:up'),
+                    ('node', 'prop', 'set', 'syn:tag:base'),
+                    ('node', 'prop', 'set', 'syn:tag:depth'),
+                    ('node', 'prop', 'set', 'syn:tag.created'),
+
+                    # New style prop set
+                    ('node', 'prop', 'set', 'test:str', 'hehe'),
+                    ('node', 'prop', 'set', 'test:str', '.created'),
+
+                    ('node', 'prop', 'set', 'syn:tag', 'up'),
+                    ('node', 'prop', 'set', 'syn:tag', 'base'),
+                    ('node', 'prop', 'set', 'syn:tag', 'depth'),
+                    ('node', 'prop', 'set', 'syn:tag', '.created'),
+
+                    # Tag/tagprop add
+                    ('node', 'tag', 'add', 'foo'),
+                    ('node', 'tag', 'add', 'bar'),
+                    ('node', 'tag', 'add', 'foo', 'bar'),
+                    ('node', 'tag', 'add', 'foo', 'bar', 'baz'),
+
+                    # Nodedata set
+                    ('node', 'data', 'set', 'foo'),
+
+                    # Edge add
+                    ('node', 'edge', 'add', 'refs'),
+                })
+
+                await core.nodes('''
+                    test:str=foo
+                    [ <(refs)- { test:str=bar } ]
+                    $node.data.pop(foo)
+                    | delnode
+                ''', opts=opts)
+
+                seen.clear()
+                with mock.patch.object(s_auth.User, 'confirm', confirm):
+                    with mock.patch.object(s_cortex.Cortex, 'confirmPropSet', confirmPropSet):
+                        with mock.patch.object(s_cortex.Cortex, 'confirmPropDel', confirmPropDel):
+                            await layr.confirmLayerEditPerms(user, parent.iden)
+
+                self.eq(seen, {
+                    # Node add
+                    ('node', 'add', 'syn:tag'),
+                    ('node', 'add', 'test:str'),
+
+                    # Old style prop set
+                    ('node', 'prop', 'set', 'test:str.created'),
+
+                    ('node', 'prop', 'set', 'syn:tag:up'),
+                    ('node', 'prop', 'set', 'syn:tag:base'),
+                    ('node', 'prop', 'set', 'syn:tag:depth'),
+                    ('node', 'prop', 'set', 'syn:tag.created'),
+
+                    # New style prop set
+                    ('node', 'prop', 'set', 'test:str', '.created'),
+
+                    ('node', 'prop', 'set', 'syn:tag', 'up'),
+                    ('node', 'prop', 'set', 'syn:tag', 'base'),
+                    ('node', 'prop', 'set', 'syn:tag', 'depth'),
+                    ('node', 'prop', 'set', 'syn:tag', '.created'),
+
+                    # Tag/tagprop add
+                    ('node', 'tag', 'add', 'foo', 'bar'),
+                })
+
+                seen.clear()
+                with mock.patch.object(s_auth.User, 'confirm', confirm):
+                    with mock.patch.object(s_cortex.Cortex, 'confirmPropSet', confirmPropSet):
+                        with mock.patch.object(s_cortex.Cortex, 'confirmPropDel', confirmPropDel):
+                            await layr.confirmLayerEditPerms(user, layr.iden, delete=True)
+
+                self.eq(seen, {
+                    # Node del
+                    ('node', 'del', 'syn:tag'),
+                    ('node', 'del', 'test:str'),
+
+                    # Old style prop del
+                    ('node', 'prop', 'del', 'test:str.created'),
+
+                    ('node', 'prop', 'del', 'syn:tag:up'),
+                    ('node', 'prop', 'del', 'syn:tag:base'),
+                    ('node', 'prop', 'del', 'syn:tag:depth'),
+                    ('node', 'prop', 'del', 'syn:tag.created'),
+
+                    # New style prop del
+                    ('node', 'prop', 'del', 'test:str', '.created'),
+
+                    ('node', 'prop', 'del', 'syn:tag', 'up'),
+                    ('node', 'prop', 'del', 'syn:tag', 'base'),
+                    ('node', 'prop', 'del', 'syn:tag', 'depth'),
+                    ('node', 'prop', 'del', 'syn:tag', '.created'),
+
+                    # Tag/tagprop del
+                    ('node', 'tag', 'del', 'foo', 'bar'),
+                })
+
         async with self.getTestCore() as core:
+
+            user = await core.auth.addUser('blackout@vertex.link')
+            await user.addRule((False, ('node', 'edge', 'add', 'haha')))
+            await user.addRule((False, ('node', 'data', 'set', 'hehe')))
+            await user.addRule((True, ('node',)))
 
             viewiden = await core.callStorm('''
                 $lyr = $lib.layer.add()
@@ -1946,63 +2143,329 @@ class LayerTest(s_t_utils.SynTest):
                 return($view.iden)
             ''')
 
+            layr = core.views[viewiden].layers[0]
+
             opts = {'view': viewiden}
 
-            await core.addTagProp('score', ('int', {}), {})
-
-            await core.nodes('[ test:str=bar ]', opts=opts)
+            await core.nodes('[ test:str=bar +#foo.bar ]', opts=opts)
 
             await core.nodes('''
                 [ test:str=foo
                     :hehe=bar
-                    +#foo:score=2
-                    +#foo.bar
+                    +#foo.bar.baz
                     <(refs)+ { test:str=bar }
                 ]
                 $node.data.set(foo, bar)
             ''', opts=opts)
 
-            await core.nodes('''
-                test:str=foo
-                [ <(refs)- { test:str=bar } ]
-                $node.data.pop(foo)
-                | delnode
-            ''', opts=opts)
+            parent = core.view.layers[0]
 
-            layr = core.views[viewiden].layers[0]
+            seen.clear()
+            with mock.patch.object(s_auth.User, 'confirm', confirm):
+                with mock.patch.object(s_cortex.Cortex, 'confirmPropSet', confirmPropSet):
+                    with mock.patch.object(s_cortex.Cortex, 'confirmPropDel', confirmPropDel):
+                        await layr.confirmLayerEditPerms(user, parent.iden)
 
-            nodeedits = []
-            async for _, edits, _ in layr.iterNodeEditLog():
-                nodeedits.extend(edits)
-
-            perms = [perm for permoffs, perm in s_layer.getNodeEditPerms(nodeedits)]
-
-            self.eq({
-                ('node', 'add', 'test:str'),
-                ('node', 'del', 'test:str'),
-
-                ('node', 'add', 'syn:tag'),
-
-                ('node', 'prop', 'set', 'test:str:.created'),
-                ('node', 'prop', 'del', 'test:str:.created'),
-
-                ('node', 'prop', 'set', 'test:str:hehe'),
-                ('node', 'prop', 'del', 'test:str:hehe'),
-
-                ('node', 'prop', 'set', 'syn:tag:up'),
-                ('node', 'prop', 'set', 'syn:tag:base'),
-                ('node', 'prop', 'set', 'syn:tag:depth'),
-                ('node', 'prop', 'set', 'syn:tag:.created'),
-
-                ('node', 'tag', 'add', 'foo'),
-                ('node', 'tag', 'del', 'foo'),
-
-                ('node', 'tag', 'add', 'foo', 'bar'),
-                ('node', 'tag', 'del', 'foo', 'bar'),
-
-                ('node', 'data', 'set', 'foo'),
-                ('node', 'data', 'pop', 'foo'),
-
+            self.eq(seen, {
+                # node.edge.add.* and node.data.set.* because of the deny rules
                 ('node', 'edge', 'add', 'refs'),
-                ('node', 'edge', 'del', 'refs'),
-            }, set(perms))
+                ('node', 'data', 'set', 'foo'),
+            })
+
+            await user.delRule((False, ('node', 'edge', 'add', 'haha')))
+            await user.delRule((False, ('node', 'data', 'set', 'hehe')))
+
+            seen.clear()
+            with mock.patch.object(s_auth.User, 'confirm', confirm):
+                with mock.patch.object(s_cortex.Cortex, 'confirmPropSet', confirmPropSet):
+                    with mock.patch.object(s_cortex.Cortex, 'confirmPropDel', confirmPropDel):
+                        await layr.confirmLayerEditPerms(user, parent.iden)
+
+            self.eq(seen, set())
+
+    async def test_layer_v9(self):
+        async with self.getRegrCore('2.101.1-hugenum-indxprec') as core:
+
+            huge1 = '730750818665451459101841.000000000000000000000001'
+            huge2 = '730750818665451459101841.000000000000000000000002'
+            huge3 = '730750818665451459101841.000000000000000000000003'
+
+            nodes = await core.nodes(f'econ:purchase:price={huge1}')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('econ:purchase', '99a453112c45570ac2ccc6b941b09035'))
+
+            nodes = await core.nodes(f'econ:purchase:price={huge2}')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('econ:purchase', '95afaf2b258160e0845f899ffff5115c'))
+
+            nodes = await core.nodes(f'inet:fqdn:_hugearray*[={huge1}]')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('inet:fqdn', 'test1.com'))
+
+            nodes = await core.nodes(f'inet:fqdn:_hugearray*[={huge3}]')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('inet:fqdn', 'test2.com'))
+
+            nodes = await core.nodes(f'inet:fqdn#test:hugetp={huge1}')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('inet:fqdn', 'test3.com'))
+
+            nodes = await core.nodes(f'inet:fqdn#test:hugetp={huge2}')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('inet:fqdn', 'test4.com'))
+
+            self.len(1, await core.nodes(f'_test:huge={huge1}'))
+            self.len(1, await core.nodes(f'_test:huge={huge2}'))
+            self.len(1, await core.nodes(f'_test:hugearray*[={huge1}]'))
+            self.len(1, await core.nodes(f'_test:hugearray*[={huge2}]'))
+            self.len(1, await core.nodes(f'_test:hugearray*[={huge3}]'))
+
+    async def test_layer_fromfuture(self):
+        with self.raises(s_exc.BadStorageVersion):
+            async with self.getRegrCore('future-layrvers') as core:
+                pass
+
+    async def test_layer_readonly_new(self):
+        with self.getLoggerStream('synapse.cortex') as stream:
+            async with self.getRegrCore('readonly-newlayer') as core:
+                ldefs = await core.callStorm('return($lib.layer.list())')
+                self.len(2, ldefs)
+
+                readidens = [ldef['iden'] for ldef in ldefs if ldef.get('readonly')]
+                self.len(1, readidens)
+
+                writeidens = [ldef['iden'] for ldef in ldefs if not ldef.get('readonly')]
+
+                readlayr = core.getLayer(readidens[0])
+                writelayr = core.getLayer(writeidens[0])
+
+                self.eq(readlayr.meta.get('version'), writelayr.meta.get('version'))
+
+    async def test_push_pull_default_migration(self):
+        async with self.getRegrCore('2.159.0-layr-pdefs') as core:
+            def_tree = core.getLayer('507ebf7e6ec7aadc47ace6f1f8f77954').layrinfo
+            dst_tree = core.getLayer('9bf7a3adbf69bd16832529ab1fcd1c83').layrinfo
+
+            epulls = {'28cb757e9e390a234822f55b922f3295':
+                           {'chunk:size': 1000,
+                            'iden': '28cb757e9e390a234822f55b922f3295',
+                            'offs': 0,
+                            'queue:size': 10000,
+                            'time': 1703781215891,
+                            'url': 'cell://./cells/pdefmigr00:*/layer/9bf7a3adbf69bd16832529ab1fcd1c83',
+                            'user': '1d8e6e87a2931f8d27690ff408debdab'}}
+            epushs = {'e112f93f09e43f3a10ae945b84721778':
+                           {'chunk:size': 1000,
+                            'iden': 'e112f93f09e43f3a10ae945b84721778',
+                            'offs': 0,
+                            'queue:size': 10000,
+                            'time': 1703781208684,
+                            'url': 'cell://./cells/pdefmigr00:*/layer/9bf7a3adbf69bd16832529ab1fcd1c83',
+                            'user': '1d8e6e87a2931f8d27690ff408debdab'}}
+
+            self.eq(def_tree.get('pulls'), epulls)
+            self.eq(def_tree.get('pushs'), epushs)
+
+            self.notin('pulls', dst_tree)
+            self.notin('pushs', dst_tree)
+
+    async def test_layer_readahead(self):
+
+        async with self.getTestCore() as core:
+
+            layr = core.getLayer()
+            self.true(layr.layrslab.readahead)
+            self.true(layr.layrslab.lenv.flags()['readahead'])
+            self.false(layr.nodeeditslab.readahead)
+            self.false(layr.nodeeditslab.lenv.flags()['readahead'])
+            self.false(layr.dataslab.readahead)
+            self.false(layr.dataslab.lenv.flags()['readahead'])
+
+            with self.setTstEnvars(SYNDEV_CORTEX_LAYER_READAHEAD='false'):
+                iden = await core.callStorm('return($lib.layer.add().iden)')
+                layr = core.getLayer(iden)
+                self.false(layr.layrslab.readahead)
+                self.false(layr.layrslab.lenv.flags()['readahead'])
+                self.false(layr.nodeeditslab.readahead)
+                self.false(layr.nodeeditslab.lenv.flags()['readahead'])
+                self.false(layr.dataslab.readahead)
+                self.false(layr.dataslab.lenv.flags()['readahead'])
+
+    async def test_layer_delete_with_nodedata(self):
+
+        async with self.getTestCore() as core:
+
+            fork00 = await core.view.fork()
+            infork00 = {'view': fork00['iden']}
+            layr00 = core.getLayer(fork00['layers'][0]['iden'])
+
+            iden = await core.callStorm('[ inet:ipv4=1.2.3.4 ] return($node.iden())')
+
+            sodes = await s_t_utils.alist(layr00.getStorNodesByForm('inet:ipv4'))
+            self.len(0, sodes)
+
+            q = '''
+                inet:ipv4=1.2.3.4
+                $node.data.set("key", "valu")
+            '''
+            await core.callStorm(q, opts=infork00)
+
+            sodes = await s_t_utils.alist(layr00.getStorNodesByForm('inet:ipv4'))
+            self.len(1, sodes)
+
+            q = '''
+                view.exec $fork00 {
+                    yield $iden
+                    $lib.print($node)
+                    delnode --deledges --force
+                }
+            '''
+            opts = {'vars': {'iden': iden, 'fork00': fork00['iden']}}
+            await core.callStorm(q, opts=opts)
+
+            sodes = await s_t_utils.alist(layr00.getStorNodesByForm('inet:ipv4'))
+            self.len(0, sodes)
+
+    async def test_layer_migrate_props_fork(self):
+
+        async with self.getTestCore() as core:
+
+            fork00 = await core.view.fork()
+            layr00 = core.getLayer(fork00['layers'][0]['iden'])
+            infork = {'view': fork00['iden']}
+
+            await core.nodes('''
+                for $prop in (_custom:risk:level, _custom:risk:severity) {
+                    $lib.model.ext.addFormProp(
+                        test:guid,
+                        $prop,
+                        (["int", {"enums": [[10, "low"], [20, "medium"], [30, "high"]]}]),
+                        ({"doc": "hey now"}),
+                    )
+                }
+
+            ''')
+            self.len(1, await core.nodes('syn:prop=test:guid:_custom:risk:level'))
+            self.len(1, await core.nodes('syn:prop=test:guid:_custom:risk:severity'))
+
+            # Full node in the default layer
+            nodes = await core.nodes('[ test:guid=* :name=test0 :_custom:risk:level=high ]')
+            self.len(1, nodes)
+            testnode00 = nodes[0]
+
+            # Make some edits in the fork layer
+            q = '''
+                test:guid
+                [
+                    :_custom:risk:level=medium
+                    <(seen)+ {[ meta:source=* ]}
+                    +(refs)> {[ test:str=foobar ]}
+                ]
+                $node.data.set(foo, foo)
+                $node.data.set(bar, bar)
+                $node.data.set(baz, baz)
+            '''
+            msgs = await core.stormlist(q, opts=infork)
+            self.stormHasNoWarnErr(msgs)
+
+            nodes = await core.nodes('test:str=foobar', opts=infork)
+            self.len(1, nodes)
+            refs = nodes[0]
+
+            # Edit a prop on the node in the default layer
+            await core.nodes('test:guid [ :_custom:risk:level=medium ]', opts=infork)
+
+            # Full node in the fork layer
+            nodes = await core.nodes('[ test:guid=* :name=test1 :_custom:risk:level=low ]', opts=infork)
+            self.len(1, nodes)
+
+            await core.getView(fork00['iden']).delete()
+
+            # Can't delete prop because we iterated through the views and there's a _custom:risk:level prop in an
+            # orphaned layer
+            with self.raises(s_exc.CantDelProp) as cm:
+                await core.callStorm('''
+                    $fullprop = "test:guid:_custom:risk:level"
+                    for $view in $lib.view.list(deporder=$lib.true) {
+                        view.exec $view.iden {
+                            yield $lib.layer.get().liftByProp($fullprop)
+                            $repr = $node.repr("_custom:risk:level")
+                            [ :_custom:risk:severity=$repr -:_custom:risk:level ]
+                        }
+                    }
+                    $lib.model.ext.delFormProp("test:guid", "_custom:risk:level")
+                ''')
+            self.eq(cm.exception.get('mesg'), f'Nodes still exist with prop: test:guid:_custom:risk:level in layer {layr00.iden}')
+            self.len(1, await core.nodes('syn:prop=test:guid:_custom:risk:level'))
+
+            # Migrate layer
+            await core.callStorm('''
+                $fullprop = "test:guid:_custom:risk:level"
+                for $layer in $lib.layer.list() {
+                    if $layer.getPropCount($fullprop, maxsize=1) {
+                        for ($buid, $sode) in $layer.getStorNodesByProp($fullprop) {
+                            $oldv = $sode.props."_custom:risk:level"
+                            $layer.setStorNodeProp($buid, "test:guid:_custom:risk:severity", $oldv.0)
+                            $layer.delStorNodeProp($buid, $fullprop)
+
+                            if (not $layer.setNodeDataValu($buid, oldlevel, $oldv.0)) {
+                                $lib.raise(BadArg, "setNodeDataValu() made no edits")
+                            }
+                        }
+
+                        $layer.delNodeData($buid, foo)
+                        $layer.delNodeData($buid, bar)
+
+                        for ($verb, $n2iden) in $layer.getEdgesByN2($buid) {
+                            $layer.delEdge($n2iden, $verb, $buid)
+                        }
+                    }
+                }
+                $lib.model.ext.delFormProp("test:guid", "_custom:risk:level")
+            ''')
+
+            nodes = await core.nodes('syn:prop=test:guid:_custom:risk:level')
+            self.len(0, nodes)
+
+            nodes = await core.nodes('test:guid:_custom:risk:severity')
+            self.len(1, nodes)
+            self.eq(nodes[0].iden(), testnode00.iden())
+            self.eq(nodes[0].get('name'), testnode00.get('name'))
+            self.eq(nodes[0].get('_custom:risk:severity'), testnode00.get('_custom:risk:level'))
+
+            nodes = await core.nodes('syn:prop=test:guid:_custom:risk:level')
+            self.len(0, nodes)
+
+            nodes = await core.nodes('test:guid:_custom:risk:severity')
+            self.len(1, nodes)
+            self.eq(nodes[0].iden(), testnode00.iden())
+            self.eq(nodes[0].get('name'), testnode00.get('name'))
+            self.eq(nodes[0].get('_custom:risk:severity'), testnode00.get('_custom:risk:level'))
+
+            view00 = (await core.addView(vdef={'layers': [layr00.iden, core.view.layers[0].iden]}))['iden']
+            inview = {'view': view00}
+
+            nodes = await core.nodes('test:guid:name=test1', opts=inview)
+            self.len(1, nodes)
+            self.none(nodes[0].get('_custom:risk:level'))
+            self.eq(nodes[0].get('_custom:risk:severity'), 10)
+            self.eq(await nodes[0].getData('oldlevel'), 10)
+
+            nodes = await core.nodes('test:guid:name=test0', opts=inview)
+            self.len(1, nodes)
+            self.none(nodes[0].get('_custom:risk:level'))
+            self.eq(nodes[0].get('_custom:risk:severity'), 20)
+            self.eq(await nodes[0].getData('oldlevel'), 20)
+            self.eq(sorted(await s_t_utils.alist(nodes[0].iterData())), [('baz', 'baz'), ('oldlevel', 20)])
+            self.eq(await s_t_utils.alist(nodes[0].iterEdgesN1()), [('refs', refs.iden())])
+            self.len(0, await s_t_utils.alist(nodes[0].iterEdgesN2()))
+
+            msgs = await core.stormlist('test:guid:name=test0 $lib.layer.get().delStorNode($node)', opts=inview)
+
+            nodes = await core.nodes('test:guid:name=test0', opts=inview)
+            self.len(1, nodes)
+            self.none(nodes[0].get('_custom:risk:level'))
+            self.eq(nodes[0].get('_custom:risk:severity'), 30)
+            self.len(0, await s_t_utils.alist(nodes[0].iterData()))
+            self.len(0, await s_t_utils.alist(nodes[0].iterEdgesN1()))
+            self.len(0, await s_t_utils.alist(nodes[0].iterEdgesN2()))

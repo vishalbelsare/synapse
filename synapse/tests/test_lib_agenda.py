@@ -1,3 +1,4 @@
+import time
 import asyncio
 import hashlib
 import datetime
@@ -8,10 +9,7 @@ import synapse.exc as s_exc
 import synapse.common as s_common
 import synapse.tests.utils as s_t_utils
 
-import synapse.lib.boss as s_boss
-import synapse.lib.hive as s_hive
-import synapse.lib.nexus as s_nexus
-import synapse.lib.lmdbslab as s_lmdbslab
+import synapse.tools.service.backup as s_tools_backup
 
 import synapse.lib.agenda as s_agenda
 from synapse.lib.agenda import TimeUnit as s_tu
@@ -157,11 +155,9 @@ class AgendaTest(s_t_utils.SynTest):
         newts = ar.nexttime(now)
         self.eq(newts, datetime.datetime(year=2018, month=12, day=5, hour=7, minute=2, tzinfo=tz.utc).timestamp())
 
-    async def test_agenda(self):
+    async def test_agenda_base(self):
         MONO_DELT = 1543827303.0
         unixtime = datetime.datetime(year=2018, month=12, day=5, hour=7, minute=0, tzinfo=tz.utc).timestamp()
-        sync = asyncio.Event()
-        lastquery = None
 
         def timetime():
             return unixtime
@@ -169,135 +165,97 @@ class AgendaTest(s_t_utils.SynTest):
         def looptime():
             return unixtime - MONO_DELT
 
-        async def myeval(query, opts=None):
-            nonlocal lastquery
-            lastquery = query
-            sync.set()
-            if 'sleep' in query:
-                await asyncio.sleep(60)
+        async with self.getTestCore() as core:
 
-            if query == 'badquery':
-                raise Exception('test exception')
-            return
-            yield None
+            loop = asyncio.get_running_loop()
+            with mock.patch.object(loop, 'time', looptime), mock.patch('time.time', timetime):
 
-        class FakeAuth(mock.Mock):
-            def __init__(self, **kwargs):
-                mock.Mock.__init__(self, **kwargs)
-                self.users = {}
+                visi = await core.auth.addUser('visi')
+                await visi.setAdmin(True)
 
-            def user(self, iden):
-                return self.users.get(iden)
+                agenda = core.agenda
 
-            async def addUser(self, username, iden=None):
-                if iden is None:
-                    iden = s_common.guid()
-                user = FakeUser()
-                user.name = username
-                self.users[iden] = user
-                return user
-
-        class FakeUser(mock.Mock):
-            def __init__(self, **kwargs):
-                mock.Mock.__init__(self, **kwargs)
-                self.info = {'locked': False}
-
-            async def setLocked(self, valu):
-                self.info['locked'] = valu
-
-        loop = asyncio.get_running_loop()
-        with mock.patch.object(loop, 'time', looptime), mock.patch('time.time', timetime), self.getTestDir() as dirn:
-            core = mock.Mock()
-            core.eval = myeval
-            core.slab = await s_lmdbslab.Slab.anit(dirn, map_size=s_t_utils.TEST_MAP_SIZE, readonly=False)
-            nexsroot = await s_nexus.NexsRoot.anit(dirn)
-            await nexsroot.startup(None)
-
-            def mockgetStormQuery(q):
-                # TODO: Remove this and use AsyncMock when Python 3.8+ only
-                f = asyncio.Future()
-                f.set_result(None)
-                return f
-
-            core.getStormQuery = mockgetStormQuery
-
-            db = core.slab.initdb('hive')
-            core.hive = await s_hive.SlabHive.anit(core.slab, db=db, nexsroot=nexsroot)
-
-            core.auth = FakeAuth()
-            rootiden = 'aaaaa'
-            await core.auth.addUser('root', iden=rootiden)
-
-            core.boss = await s_boss.Boss.anit()
-            async with await s_agenda.Agenda.anit(core) as agenda:
-                agenda.onfini(core.hive)
-                agenda.onfini(core.slab)
-                agenda.onfini(core.boss)
-
-                await agenda.start()
-                await agenda.start()  # make sure it doesn't blow up
                 self.eq([], agenda.list())
 
                 # Missing reqs
-                cdef = {'creator': rootiden, 'iden': 'fakeiden', 'storm': 'foo'}
-                await self.asyncraises(ValueError, agenda.add(cdef))
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': 'fakeiden', 'storm': 'foo'}
+                with self.raises(s_exc.BadArg):
+                    await agenda.add(cdef)
 
                 # Missing creator
                 cdef = {'iden': 'fakeiden', 'storm': 'foo',
                         'reqs': {s_agenda.TimeUnit.MINUTE: 1}}
-                await self.asyncraises(ValueError, agenda.add(cdef))
+                with self.raises(s_exc.BadArg):
+                    await agenda.add(cdef)
 
                 # Missing storm
-                cdef = {'creator': rootiden, 'iden': 'fakeiden',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': 'fakeiden',
                         'reqs': {s_agenda.TimeUnit.MINUTE: 1}}
-                await self.asyncraises(ValueError, agenda.add(cdef))
-                await self.asyncraises(s_exc.NoSuchIden, agenda.get('newp'))
+                with self.raises(s_exc.BadArg):
+                    await agenda.add(cdef)
+
+                with self.raises(s_exc.NoSuchIden):
+                    await agenda.get('newp')
 
                 # Missing incvals
-                cdef = {'creator': rootiden, 'iden': 'DOIT', 'storm': '[test:str=doit]',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': 'DOIT', 'storm': '[test:str=doit]',
                         'reqs': {s_agenda.TimeUnit.NOW: True},
                         'incunit': s_agenda.TimeUnit.MONTH}
-                await self.asyncraises(ValueError, agenda.add(cdef))
+                with self.raises(s_exc.BadArg):
+                    await agenda.add(cdef)
 
                 # Cannot schedule a recurring job with 'now'
-                cdef = {'creator': rootiden, 'iden': 'DOIT', 'storm': '[test:str=doit]',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': 'DOIT', 'storm': '[test:str=doit]',
                         'reqs': {s_agenda.TimeUnit.NOW: True},
                         'incunit': s_agenda.TimeUnit.MONTH,
                         'incvals': 1}
-                await self.asyncraises(ValueError, agenda.add(cdef))
-                await self.asyncraises(s_exc.NoSuchIden, agenda.get('DOIT'))
+                with self.raises(s_exc.BadArg):
+                    await agenda.add(cdef)
+
+                with self.raises(s_exc.NoSuchIden):
+                    await agenda.get('DOIT')
+
+                # Require valid storm
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': 'DOIT', 'storm': ' | | | ',
+                        'reqs': {s_agenda.TimeUnit.MINUTE: 1}}
+                with self.raises(s_exc.BadSyntax):
+                    await agenda.add(cdef)
+
+                with self.raises(s_exc.NoSuchIden):
+                    await agenda.get('DOIT')
+
+                # invalid loglevel
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': 'DOIT',
+                        'storm': '$lib.print(hehe)', 'loglevel': 'nope',
+                        'reqs': {s_agenda.TimeUnit.MINUTE: 1}}
+                with self.raises(s_exc.SchemaViolation):
+                    await agenda.add(cdef)
 
                 # Schedule a one-shot to run immediately
-                cdef = {'creator': rootiden, 'iden': 'DOIT', 'storm': '[test:str=doit]',
+                doit = s_common.guid()
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': doit,
+                        'storm': '$lib.queue.gen(visi).put(woot)',
                         'reqs': {s_agenda.TimeUnit.NOW: True}}
                 await agenda.add(cdef)
 
                 # Can't have two with the same iden
-                await self.asyncraises(s_exc.DupIden, agenda.add(cdef))
+                with self.raises(s_exc.DupIden):
+                    await agenda.add(cdef)
 
-                await sync.wait()  # wait for the query to run
-                sync.clear()
-                self.eq(lastquery, '[test:str=doit]')
-                core.reset_mock()
-                lastquery = None
+                self.eq((0, 'woot'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 appts = agenda.list()
                 self.len(1, appts)
                 self.eq(appts[0][1].startcount, 1)
                 self.eq(appts[0][1].nexttime, None)
-                await agenda.delete('DOIT')
+                await agenda.delete(doit)
 
                 # Schedule a one-shot 1 minute from now
-                cdef = {'creator': rootiden, 'iden': 'IDEN1', 'storm': '[test:str=foo]',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': s_common.guid(), 'storm': '$lib.queue.gen(visi).put(woot)',
                         'reqs': {s_agenda.TimeUnit.MINUTE: 1}}
                 await agenda.add(cdef)
-                await asyncio.sleep(0)  # give the scheduler a shot to wait
                 unixtime += 61
-                await sync.wait()  # wait for the query to run
-                sync.clear()
-                self.eq(lastquery, '[test:str=foo]')
-                core.reset_mock()
-                lastquery = None
+                self.eq((1, 'woot'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 appts = agenda.list()
                 self.len(1, appts)
@@ -305,7 +263,7 @@ class AgendaTest(s_t_utils.SynTest):
                 self.eq(appts[0][1].nexttime, None)
 
                 # Schedule a query to run every Wednesday and Friday at 10:15am
-                cdef = {'creator': rootiden, 'iden': 'IDEN2', 'storm': '[test:str=bar]',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': s_common.guid(), 'storm': '$lib.queue.gen(visi).put(bar)',
                         'reqs': {s_tu.HOUR: 10, s_tu.MINUTE: 15},
                         'incunit': s_agenda.TimeUnit.DAYOFWEEK,
                         'incvals': (2, 4)}
@@ -313,7 +271,7 @@ class AgendaTest(s_t_utils.SynTest):
                 guid = adef.get('iden')
 
                 # every 6th of the month at 7am and 8am (the 6th is a Thursday)
-                cdef = {'creator': rootiden, 'iden': 'IDEN3', 'storm': '[test:str=baz]',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': s_common.guid(), 'storm': '$lib.queue.gen(visi).put(baz)',
                         'reqs': {s_tu.HOUR: (7, 8), s_tu.MINUTE: 0, s_tu.DAYOFMONTH: 6},
                         'incunit': s_agenda.TimeUnit.MONTH,
                         'incvals': 1}
@@ -324,70 +282,76 @@ class AgendaTest(s_t_utils.SynTest):
                 lasthanu = {s_tu.DAYOFMONTH: 10, s_tu.MONTH: 12, s_tu.YEAR: 2018}
 
                 # And one-shots for Christmas and last day of Hanukkah of 2018
-                cdef = {'creator': rootiden, 'iden': 'IDEN4', 'storm': '#happyholidays',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': s_common.guid(), 'storm': '$lib.queue.gen(visi).put(happyholidays)',
                         'reqs': (xmas, lasthanu)}
                 await agenda.add(cdef)
 
-                await asyncio.sleep(0)
                 unixtime += 1
-                # Nothing should happen
-                self.none(lastquery)
+                await asyncio.sleep(0)
+                self.none(await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop())'), timeout=5))
 
                 # Advance to the first event on Wednesday the 5th
                 unixtime = datetime.datetime(year=2018, month=12, day=5, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=bar]')
+                self.eq((2, 'bar'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Then two on the 6th
                 unixtime = datetime.datetime(year=2018, month=12, day=6, hour=7, minute=15, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=baz]')
-                lastquery = None
+                self.eq((3, 'baz'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
+
                 unixtime = datetime.datetime(year=2018, month=12, day=6, hour=8, minute=15, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=baz]')
+                self.eq((4, 'baz'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Then back to the 10:15 on Friday
                 unixtime = datetime.datetime(year=2018, month=12, day=7, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=bar]')
+                self.eq((5, 'bar'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Then Dec 10
                 unixtime = datetime.datetime(year=2018, month=12, day=10, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '#happyholidays')
+                self.eq((6, 'happyholidays'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Then the Wednesday again
                 unixtime = datetime.datetime(year=2018, month=12, day=12, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=bar]')
+                self.eq((7, 'bar'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Cancel the Wednesday/Friday appt
                 await agenda.delete(guid)
-                await self.asyncraises(s_exc.NoSuchIden, agenda.delete(b'1234'))
+                with self.raises(s_exc.NoSuchIden):
+                    await agenda.delete('1234')
 
                 # Then Dec 25
                 unixtime = datetime.datetime(year=2018, month=12, day=25, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '#happyholidays')
+                self.eq((8, 'happyholidays'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Then Jan 6
                 unixtime = datetime.datetime(year=2019, month=1, day=6, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=baz]')
+                self.eq((9, 'baz'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 # Modify the last appointment
-                await self.asyncraises(ValueError, agenda.mod(guid2, '', ))
-                await agenda.mod(guid2, '#baz')
+                with self.raises(s_exc.BadArg):
+                    await agenda.mod(guid2, {'query': ''})
+
+                await agenda.mod(guid2, {'query': '#baz'})
                 self.eq(agenda.appts[guid2].query, '#baz')
+
+                # Modifying a disabled appointment does not re-enable it
+                appt = agenda.appts[guid2]
+                await agenda.disable(guid2)
+                await agenda.mod(guid2, {'query': '#faz'})
+                self.eq(appt.query, '#faz')
+                self.false(appt.enabled)
+
+                # Enabling an appointment with an unparsable query fails and leaves it disabled
+                appt.query = '|||'
+                with self.raises(s_exc.BadSyntax):
+                    await agenda.enable(guid2)
+                self.false(appt.enabled)
+
+                appt.query = '#faz'
+                await agenda.enable(guid2)
+                self.true(appt.enabled)
+
+                with self.raises(s_exc.NoSuchIden):
+                    await agenda.enable('newp')
 
                 # Delete the other recurring appointment
                 await agenda.delete(guid2)
@@ -396,22 +360,31 @@ class AgendaTest(s_t_utils.SynTest):
                 self.len(0, agenda.apptheap)
 
                 # Test that isrunning updated, cancelling works
-                cdef = {'creator': rootiden, 'iden': 'IDEN5', 'storm': 'inet:ipv4=1 | sleep 120',
-                        'reqs': {}, 'incunit': s_agenda.TimeUnit.MINUTE, 'incvals': 1}
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': s_common.guid(),
+                        'storm': '$lib.queue.gen(visi).put(sleep) [ inet:ipv4=1 ] | sleep 120',
+                        'reqs': {}, 'incunit': s_agenda.TimeUnit.MINUTE, 'incvals': 1,
+                        'loglevel': 'CRITICAL'}
                 adef = await agenda.add(cdef)
                 guid = adef.get('iden')
 
                 unixtime += 60
-                await sync.wait()
-                sync.clear()
-                self.len(1, core.boss.tasks)
-                task = next(iter(core.boss.tasks.values()))
-                self.eq(task.info.get('query'), 'inet:ipv4=1 | sleep 120')
-                self.eq(task.info.get('iden'), guid)
+                self.eq((10, 'sleep'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
 
                 appt = await agenda.get(guid)
                 self.eq(appt.isrunning, True)
-                await task.kill()
+                self.eq(core.view.iden, appt.task.info.get('view'))
+                self.eq(appt.loglevel, 'CRITICAL')
+
+                self.true(await core._killCronTask(guid))
+
+                events = [
+                    {'event': 'cron:stop', 'info': {'iden': appt.iden}},
+                ]
+
+                task = core.schedCoro(s_t_utils.waitForBehold(core, events))
+                await asyncio.wait_for(task, timeout=5)
+
+                self.false(await core._killCronTask(guid))
 
                 appt = await agenda.get(guid)
                 self.eq(appt.isrunning, False)
@@ -419,234 +392,173 @@ class AgendaTest(s_t_utils.SynTest):
                 await agenda.delete(guid)
 
                 # Test bad queries record exception
-                cdef = {'creator': rootiden, 'iden': '#foo', 'storm': 'IDEN',
+                cdef = {'creator': core.auth.rootuser.iden, 'iden': s_common.guid(),
+                        'storm': '$lib.queue.gen(visi).put(boom) $lib.raise(OmgWtfBbq, boom)',
                         'reqs': {}, 'incunit': s_agenda.TimeUnit.MINUTE,
                         'incvals': 1}
                 adef = await agenda.add(cdef)
                 guid = adef.get('iden')
 
+                strt = await core.nexsroot.index()
                 # bypass the API because it would actually syntax check
-                agenda.appts[guid].query = 'badquery'
                 unixtime += 60
-                await sync.wait()
-                sync.clear()
+                self.eq((11, 'boom'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
+                await core.nexsroot.waitOffs(strt + 5)
 
                 appt = await agenda.get(guid)
                 self.eq(appt.isrunning, False)
-                self.eq(appt.lastresult, 'raised exception test exception')
+                self.isin("raised exception StormRaise: errname='OmgWtfBbq'", appt.lastresult)
+                self.isin("highlight={'hash': '6736b8252d9413221a9b693b2b19cf53'", appt.lastresult)
+                self.isin("mesg='boom'", appt.lastresult)
 
                 # Test setting the global enable/disable flag
-                # reset
                 await agenda.delete(guid)
-                lastquery = None
                 self.len(0, agenda.apptheap)
-                agenda._schedtask.cancel()
-                agenda._schedtask = agenda.schedCoro(agenda._scheduleLoop())
-
-                visi = await core.auth.addUser('visi', iden='visivisi')
 
                 # schedule a query to run every Wednesday and Friday at 10:15am
-                cdef = {'creator': 'visivisi', 'iden': 'IDEN6', 'storm': '[test:str=bar]',
+                cdef = {'creator': visi.iden, 'iden': s_common.guid(), 'storm': '$lib.queue.gen(visi).put(bar)',
+                        'pool': True,
                         'reqs': {s_tu.HOUR: 10, s_tu.MINUTE: 15},
                         'incunit': s_agenda.TimeUnit.DAYOFWEEK,
                         'incvals': (2, 4)}
                 adef = await agenda.add(cdef)
+
+                self.true(adef['pool'])
                 guid = adef.get('iden')
 
                 self.len(1, agenda.apptheap)
-
-                # disable crons and advance time
-                agenda.enabled = False
 
                 unixtime = datetime.datetime(year=2019, month=2, day=6, hour=10, minute=16, tzinfo=tz.utc).timestamp()
                 nexttime = datetime.datetime(year=2019, month=2, day=8, hour=10, minute=15, tzinfo=tz.utc).timestamp()
 
                 await asyncio.sleep(0)
-                self.none(lastquery)
 
                 appt = await agenda.get(guid)
                 self.eq(nexttime, appt.nexttime)
                 self.true(appt.enabled)
                 self.eq(0, appt.startcount)
 
-                # enable crons and advance time
-                agenda.enabled = True
+                # Ensure structured logging captures the cron iden value
+                core.stormlog = True
+                with self.getLoggerStream('synapse.storm') as stream:
+                    unixtime = datetime.datetime(year=2019, month=2, day=13, hour=10, minute=16,
+                                                 tzinfo=tz.utc).timestamp()
+                    self.eq((12, 'bar'), await asyncio.wait_for(core.callStorm('return($lib.queue.gen(visi).pop(wait=$lib.true))'), timeout=5))
+                core.stormlog = False
 
-                unixtime = datetime.datetime(year=2019, month=2, day=13, hour=10, minute=16, tzinfo=tz.utc).timestamp()
-                await sync.wait()
-                sync.clear()
-                self.eq(lastquery, '[test:str=bar]')
+                msgs = stream.jsonlines()
+                msgs = [m for m in msgs if m['params']['text'] == '$lib.queue.gen(visi).put(bar)']
+                self.gt(len(msgs), 0)
+                for m in msgs:
+                    self.eq(m['params'].get('cron'), appt.iden)
+
                 self.eq(1, appt.startcount)
 
-                cdef = {'creator': rootiden, 'iden': 'IDEN2', 'storm': '[test:str=foo2]',
+                cdef = {'creator': visi.iden, 'iden': s_common.guid(), 'storm': '[test:str=foo2]',
                         'reqs': {s_agenda.TimeUnit.MINUTE: 1}}
+
                 await agenda.add(cdef)
 
                 # Lock user and advance time
+                strt = await core.nexsroot.index()
+
                 await visi.setLocked(True)
 
-                with self.getLoggerStream('synapse.lib.agenda', 'locked') as stream:
-                    unixtime = datetime.datetime(year=2019, month=2, day=16, hour=10, minute=16,
-                                                 tzinfo=tz.utc).timestamp()
-                    await sync.wait()
-                    sync.clear()
+                with self.getLoggerStream('synapse.lib.agenda') as stream:
+                    unixtime = datetime.datetime(year=2019, month=2, day=16, hour=10, minute=16, tzinfo=tz.utc).timestamp()
+
+                    # pump the ioloop via sleep(0) until the log message appears
+                    while 'locked' not in stream.getvalue():
+                        await asyncio.sleep(0)
+
+                    while not await core.nexsroot.waitOffs(strt + 4):
+                        await asyncio.sleep(0)
+
                     self.eq(2, appt.startcount)
-                    self.true(stream.wait(0.1))
+
+                # Can't use an existing authgate iden
+                viewiden = core.getView().iden
+                cdef = {'creator': core.auth.rootuser.iden,
+                        'storm': '[test:str=bar]',
+                        'reqs': {'hour': 10},
+                        'incunit': 'dayofweek',
+                        'incvals': (2, 4),
+                        'iden': viewiden}
+                with self.raises(s_exc.DupIden):
+                    await core.addCronJob(cdef)
+
+                await core.delCronJob(viewiden)
+
+                self.nn(await core.getAuthGate(viewiden))
 
     async def test_agenda_persistence(self):
         ''' Test we can make/change/delete appointments and they are persisted to storage '''
-        with self.getTestDir() as fdir:
 
-            core = mock.Mock()
+        with self.getTestDir() as dirn:
 
-            def raiseOnBadStorm(q):
-                ''' Just enough storm parsing for this test '''
-                # TODO: Async this and use AsyncMock when Python 3.8+ only
-                f = asyncio.Future()
-                if (q[0] == '[') != (q[-1] == ']'):
-                    f.set_exception(s_exc.BadSyntax(mesg='mismatched braces'))
-                else:
-                    f.set_result('all good')
-                return f
+            async with self.getTestCore(dirn=dirn) as core:
 
-            core.getStormQuery = raiseOnBadStorm
+                cdef = {'creator': core.auth.rootuser.iden,
+                        'storm': '[test:str=bar]',
+                        'reqs': {'hour': 10, 'minute': 15},
+                        'incunit': 'dayofweek',
+                        'incvals': (2, 4)}
+                adef = await core.addCronJob(cdef)
+                guid1 = adef.get('iden')
 
-            async with await s_lmdbslab.Slab.anit(fdir, map_size=100000) as slab:
-                db = slab.initdb('hive')
-                hive = await s_hive.SlabHive.anit(slab, db=db)
-                core.hive = hive
-
-                async with await s_agenda.Agenda.anit(core) as agenda:
-                    await agenda.start()
-                    # Schedule a query to run every Wednesday and Friday at 10:15am
-                    cdef = {'creator': 'visi', 'iden': 'IDEN1', 'storm': '[test:str=bar]',
-                            'reqs': {s_tu.HOUR: 10, s_tu.MINUTE: 15},
-                            'incunit': s_agenda.TimeUnit.DAYOFWEEK,
-                            'incvals': (2, 4)}
-                    adef = await agenda.add(cdef)
-                    guid1 = adef.get('iden')
-
-                    # every 6th of the month at 7am and 8am (the 6th is a Thursday)
-                    cdef = {'creator': 'visi', 'iden': 'IDEN2', 'storm': '[test:str=baz]',
-                            'reqs': {s_tu.HOUR: (7, 8), s_tu.MINUTE: 0, s_tu.DAYOFMONTH: 6},
-                            'incunit': s_agenda.TimeUnit.MONTH,
-                            'incvals': 1}
-                    adef = await agenda.add(cdef)
-
-                    guid2 = adef.get('iden')
-                    appt = agenda.appts[guid2]
-                    appt.lasterrs.append('error happened')
-                    await agenda._storeAppt(appt)
-
-                    # Add an appt with an invalid query
-                    cdef = {'creator': 'visi', 'iden': 'BAD1', 'storm': '[test:str=',
-                            'reqs': {s_tu.HOUR: (7, 8)},
-                            'incunit': s_agenda.TimeUnit.MONTH,
-                            'incvals': 1}
-                    adef = await agenda.add(cdef)
-                    badguid1 = adef.get('iden')
-
-                    # Add an appt with a bad version in storage
-                    cdef = {'creator': 'visi', 'iden': 'BAD2', 'storm': '[test:str=foo]',
-                            'reqs': {s_tu.HOUR: (7, 8)},
-                            'incunit': s_agenda.TimeUnit.MONTH,
-                            'incvals': 1}
-                    adef = await agenda.add(cdef)
-                    badguid2 = adef.get('iden')
-
-                    adef['ver'] = 1337
-                    full = agenda._hivenode.full + (badguid2,)
-                    await agenda.core.hive.set(full, adef)
-
-                    xmas = {s_tu.DAYOFMONTH: 25, s_tu.MONTH: 12, s_tu.YEAR: 2099}
-                    lasthanu = {s_tu.DAYOFMONTH: 10, s_tu.MONTH: 12, s_tu.YEAR: 2099}
-
-                    await agenda.delete(guid1)
-
-                    # And one-shots for Christmas and last day of Hanukkah of 2018
-                    cdef = {'creator': 'visi', 'iden': 'IDEN3', 'storm': '#happyholidays',
-                            'reqs': (xmas, lasthanu)}
-
-                    adef = await agenda.add(cdef)
-                    guid3 = adef.get('iden')
-
-                    await agenda.mod(guid3, '#bahhumbug')
-
-                async with await s_agenda.Agenda.anit(core) as agenda:
-                    await agenda.start()
-                    agenda.enabled = True
-
-                    appts = agenda.list()
-                    self.len(3, appts)
-
-                    last_appt = [appt for (iden, appt) in appts if iden == guid3][0]
-                    self.eq(last_appt.query, '#bahhumbug')
-
-                    bad_appt = [appt for (iden, appt) in appts if iden == badguid1][0]
-                    self.false(bad_appt.enabled)
-
-                    self.len(0, [appt for (iden, appt) in appts if iden == badguid2])
-
-    async def test_cron_perms(self):
-
-        async with self.getTestCore() as core:
-
-            visi = await core.auth.addUser('visi')
-            newb = await core.auth.addUser('newb')
-            async with core.getLocalProxy(user='visi') as proxy:
-
-                cdef = {'storm': 'inet:ipv4', 'reqs': {'hour': 2}}
-                with self.raises(s_exc.AuthDeny):
-                    await proxy.addCronJob(cdef)
-
-                await visi.addRule((True, ('cron', 'add')))
-                cron0 = await proxy.addCronJob(cdef)
-                cron0_iden = cron0.get('iden')
-
-                cdef = {'storm': 'inet:ipv6', 'reqs': {'hour': 2}}
-                cron1 = await proxy.addCronJob(cdef)
-                cron1_iden = cron1.get('iden')
-
-                await proxy.delCronJob(cron0_iden)
-
-                cdef = {'storm': '[test:str=foo]', 'reqs': {'now': True},
+                # every 6th of the month at 7am and 8am (the 6th is a Thursday)
+                cdef = {'creator': core.auth.rootuser.iden,
+                        'storm': '[test:str=baz]',
+                        'reqs': {'hour': (7, 8), 'minute': 0, 'dayofmonth': 6},
                         'incunit': 'month',
                         'incvals': 1}
-                await self.asyncraises(s_exc.BadConfValu, proxy.addCronJob(cdef))
+                adef = await core.addCronJob(cdef)
 
-            async with core.getLocalProxy(user='newb') as proxy:
+                guid2 = adef.get('iden')
+                appt = core.agenda.appts[guid2]
+                appt.lasterrs.append('error happened')
+                await appt.save()
 
-                with self.raises(s_exc.AuthDeny):
-                    await proxy.delCronJob(cron1_iden)
+                # Add an appt with an invalid query
+                cdef = {'creator': core.auth.rootuser.iden,
+                        'storm': '[test:str=',
+                        'reqs': {'hour': (7, 8)},
+                        'incunit': 'month',
+                        'incvals': 1}
 
-                self.eq(await proxy.listCronJobs(), ())
-                await newb.addRule((True, ('cron', 'get')))
-                self.len(1, await proxy.listCronJobs())
+                with self.raises(s_exc.BadSyntax):
+                    await core.addCronJob(cdef)
 
-                with self.raises(s_exc.AuthDeny):
-                    await proxy.disableCronJob(cron1_iden)
+                xmas = {'dayofmonth': 25, 'month': 12, 'year': 2099}
+                lasthanu = {'dayofmonth': 10, 'month': 12, 'year': 2099}
 
-                await newb.addRule((True, ('cron', 'set')))
-                self.none(await proxy.disableCronJob(cron1_iden))
+                await core.delCronJob(guid1)
 
-                await newb.addRule((True, ('cron', 'del')))
-                await proxy.delCronJob(cron1_iden)
+                # And one-shots for Christmas and last day of Hanukkah of 2018
+                cdef = {'creator': core.auth.rootuser.iden,
+                        'storm': '#happyholidays',
+                        'reqs': (xmas, lasthanu)}
 
-    async def test_agenda_stop(self):
+                adef = await core.addCronJob(cdef)
+                guid3 = adef.get('iden')
 
-        async with self.getTestCore() as core:
-            await core.callStorm('$lib.queue.add(foo)')
-            await core.callStorm('cron.add --minute +1 { $lib.queue.get(foo).put((99)) $lib.time.sleep(10) }')
-            appts = core.agenda.list()
-            await core.agenda._execute(appts[0][1])
-            self.eq((0, 99), await core.callStorm('return($lib.queue.get(foo).get())'))
+                await core.updateCronJob(guid3, '#bahhumbug')
 
-            appts[0][1].creator = 'fakeuser'
-            await core.agenda._execute(appts[0][1])
-            self.eq(appts[0][1].lastresult, 'Failed due to unknown user')
+                # Add a job with invalid storage version
+                cdef = (await core.listCronJobs())[0]
+                guid = s_common.guid()
+                cdef['ver'] = 0
+                cdef['iden'] = guid
+                core.agenda.apptdefs.set(guid, cdef)
 
-            await core.agenda.stop()
-            self.false(core.agenda.enabled)
+            async with self.getTestCore(dirn=dirn) as core:
+
+                appts = await core.listCronJobs()
+
+                self.len(2, appts)
+
+                last_appt = [appt for appt in appts if appt.get('iden') == guid3][0]
+                self.eq(last_appt.get('query'), '#bahhumbug')
 
     async def test_agenda_custom_view(self):
 
@@ -654,7 +566,7 @@ class AgendaTest(s_t_utils.SynTest):
             # no existing view
             await core.callStorm('$lib.queue.add(testq)')
             defview = core.getView()
-            fakeiden = hashlib.md5(defview.iden.encode('utf-8')).hexdigest()
+            fakeiden = hashlib.md5(defview.iden.encode('utf-8'), usedforsecurity=False).hexdigest()
             opts = {'vars': {'fakeiden': fakeiden}}
             with self.raises(s_exc.NoSuchView):
                 await prox.callStorm('cron.add --view $fakeiden --minute +2 { $lib.queue.get(testq).put((43)) }', opts=opts)
@@ -715,6 +627,7 @@ class AgendaTest(s_t_utils.SynTest):
             jobs = await core.callStorm('return($lib.cron.list())')
             self.len(1, jobs)
             self.eq(defview.iden, jobs[0]['view'])
+            self.nn(jobs[0].get('created'))
 
             core.agenda._addTickOff(60)
             retn = await core.callStorm('return($lib.queue.get(testq).get())', opts=asfail)
@@ -813,3 +726,1452 @@ class AgendaTest(s_t_utils.SynTest):
             self.len(1, nodes)
             nodes = await core.nodes('test:int=97', opts={'view': newview})
             self.len(0, nodes)
+
+    async def test_agenda_edit(self):
+
+        async with self.getTestCore() as core:
+
+            lowuser = await core.addUser('lowuser')
+            lowuser = lowuser.get('iden')
+
+            msgs = await core.stormlist('cron.add --hourly 32 { $lib.print(woot) }')
+            self.stormHasNoErr(msgs) # --hourly is deprecated, but should not be an error
+
+            cdef = await core.callStorm('for $cron in $lib.cron.list() { return($cron) }')
+            self.false(cdef['pool'])
+            self.eq(cdef['creator'], core.auth.rootuser.iden)
+
+            cdef = await core.callStorm('for $cron in $lib.cron.list() { $cron.set(pool, (true)) return($cron) }')
+            self.true(cdef['pool'])
+
+            opts = {'vars': {'lowuser': lowuser}}
+            cdef = await core.callStorm('for $cron in $lib.cron.list() { return($cron.set(creator, $lowuser)) }',
+                                        opts=opts)
+            self.eq(cdef['creator'], lowuser)
+
+            opts = {'user': lowuser, 'vars': {'iden': cdef.get('iden'), 'lowuser': lowuser}}
+            q = '$cron = $lib.cron.get($iden) return ( $cron.set(creator, $lowuser) )'
+            msgs = await core.stormlist(q, opts=opts)
+            # XXX FIXME - This is an odd message since the new creator does not implicitly have
+            # access to the cronjob that is running as them.
+            self.stormIsInErr('Provided iden does not match any valid authorized cron job.', msgs)
+
+            await core.addUserRule(lowuser, (True, ('cron', 'get')))
+            opts = {'user': lowuser, 'vars': {'iden': cdef.get('iden'), 'lowuser': lowuser}}
+            q = '$cron = $lib.cron.get($iden) return ( $cron.set(creator, $lowuser) )'
+            msgs = await core.stormlist(q, opts=opts)
+            self.stormIsInErr('must have permission cron.set.creator', msgs)
+
+    async def test_agenda_fatal_run(self):
+
+        # Create a scenario where an agenda appointment is "correct"
+        # but encounters a fatal error when attempting to be created.
+        # This error is then logged, and corrected.
+
+        async with self.getTestCore() as core:
+
+            udef = await core.addUser('user')
+            user = udef.get('iden')
+
+            fork = await core.callStorm('$fork = $lib.view.get().fork().iden return ( $fork )')
+
+            q = '$lib.log.info(`I am a cron job run by {$lib.user.name()} in {$lib.view.get().iden}`)'
+            msgs = await core.stormlist('cron.add --minute +1 $q', opts={'vars': {'q': q}, 'view': fork})
+            self.stormHasNoErr(msgs) # --minute is deprecated, but should not be an error
+
+            cdef = await core.callStorm('for $cron in $lib.cron.list() { return($cron.set(creator, $user)) }',
+                                        opts={'vars': {'user': user}})
+            self.eq(cdef['creator'], user)
+
+            # Force the cron to run.
+
+            with self.getLoggerStream('synapse.lib.agenda') as stream:
+                core.agenda._addTickOff(55)
+                await stream.expect('Agenda error running appointment', timeout=12)
+
+            await core.addUserRule(user, (True, ('storm',)))
+            await core.addUserRule(user, (True, ('view', 'read')), gateiden=fork)
+
+            with self.getLoggerStream('synapse.storm.log') as stream:
+                core.agenda._addTickOff(60)
+                await stream.expect('I am a cron job', timeout=12)
+
+    async def test_agenda_mirror_realtime(self):
+        with self.getTestDir() as dirn:
+
+            path00 = s_common.gendir(dirn, 'core00')
+            path01 = s_common.gendir(dirn, 'core01')
+
+            async with self.getTestCore(dirn=path00) as core00:
+                await core00.nodes('[ inet:ipv4=1.2.3.4 ]')
+
+            s_tools_backup.backup(path00, path01)
+
+            async with self.getTestCore(dirn=path00) as core00:
+                self.false(core00.conf.get('mirror'))
+
+                await core00.callStorm('cron.add --minute +1 { $lib.time.sleep(5) }')
+
+                url = core00.getLocalUrl()
+
+                core01conf = {'mirror': url}
+
+                async with self.getTestCore(dirn=path01, conf=core01conf) as core01:
+                    mesgs = []
+                    async with core00.beholder() as wind:
+                        core00.agenda._addTickOff(55)
+                        async for mesg in wind:
+                            mesgs.append(mesg)
+                            core00.agenda._addTickOff(30)
+                            if len(mesgs) == 2:
+                                break
+
+                    await core01.sync()
+
+                    cron00 = await core00.callStorm('return($lib.cron.list())')
+                    cron01 = await core01.callStorm('return($lib.cron.list())')
+
+                    self.eq(cron00, cron01)
+
+                    start = mesgs[0]
+                    stop = mesgs[1]
+
+                    self.eq(start['event'], 'cron:start')
+                    self.eq(stop['event'], 'cron:stop')
+
+                    self.eq(start['info']['iden'], cron00[0]['iden'])
+                    self.eq(stop['info']['iden'], cron00[0]['iden'])
+
+                async with self.getTestCore(dirn=path01, conf=core01conf) as core01:
+                    nodes = await core00.nodes('syn:cron')
+                    self.len(1, nodes)
+
+                    msgs = await core00.stormlist('syn:cron [ :name=foo :doc=bar ]')
+                    self.stormHasNoWarnErr(msgs)
+                    await core01.sync()
+
+                    nodes = await core01.nodes('syn:cron')
+                    self.len(1, nodes)
+                    self.nn(nodes[0].props.get('.created'))
+                    self.eq(nodes[0].props.get('name'), 'foo')
+                    self.eq(nodes[0].props.get('doc'), 'bar')
+
+                    appt = await core01.agenda.get(nodes[0].ndef[1])
+                    self.eq(appt.name, 'foo')
+                    self.eq(appt.doc, 'bar')
+
+            with self.getLoggerStream('synapse.lib.agenda') as stream:
+                async with self.getTestCore(dirn=path00) as core00:
+                    appts = core00.agenda.list()
+                    self.len(1, appts)
+                    appt = appts[0][1]
+
+                    edits = {
+                        'invalid': 'newp',
+                    }
+                    await core00.addCronEdits(appt.iden, edits)
+
+                stream.seek(0)
+                data = stream.read()
+                self.isin("_Appt.edits() Invalid attribute received: invalid = 'newp'", data)
+
+    async def test_agenda_promotions(self):
+        # Adjust this knob for the number of cron jobs you want to test. Below
+        # are some average run times from my dev box
+        # 100 -> ~15s
+        # 250 -> ~18s
+        # 500 -> ~22s
+        # 5000 -> ~88s
+        NUMJOBS = 100
+
+        async with self.getTestAha() as aha:
+
+            conf00 = {
+                'aha:provision': await aha.addAhaSvcProv('00.cortex')
+            }
+
+            async with self.getTestCore(conf=conf00) as core00:
+                self.false(core00.conf.get('mirror'))
+
+                msgs = await core00.stormlist('[it:dev:str=foo]')
+                self.stormHasNoWarnErr(msgs)
+
+                # Forward wind agenda to two minutes past the hour so we don't hit any weird timing windows
+                tick = core00.agenda._getNowTick()
+                now = time.gmtime(int(tick))
+                diff = (60 - now.tm_min) * 60
+                core00.agenda._addTickOff(diff + 120)
+
+                # Add NUMJOBS cron jobs that starts every hour
+                q = '''
+                for $ii in $lib.range($numjobs) {
+                    cron.add --name `CRON{$ii}` --hour +1 { $lib.time.sleep(90) }
+                }
+                '''
+                opts = {'vars': {'numjobs': NUMJOBS}}
+                await core00.callStorm(q, opts=opts)
+
+                prov01 = {'mirror': '00.cortex'}
+                conf01 = {
+                    'aha:provision': await aha.addAhaSvcProv('01.cortex', provinfo=prov01),
+                }
+
+                async with self.getTestCore(conf=conf01) as core01:
+                    # Advance the ticks so the cronjob starts sooner
+                    core00.agenda._addTickOff(3600)
+
+                    # Sync agenda ticks
+                    diff = core00.agenda._getNowTick() - core01.agenda._getNowTick()
+                    core01.agenda._addTickOff(diff)
+
+                    mesgs = []
+                    async for mesg in core00.behold():
+                        mesgs.append(mesg)
+                        if len(mesgs) >= NUMJOBS:
+                            break
+
+                    for mesg in mesgs:
+                        self.eq(mesg['event'], 'cron:start')
+
+                    # Inspect crons and tasks
+                    crons00 = await core00.callStorm('return($lib.cron.list())')
+                    self.len(NUMJOBS, crons00)
+                    # isrunning is synced via nexus so it should be true for both cortexes
+                    for cron in crons00:
+                        self.true(cron.get('isrunning'))
+
+                    cronidens = [k['iden'] for k in crons00]
+
+                    await core01.sync()
+
+                    crons01 = await core01.callStorm('return($lib.cron.list())')
+                    self.len(NUMJOBS, crons01)
+                    # isrunning is synced via nexus so it should be true for both cortexes
+                    for cron in crons01:
+                        self.true(cron.get('isrunning'))
+
+                    tasks00 = await core00.callStorm('return($lib.ps.list())')
+                    # 101 tasks: one for the main task and NUMJOBS for the cronjob instances
+                    self.len(NUMJOBS + 1, tasks00)
+                    self.eq(tasks00[0]['info']['query'], '[it:dev:str=foo]')
+                    for idx, task in enumerate(tasks00):
+                        if idx == 0:
+                            continue
+
+                        self.isin(task['info']['iden'], cronidens)
+                        self.eq(task['info']['query'], '$lib.time.sleep(90)')
+
+                    # No tasks running on the follower
+                    tasks01 = await core01.callStorm('return($lib.ps.list())')
+                    self.len(0, tasks01)
+
+                    with self.getLoggerStream('synapse.lib.agenda') as stream:
+                        # Promote and inspect cortex status
+                        await core01.promote(graceful=True)
+                        self.false(core00.isactive)
+                        self.true(core01.isactive)
+                        await stream.expect('name=CRON99', timeout=6)
+
+                    data = stream.getvalue()
+                    for ii in range(NUMJOBS):
+                        self.isin(f' name=CRON{ii} with result \\"cancelled\\" took ', data)
+
+                    # Sync the (now) follower so the isrunning status gets updated to false on both cortexes
+                    await core00.sync()
+
+                    crons00 = await core00.callStorm('return($lib.cron.list())')
+                    self.len(NUMJOBS, crons00)
+                    for cron in crons00:
+                        self.false(cron.get('isrunning'))
+
+                    crons01 = await core01.callStorm('return($lib.cron.list())')
+                    self.len(NUMJOBS, crons01)
+                    for cron in crons01:
+                        self.false(cron.get('isrunning'))
+
+                    # Bump the ticks on core01 so the cron jobs start
+                    core01.agenda._addTickOff(3600)
+
+                    mesgs = []
+                    async for mesg in core01.behold():
+                        mesgs.append(mesg)
+                        if len(mesgs) >= NUMJOBS:
+                            break
+
+                    for mesg in mesgs:
+                        self.eq(mesg['event'], 'cron:start')
+
+                    # Sync the follower to get the latest isrunning status
+                    await core00.sync()
+
+                    crons00 = await core00.callStorm('return($lib.cron.list())')
+                    self.len(NUMJOBS, crons00)
+                    # Cronjobs are running so true on both cortexes
+                    for cron in crons00:
+                        self.true(cron.get('isrunning'))
+
+                    crons01 = await core01.callStorm('return($lib.cron.list())')
+                    self.len(NUMJOBS, crons01)
+                    # Cronjobs are running so true on both cortexes
+                    for cron in crons01:
+                        self.true(cron.get('isrunning'))
+
+                    tasks00 = await core00.callStorm('return($lib.ps.list())')
+                    # This task is the main task from before promotion
+                    self.len(1, tasks00)
+                    self.eq(tasks00[0]['info']['query'], '[it:dev:str=foo]')
+
+                    tasks01 = await core01.callStorm('return($lib.ps.list())')
+                    # The cronjob instances are the only tasks
+                    self.len(NUMJOBS, tasks01)
+                    for task in tasks01:
+                        self.isin(task['info']['iden'], cronidens)
+                        self.eq(task['info']['query'], '$lib.time.sleep(90)')
+
+    async def test_cron_kill(self):
+        async with self.getTestCore() as core:
+
+            evt = asyncio.Event()
+
+            # Cron task watcher
+            async def task():
+                async for mesg in core.behold():
+                    if mesg.get('event') == 'cron:stop':
+                        evt.set()
+
+            core.schedCoro(task())
+
+            # Put an item into the queue and then block forever
+            q = '$q = $lib.queue.gen(test) $q.put((0)) $lib.time.sleep(999)'
+            guid = s_common.guid()
+            cdef = {
+                'creator': core.auth.rootuser.iden, 'iden': guid,
+                'storm': q,
+                'reqs': {'now': True}
+            }
+            await core.addCronJob(cdef)
+
+            # Get the item from the queue to confirm the cron job is running
+            q = '$q=$lib.queue.gen(test) for $valu in $q.get((0), wait=(true)) { return ($valu) }'
+            valu = await core.callStorm(q)
+            self.eq(valu, 0)
+
+            # Get the cron def
+            opts = {'vars': {'iden': guid}}
+            get_cron = 'return($lib.cron.get($iden).pack())'
+            cdef = await core.callStorm(get_cron, opts=opts)
+            self.true(cdef.get('isrunning'), msg=cdef)
+
+            # Kill the cron job
+            self.true(await core.callStorm('return($lib.cron.get($iden).kill())', opts=opts))
+
+            # Wait for the beholder event
+            self.true(await asyncio.wait_for(evt.wait(), timeout=12))
+
+            # Check cron job is stopped
+            cdef = await core.callStorm(get_cron, opts=opts)
+            self.false(cdef.get('isrunning'))
+
+    async def test_cron_kill_pool(self):
+
+        async with self.getTestAha() as aha:
+
+            import synapse.cortex as s_cortex
+            import synapse.lib.base as s_base
+
+            async with await s_base.Base.anit() as base:
+
+                with self.getTestDir() as dirn:
+
+                    dirn00 = s_common.genpath(dirn, 'cell00')
+                    dirn01 = s_common.genpath(dirn, 'cell01')
+
+                    core00 = await base.enter_context(self.addSvcToAha(aha, '00.core', s_cortex.Cortex, dirn=dirn00))
+                    provinfo = {'mirror': '00.core'}
+                    core01 = await base.enter_context(self.addSvcToAha(aha, '01.core', s_cortex.Cortex, dirn=dirn01, provinfo=provinfo))
+
+                    self.len(1, await core00.nodes('[inet:asn=0]'))
+                    await core01.sync()
+                    self.len(1, await core01.nodes('inet:asn=0'))
+
+                    msgs = await core00.stormlist('aha.pool.add pool00...')
+                    self.stormHasNoWarnErr(msgs)
+                    self.stormIsInPrint('Created AHA service pool: pool00.synapse', msgs)
+
+                    msgs = await core00.stormlist('aha.pool.svc.add pool00... 01.core...')
+                    self.stormHasNoWarnErr(msgs)
+                    self.stormIsInPrint('AHA service (01.core...) added to service pool (pool00.synapse)', msgs)
+
+                    msgs = await core00.stormlist('cortex.storm.pool.set --connection-timeout 1 --sync-timeout 1 aha://pool00...')
+                    self.stormHasNoWarnErr(msgs)
+                    self.stormIsInPrint('Storm pool configuration set.', msgs)
+
+                    await core00.stormpool.waitready(timeout=12)
+
+                    data = []
+                    evt = asyncio.Event()
+
+                    async def task():
+                        async for mesg in core00.behold():
+                            data.append(mesg)
+                            if mesg.get('event') == 'cron:stop':
+                                evt.set()
+
+                    core00.schedCoro(task())
+
+                    q = '$q=$lib.queue.gen(test) for $i in $lib.range(60) { $lib.time.sleep(0.1) $q.put($i) }'
+                    guid = s_common.guid()
+                    cdef = {
+                        'creator': core00.auth.rootuser.iden, 'iden': guid,
+                        'storm': q,
+                        'reqs': {'NOW': True},
+                        'pool': True,
+                    }
+                    await core00.addCronJob(cdef)
+
+                    q = '$q=$lib.queue.gen(test) for $valu in $q.get((0), wait=(true)) { return ($valu) }'
+                    valu = await core00.callStorm(q, opts={'mirror': False})
+                    self.eq(valu, 0)
+
+                    opts = {'vars': {'iden': guid}, 'mirror': False}
+                    get_cron = 'return($lib.cron.get($iden).pack())'
+                    cdef = await core00.callStorm(get_cron, opts=opts)
+                    self.true(cdef.get('isrunning'))
+
+                    self.true(await core00.callStorm('return($lib.cron.get($iden).kill())', opts=opts))
+
+                    self.true(await asyncio.wait_for(evt.wait(), timeout=12))
+
+                    cdef00 = await core00.callStorm(get_cron, opts=opts)
+                    self.false(cdef00.get('isrunning'))
+
+                    cdef01 = await core01.callStorm(get_cron, opts=opts)
+                    self.false(cdef01.get('isrunning'))
+                    self.eq(cdef01.get('lastresult'), 'cancelled')
+                    self.gt(cdef00['laststarttime'], 0)
+                    self.eq(cdef00['laststarttime'], cdef01['laststarttime'])
+
+    async def test_agenda_warnings(self):
+
+        async with self.getTestCore() as core:
+            with self.getLoggerStream('synapse.lib.agenda') as stream:
+                q = '$lib.warn("oh hai")'
+                msgs = await core.stormlist('cron.at --now $q', opts={'vars': {'q': q}})
+                self.stormHasNoWarnErr(msgs)
+                await stream.expect('issued warning: oh hai', timeout=6)
+
+    async def test_agenda_graceful_promotion_with_running_cron(self):
+
+        async with self.getTestAha() as aha:
+
+            conf00 = {
+                'aha:provision': await aha.addAhaSvcProv('00.cortex')
+            }
+
+            async with self.getTestCore(conf=conf00) as core00:
+                self.false(core00.conf.get('mirror'))
+
+                q = '''
+                while((true)) {
+                    $lib.log.error('I AM A ERROR LOG MESSAGE')
+                    $lib.time.sleep(6)
+                }
+                '''
+                msgs = await core00.stormlist('cron.at --now $q', opts={'vars': {'q': q}})
+                self.stormHasNoWarnErr(msgs)
+
+                crons00 = await core00.callStorm('return($lib.cron.list())')
+                self.len(1, crons00)
+
+                prov01 = {'mirror': '00.cortex'}
+                conf01 = {
+                    'aha:provision': await aha.addAhaSvcProv('01.cortex', provinfo=prov01),
+                }
+
+                async with self.getTestCore(conf=conf01) as core01:
+
+                    with self.getLoggerStream('synapse.storm.log') as stream:
+                        await stream.expect('I AM A ERROR LOG MESSAGE', timeout=6)
+
+                    cron = await core00.callStorm('return($lib.cron.list())')
+                    self.len(1, cron)
+                    self.true(cron[0].get('isrunning'))
+
+                    await core01.promote(graceful=True)
+
+                    self.false(core00.isactive)
+                    self.true(core01.isactive)
+
+                    await core00.sync()
+
+                    cron00 = await core00.callStorm('return($lib.cron.list())')
+                    self.len(1, cron00)
+                    self.false(cron00[0].get('isrunning'))
+                    self.eq(cron00[0].get('lasterrs')[0], 'aborted')
+
+                    cron01 = await core01.callStorm('return($lib.cron.list())')
+                    self.len(1, cron01)
+                    self.false(cron01[0].get('isrunning'))
+                    self.eq(cron01[0].get('lasterrs')[0], 'aborted')
+
+    async def test_agenda_force_promotion_with_running_cron(self):
+
+        async with self.getTestAha() as aha:
+
+            conf00 = {
+                'aha:provision': await aha.addAhaSvcProv('00.cortex')
+            }
+
+            async with self.getTestCore(conf=conf00) as core00:
+                self.false(core00.conf.get('mirror'))
+
+                q = '''
+                while((true)) {
+                    $lib.log.error('I AM A ERROR LOG MESSAGE')
+                    $lib.time.sleep(6)
+                }
+                '''
+                msgs = await core00.stormlist('cron.at --now $q', opts={'vars': {'q': q}})
+                self.stormHasNoWarnErr(msgs)
+
+                crons00 = await core00.callStorm('return($lib.cron.list())')
+                self.len(1, crons00)
+
+                prov01 = {'mirror': '00.cortex'}
+                conf01 = {
+                    'aha:provision': await aha.addAhaSvcProv('01.cortex', provinfo=prov01),
+                }
+
+                async with self.getTestCore(conf=conf01) as core01:
+
+                    cron = await core00.callStorm('return($lib.cron.list())')
+                    self.len(1, cron)
+                    self.true(cron[0].get('isrunning'))
+
+                    await core01.promote(graceful=False)
+
+                    self.true(core00.isactive)
+                    self.true(core01.isactive)
+
+                    cron01 = await core01.callStorm('return($lib.cron.list())')
+                    self.len(1, cron01)
+                    self.false(cron01[0].get('isrunning'))
+                    self.eq(cron01[0].get('lasterrs')[0], 'aborted')
+
+    async def test_agenda_lasterrs(self):
+
+        async with self.getTestCore() as core:
+
+            cdef = {
+                'iden': 'test',
+                'creator': core.auth.rootuser.iden,
+                'storm': '[ test:str=foo ]',
+                'reqs': {},
+                'incunit': s_tu.MINUTE,
+                'incvals': 1
+            }
+
+            await core.agenda.add(cdef)
+            appt = await core.agenda.get('test')
+
+            self.true(isinstance(appt.lasterrs, list))
+            self.eq(appt.lasterrs, [])
+
+            edits = {
+                'lasterrs': ('error1', 'error2'),
+            }
+            await appt.edits(edits)
+
+            self.true(isinstance(appt.lasterrs, list))
+            self.eq(appt.lasterrs, ['error1', 'error2'])
+
+            await core.agenda._load_all()
+            appt = await core.agenda.get('test')
+            self.true(isinstance(appt.lasterrs, list))
+            self.eq(appt.lasterrs, ['error1', 'error2'])
+
+    async def test_cron_at_mirror_cleanup(self):
+
+        with self.getTestDir() as dirn:
+
+            dirn00 = s_common.genpath(dirn, 'core00')
+            dirn01 = s_common.genpath(dirn, 'core01')
+
+            async with self.getTestAha() as aha:
+
+                conf = {'aha:provision': await aha.addAhaSvcProv('00.cortex')}
+                core00 = await aha.enter_context(self.getTestCore(conf=conf, dirn=dirn00))
+
+                conf = {'aha:provision': await aha.addAhaSvcProv('01.cortex', {'mirror': 'cortex'})}
+                core01 = await aha.enter_context(self.getTestCore(conf=conf, dirn=dirn01))
+
+                msgs = await core00.stormlist('cron.at --minute +1 { $lib.log.info(cronran) }')
+                await core01.sync()
+
+                with self.getLoggerStream('synapse.storm.log') as stream:
+                    core00.agenda._addTickOff(60)
+                    await stream.expect('cronran', timeout=12)
+
+                await core01.sync()
+
+                # appt.recs should be cleared on both leader and mirror
+                appt = list(core00.agenda.appts.values())[0]
+                self.len(0, appt.recs)
+
+                appt = list(core01.agenda.appts.values())[0]
+                self.len(0, appt.recs)
+
+                # apptheap should also now be empty on both
+                self.len(0, core00.agenda.apptheap)
+                self.len(0, core01.agenda.apptheap)
+
+                await core00.fini()
+                core00 = await aha.enter_context(self.getTestCore(dirn=dirn00))
+
+                await core01.fini()
+                core01 = await aha.enter_context(self.getTestCore(dirn=dirn01))
+
+                # Job still exists on leader and mirror, wasn't removed due to being invalid
+                cron00 = await core00.listCronJobs()
+                cron01 = await core01.listCronJobs()
+                self.len(1, cron00)
+                self.eq(cron00, cron01)
+
+                await core00.delCronJob(cron00[0]['iden'])
+
+                # Add a job that is past due that will be deleted on startup
+                xmas = {'dayofmonth': 25, 'month': 12, 'year': 2099}
+                cdef = {'creator': core00.auth.rootuser.iden,
+                        'storm': '#happyholidays',
+                        'reqs': (xmas,)}
+                guid = s_common.guid()
+                cdef['iden'] = guid
+
+                await core00.addCronJob(cdef)
+                await core01.sync()
+
+                # Move the year back to the past
+                apptdef = core01.agenda.apptdefs.get(guid)
+                apptdef['recs'][0][0]['year'] = 1999
+
+                core00.agenda.apptdefs.set(guid, apptdef)
+                core01.agenda.apptdefs.set(guid, apptdef)
+
+                with self.getLoggerStream('synapse.lib.agenda') as stream:
+                    await core01.fini()
+                    core01 = await aha.enter_context(self.getTestCore(dirn=dirn01))
+                    await stream.expect('This appointment will be removed', timeout=12)
+
+                # Mirror warns about the invalid appointment but does not remove it
+                self.nn(core01.agenda.apptdefs.get(guid))
+                self.nn(await core01.getAuthGate(guid))
+
+                with self.getLoggerStream('synapse.lib.agenda') as stream:
+                    await core00.fini()
+                    core00 = await aha.enter_context(self.getTestCore(dirn=dirn00))
+                    await stream.expect('Removing invalid appointment', timeout=12)
+
+                await core01.sync()
+
+                # Leader removes the appointment via delCronJob which cleans up properly
+                self.none(core00.agenda.apptdefs.get(guid))
+                self.none(core01.agenda.apptdefs.get(guid))
+
+                self.none(await core00.getAuthGate(guid))
+                self.none(await core01.getAuthGate(guid))
+
+                # Add a job with iden mismatch for coverage
+                cdef = {'creator': core00.auth.rootuser.iden,
+                        'storm': '#happyholidays',
+                        'reqs': (xmas,)}
+                guid = s_common.guid()
+                cdef['iden'] = guid
+
+                await core00.addCronJob(cdef)
+                await core01.sync()
+
+                apptdef = core01.agenda.apptdefs.get(guid)
+                apptdef['iden'] = s_common.guid()
+
+                core00.agenda.apptdefs.set(guid, apptdef)
+                core01.agenda.apptdefs.set(guid, apptdef)
+
+                with self.getLoggerStream('synapse.lib.agenda') as stream:
+
+                    await core00.fini()
+                    core00 = await aha.enter_context(self.getTestCore(dirn=dirn00))
+
+                    await core01.fini()
+                    core01 = await aha.enter_context(self.getTestCore(dirn=dirn01))
+                    await stream.expect('Removing invalid appointment', timeout=12)
+
+                await core01.sync()
+
+                self.none(core00.agenda.apptdefs.get(guid))
+                self.none(core01.agenda.apptdefs.get(guid))
+
+                with self.getLoggerStream('synapse.storm.log') as stream:
+                    q = "cron.at --now ${ while((true)) { $lib.log.error('I AM A ERROR') $lib.time.sleep(6) }  }"
+                    await core00.nodes(q)
+                    await stream.expect('I AM A ERROR', timeout=12)
+                await core01.sync()
+
+                await core01.promote(graceful=True)
+                await core00.sync()
+
+                cron00 = await core00.listCronJobs()
+                cron01 = await core01.listCronJobs()
+
+                self.len(1, cron00)
+                self.false(cron00[0].get('isrunning'))
+                self.eq(cron00[0].get('lasterrs')[0], 'aborted')
+                self.eq(cron00, cron01)
+
+                self.len(0, core00.agenda.apptheap)
+                self.len(0, core01.agenda.apptheap)
+
+    async def test_agenda_period_mod_api(self):
+
+        async with self.getTestCore() as core:
+            agenda = core.agenda
+
+            cdef = {'creator': core.auth.rootuser.iden,
+                    'storm': '$lib.print(valid)',
+                    'reqs': {'hour': 9, 'minute': 0},
+                    'incunit': 'day',
+                    'incvals': 1}
+            adef = await core.addCronJob(cdef)
+            guid = adef.get('iden')
+
+            # modify query only
+            await core.updateCronJob(guid, '#modified')
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '#modified')
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'day')
+
+            # modify period only (fixed time)
+            await core.updateCronJob(guid, reqs={'minute': 30},
+                                  incunit='hour', incvals=2)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '#modified')
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'hour')
+            self.eq(incval, 2)
+            appt = agenda.appts[guid]
+            self.notin(s_tu.HOUR, appt.recs[0].reqdict)
+            self.eq(appt.recs[0].reqdict[s_tu.MINUTE], 30)
+
+            # modify period only (no fixed time)
+            await core.updateCronJob(guid, incunit='hour', incvals=1)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '#modified')
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'hour')
+            self.eq(incval, 1)
+
+            # modify both query and period
+            await core.updateCronJob(guid, '#both',
+                                  reqs={'hour': 12, 'minute': 0},
+                                  incunit='dayofweek',
+                                  incvals=(0, 6))
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '#both')
+            incvals = [rec[2] for rec in cron['recs']]
+            self.eq(cron['recs'][0][1], 'dayofweek')
+            self.eq(set(incvals), {0, 6})
+            appt = agenda.appts[guid]
+            self.eq(appt.recs[0].reqdict[s_tu.HOUR], 12)
+            self.eq(appt.recs[0].reqdict[s_tu.MINUTE], 0)
+
+            # modifying a disabled cron job does not re-enable it
+            await core.disableCronJob(guid)
+            await core.updateCronJob(guid, '#disabled', reqs={'hour': 13, 'minute': 0}, incunit='day', incvals=1)
+            self.false(appt.enabled)
+            self.eq(appt.query, '#disabled')
+            self.eq(appt.recs[0].reqdict[s_tu.HOUR], 13)
+
+            await core.enableCronJob(guid)
+            self.true(appt.enabled)
+
+            # modify without a cdef is a no-op
+            self.none(await core.updateCronJob(guid))
+            self.none(await agenda.mod(guid, None))
+
+            # sad
+
+            # modify period with 'now' and recurring
+            with self.raises(s_exc.BadConfValu):
+                await core.updateCronJob(guid, reqs={'now': True}, incunit='day', incvals=1)
+
+            with self.raises(s_exc.BadConfValu):
+                await core.updateCronJob(guid, reqs=[{'hour': 12, 'minute': 0}, {'now': True}], incunit='day', incvals=1)
+
+            # modify period for a non-recurring job
+            cdef = {
+                'creator': core.auth.rootuser.iden,
+                'iden': s_common.guid(),
+                'storm': '$lib.print(one-shot)',
+                'reqs': {'now': True}
+            }
+            adef = await core.addCronJob(cdef)
+            guid = adef.get('iden')
+            with self.raises(s_exc.BadConfValu):
+                await core.updateCronJob(guid, reqs={'hour': 10}, incunit='day', incvals=1)
+
+            # modify with an invalid iden
+            with self.raises(s_exc.NoSuchIden):
+                await agenda.mod('nonexistent', {'query': '#test'})
+
+            # modify a recurring period that's in the past
+            cdef = {'creator': core.auth.rootuser.iden,
+                    'iden': s_common.guid(),
+                    'storm': '$lib.print(valid)',
+                    'reqs': {s_tu.HOUR: 10, s_tu.MINUTE: 0},
+                    'incunit': s_agenda.TimeUnit.DAY,
+                    'incvals': 1}
+            adef = await agenda.add(cdef)
+            guid = adef.get('iden')
+            past_year = datetime.datetime.now(tz.utc).year - 1
+            with self.raises(s_exc.BadTime):
+                await agenda.mod(guid, cdef={'reqs': {s_tu.YEAR: past_year, s_tu.MONTH: 1, s_tu.DAYOFMONTH: 1, s_tu.HOUR: 0, s_tu.MINUTE: 0}, 'incunit': s_agenda.TimeUnit.YEAR, 'incvals': 1})
+
+            # modify with empty increment values
+            cdef = {'creator': core.auth.rootuser.iden,
+                    'iden': s_common.guid(),
+                    'storm': '$lib.print(valid)',
+                    'reqs': {s_tu.HOUR: 10, s_tu.MINUTE: 0},
+                    'incunit': s_agenda.TimeUnit.DAY,
+                    'incvals': 1}
+            adef = await agenda.add(cdef)
+            guid = adef.get('iden')
+            with self.raises(s_exc.BadTime):
+                await agenda.mod(guid, cdef={'reqs': {s_tu.HOUR: 11, s_tu.MINUTE: 0}, 'incunit': s_agenda.TimeUnit.DAY, 'incvals': []})
+
+    async def test_agenda_period_add_storm(self):
+
+        async with self.getTestCore() as core:
+
+            # test daily period
+            msgs = await core.stormlist('cron.add --period daily { $lib.print(daily) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(1, crons)
+            self.eq(crons[0]['query'], '$lib.print(daily)')
+            reqdict, incunit, incval = crons[0]['recs'][0]
+            self.eq(incunit, 'day')
+            self.eq(incval, 1)
+
+            # test hourly period with increment
+            msgs = await core.stormlist('cron.add --period hourly/2@:00 { $lib.print(every2hours) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(2, crons)
+            hourly_cron = [c for c in crons if c['query'] == '$lib.print(every2hours)'][0]
+            reqdict, incunit, incval = hourly_cron['recs'][0]
+            self.eq(incunit, 'hour')
+            self.eq(incval, 2)
+
+            # test weekly period with specific days
+            msgs = await core.stormlist('cron.add --period weekly/mon,wed,fri@10:00 { $lib.print(weekdays) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(3, crons)
+            weekly_cron = [c for c in crons if c['query'] == '$lib.print(weekdays)'][0]
+            incvals = [rec[2] for rec in weekly_cron['recs']]
+            self.eq(weekly_cron['recs'][0][1], 'dayofweek')
+            self.isin(0, incvals) # mon
+            self.isin(2, incvals) # wed
+            self.isin(4, incvals) # fri
+            self.eq(weekly_cron['recs'][0][0]['hour'], 10)
+            self.eq(weekly_cron['recs'][0][0]['minute'], 0)
+
+            # test monthly period with specific day
+            msgs = await core.stormlist('cron.add --period monthly/15@09:30 { $lib.print(monthly) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(4, crons)
+            monthly_cron = [c for c in crons if c['query'] == '$lib.print(monthly)'][0]
+            reqdict, incunit, incval = monthly_cron['recs'][0]
+            self.eq(incunit, 'month')
+            self.eq(incval, 1)
+            self.eq(reqdict['dayofmonth'], 15)
+            self.eq(reqdict['hour'], 9)
+            self.eq(reqdict['minute'], 30)
+
+            # test yearly period
+            msgs = await core.stormlist('cron.add --period yearly { $lib.print(yearly) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(5, crons)
+            yearly_cron = [c for c in crons if c['query'] == '$lib.print(yearly)'][0]
+            reqdict, incunit, incval = yearly_cron['recs'][0]
+            self.eq(reqdict['month'], 1)
+            self.eq(reqdict['dayofmonth'], 1)
+            self.eq(reqdict['hour'], 0)
+            self.eq(reqdict['minute'], 0)
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+
+            # test period with only minutes
+            msgs = await core.stormlist('cron.add --period daily@:30 { $lib.print(minutes_only) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(6, crons)
+            min_cron = [c for c in crons if c['query'] == '$lib.print(minutes_only)'][0]
+            reqdict, incunit, incval = min_cron['recs'][0]
+            self.eq(reqdict['minute'], 30)
+
+            # test period with only hour
+            msgs = await core.stormlist('cron.add --period daily@14 { $lib.print(hour_only) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(7, crons)
+            hour_cron = [c for c in crons if c['query'] == '$lib.print(hour_only)'][0]
+            reqdict, incunit, incval = hour_cron['recs'][0]
+            self.eq(reqdict['hour'], 14)
+
+            # test monthly period with multiple days
+            msgs = await core.stormlist('cron.add --period monthly/1,15,30@09:00 { $lib.print(multi_day) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            self.len(8, crons)
+            multi_cron = [c for c in crons if c['query'] == '$lib.print(multi_day)'][0]
+            self.len(3, multi_cron['recs'])
+            dayofmonths = [rec[0]['dayofmonth'] for rec in multi_cron['recs']]
+            self.eq(set(dayofmonths), {1, 15, 30})
+            for reqdict, incunit, incval in multi_cron['recs']:
+                self.eq(reqdict['hour'], 9)
+                self.eq(reqdict['minute'], 0)
+                self.eq(incunit, 'month')
+                self.eq(incval, 1)
+
+            # test hourly period with multiple minutes
+            msgs = await core.stormlist('cron.add --period hourly@:24,45 { $lib.print(multi_minute) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            multi_min_cron = [c for c in crons if c['query'] == '$lib.print(multi_minute)'][0]
+            self.len(2, multi_min_cron['recs'])
+            minutes = sorted(rec[0]['minute'] for rec in multi_min_cron['recs'])
+            self.eq(minutes, [24, 45])
+            for reqdict, incunit, incval in multi_min_cron['recs']:
+                self.eq(incunit, 'hour')
+                self.eq(incval, 1)
+
+            # test hourly@00:MM period is equivalent to hourly@:MM
+            msgs = await core.stormlist('cron.add --period hourly@00:25 { $lib.print(ok) }')
+            self.stormHasNoWarnErr(msgs)
+
+            # test yearly with only hour
+            msgs = await core.stormlist('cron.add --period yearly@14 { $lib.print(yearly_hourly) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            yearly_cron = [c for c in crons if c['query'] == '$lib.print(yearly_hourly)'][0]
+            self.len(1, yearly_cron['recs'])
+            reqdict, incunit, incval = yearly_cron['recs'][0]
+            self.eq(reqdict['month'], 1)
+            self.eq(reqdict['dayofmonth'], 1)
+            self.eq(reqdict['hour'], 14)
+            self.eq(reqdict['minute'], 0)
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+
+            # test yearly period with specific time
+            msgs = await core.stormlist('cron.add --period yearly@12:15 { $lib.print(yearly_specific_time) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            yearly_cron = [c for c in crons if c['query'] == '$lib.print(yearly_specific_time)'][0]
+            self.len(1, yearly_cron['recs'])
+            reqdict, incunit, incval = yearly_cron['recs'][0]
+            self.eq(reqdict['month'], 1)
+            self.eq(reqdict['dayofmonth'], 1)
+            self.eq(reqdict['hour'], 12)
+            self.eq(reqdict['minute'], 15)
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+
+            # test yearly period with specific month and day
+            msgs = await core.stormlist('cron.add --period yearly/03-12@14:18 { $lib.print(yearly_super_specific) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            yearly_cron = [c for c in crons if c['query'] == '$lib.print(yearly_super_specific)'][0]
+            self.len(1, yearly_cron['recs'])
+            reqdict, incunit, incval = yearly_cron['recs'][0]
+            self.eq(reqdict['month'], 3)
+            self.eq(reqdict['dayofmonth'], 12)
+            self.eq(reqdict['hour'], 14)
+            self.eq(reqdict['minute'], 18)
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+
+            msgs = await core.stormlist('cron.add --period yearly/03-15 { $lib.print(yearly_only_date) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            yearly_specific = [c for c in crons if c['query'] == '$lib.print(yearly_only_date)'][0]
+            reqdict, incunit, incval = yearly_specific['recs'][0]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 3)
+            self.eq(reqdict['dayofmonth'], 15)
+            self.eq(reqdict['hour'], 0)
+            self.eq(reqdict['minute'], 0)
+
+            # test yearly period with multiple specific month, day, and time
+            msgs = await core.stormlist('cron.add --period yearly/06-21@09:00,12-25,12-26@09 { $lib.print(yearly_multi) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            yearly_multi = [c for c in crons if c['query'] == '$lib.print(yearly_multi)'][0]
+            self.len(3, yearly_multi['recs'])
+            reqdict, incunit, incval = yearly_multi['recs'][0]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 6)
+            self.eq(reqdict['dayofmonth'], 21)
+            self.eq(reqdict['hour'], 9)
+            self.eq(reqdict['minute'], 0)
+
+            reqdict, incunit, incval = yearly_multi['recs'][1]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 12)
+            self.eq(reqdict['dayofmonth'], 25)
+            self.eq(reqdict['hour'], 0)
+            self.eq(reqdict['minute'], 0)
+
+            reqdict, incunit, incval = yearly_multi['recs'][2]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 12)
+            self.eq(reqdict['dayofmonth'], 26)
+            self.eq(reqdict['hour'], 9)
+            self.eq(reqdict['minute'], 0)
+
+            # test minutely period (every minute)
+            msgs = await core.stormlist('cron.add --period minutely { $lib.print(minutely) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            minutely_cron = [c for c in crons if c['query'] == '$lib.print(minutely)'][0]
+            reqdict, incunit, incval = minutely_cron['recs'][0]
+            self.eq(reqdict, {})
+            self.eq(incunit, 'minute')
+            self.eq(incval, 1)
+
+            # test minutely period with increment (every N minutes)
+            msgs = await core.stormlist('cron.add --period minutely/5 { $lib.print(every5min) }')
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            every5_cron = [c for c in crons if c['query'] == '$lib.print(every5min)'][0]
+            reqdict, incunit, incval = every5_cron['recs'][0]
+            self.eq(reqdict, {})
+            self.eq(incunit, 'minute')
+            self.eq(incval, 5)
+
+            # sad
+
+            sadpaths = [
+                ('cron.add --period invalid { $lib.print(err) }', 'Unknown period'),
+                ('cron.add --period weekly/invalidday { $lib.print(err) }', 'Invalid weekday'),
+                ('cron.add --period daily@25:99 { $lib.print(err) }', 'Failed to parse period'),
+                ('cron.add --period daily@newp { $lib.print(err) }', 'Invalid hour value: newp'),
+                ('cron.add --period "bad//format" { $lib.print(err) }', 'Failed to parse period'),
+                ('cron.add --period daily@newp:00 { $lib.print(err) }', 'Invalid hour value: newp'),
+                ('cron.add --period daily@10:newp { $lib.print(err) }', 'Invalid minute value: newp'),
+                ('cron.add --period hourly { $lib.print(err) }', 'Hourly period requires explicit minute'),
+                ('cron.add --period hourly/2 { $lib.print(err) }', 'Hourly period requires explicit minute'),
+                ('cron.add --period hourly@10:00 { $lib.print(err) }', 'Cannot specify hour for hourly period'),
+                ('cron.add --period hourly/newp@:00 { $lib.print(err) }', 'Invalid increment value for hourly period: newp'),
+                ('cron.add --period hourly@:24,newp { $lib.print(err) }', 'Invalid minute value'),
+                ('cron.add --period daily/newp { $lib.print(err) }', 'Invalid increment value for daily period: newp'),
+                ('cron.add --period daily --hour 10 { $lib.print(err) }', 'Cannot mix --period with legacy time arguments'),
+                ('cron.add --period monthly/1,newp@10:00 { $lib.print(err) }', 'Invalid day of month value in monthly period: 1,newp'),
+                ('cron.add --period yearly/badmonth-01 { $lib.print(err) }', 'Invalid month-day value for yearly period'),
+                ('cron.add --period yearly/01 { $lib.print(err) }', 'Invalid month-day value for yearly period'),
+                ('cron.add --period yearly@33 { $lib.print(err) }', 'Invalid hour value'),
+                ('cron.add --period yearly@26:02 { $lib.print(err) }', 'Invalid hour value'),
+                ('cron.add --period yearly/01-01@25 { $lib.print(err) }', 'Invalid hour value'),
+                ('cron.add --period yearly/01-01@25:02 { $lib.print(err) }', 'Invalid hour value'),
+                ('cron.add --period yearly/01-01@21:99 { $lib.print(err) }', 'Invalid minute value'),
+                ('cron.add --period yearly/01-01@21:21,05-04@19:900 { $lib.print(err) }', 'Invalid minute value'),
+                ('cron.add --period yearly/01-01@21:21,swiggityswooty,05-04 { $lib.print(err) }', 'Invalid month-day value for yearly period: swiggityswooty'),
+                ('cron.add --period yearly/13-01 { $lib.print(err) }', 'Failed to parse period'),
+                ('cron.add --period yearly/01-32 { $lib.print(err) }', 'Failed to parse period'),
+                ('cron.add --period yearly@blorp { $lib.print(err) }', 'Failed to parse period'),
+                ('cron.add --period minutely@:30 { $lib.print(err) }', 'Minutely period does not support a time of day'),
+                ('cron.add --period minutely@blorp { $lib.print(err) }', 'Minutely period does not support a time of day'),
+                ('cron.add --period minutely/newp { $lib.print(err) }', 'Invalid increment value for minutely period: newp'),
+                ('cron.add --period minutely/0 { $lib.print(err) }', 'Out of bounds incval'),
+            ]
+
+            for cmd, err in sadpaths:
+                msgs = await core.stormlist(cmd)
+                self.stormIsInErr(err, msgs)
+
+    async def test_agenda_period_mod_storm(self):
+
+        async with self.getTestCore() as core:
+
+            cdef = {'creator': core.auth.rootuser.iden,
+                    'storm': '$lib.print(valid)',
+                    'reqs': {'hour': 10, 'minute': 15},
+                    'incunit': 'day',
+                    'incvals': 1}
+            adef = await core.addCronJob(cdef)
+            guid = adef.get('iden')
+            opts = {'vars': {'guid': guid}}
+
+            # modify query only
+            msgs = await core.stormlist('cron.mod $guid { $lib.print(modified) }', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '$lib.print(modified)')
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'day')
+
+            # modify period only
+            msgs = await core.stormlist('cron.mod $guid --period hourly/2@:00', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '$lib.print(modified)')
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'hour')
+            self.eq(incval, 2)
+
+            # modify both query and period
+            msgs = await core.stormlist('cron.mod $guid { $lib.print(both) } --period weekly/mon,wed@14:00', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '$lib.print(both)')
+            incvals = [rec[2] for rec in cron['recs']]
+            self.eq(cron['recs'][0][1], 'dayofweek')
+            self.isin(0, incvals) # mon
+            self.isin(2, incvals) # wed
+            appt = core.agenda.appts[guid]
+            self.eq(appt.recs[0].reqdict[s_tu.HOUR], 14)
+            self.eq(appt.recs[0].reqdict[s_tu.MINUTE], 0)
+
+            # modify period for weekly (uses default day of the week)
+            msgs = await core.stormlist('cron.mod $guid --period weekly', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '$lib.print(both)')
+            incvals = [rec[2] for rec in cron['recs']]
+            self.eq(cron['recs'][0][1], 'dayofweek')
+            self.eq(set(incvals), {0})
+
+            # modify period for monthly at 10:00 (uses default day of month)
+            msgs = await core.stormlist('cron.mod $guid --period monthly@10:00', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['query'], '$lib.print(both)')
+            incvals = [rec[2] for rec in cron['recs']]
+            self.eq(cron['recs'][0][1], 'month')
+            self.eq(set(incvals), {1})
+
+            # modify period to yearly with specific month and day
+            msgs = await core.stormlist('cron.mod $guid --period yearly/03-15', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 3)
+            self.eq(reqdict['dayofmonth'], 15)
+            self.eq(reqdict['hour'], 0)
+            self.eq(reqdict['minute'], 0)
+
+            # modify period to yearly with specific month, day, and time
+            msgs = await core.stormlist('cron.mod $guid --period yearly/11-30@08:00', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 11)
+            self.eq(reqdict['dayofmonth'], 30)
+            self.eq(reqdict['hour'], 8)
+            self.eq(reqdict['minute'], 0)
+
+            msgs = await core.stormlist('cron.mod $guid --period yearly@13', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.len(1, cron['recs'])
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(reqdict['month'], 1)
+            self.eq(reqdict['dayofmonth'], 1)
+            self.eq(reqdict['hour'], 13)
+            self.eq(reqdict['minute'], 0)
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+
+            # modify period to yearly with multiple month, day, and time
+            msgs = await core.stormlist('cron.mod $guid --period yearly/11-30@08:00,07-12@8,12-10', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.len(3, cron['recs'])
+            reqdict, incunit, incval = cron['recs'][0]
+            self.len(3, cron['recs'])
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 11)
+            self.eq(reqdict['dayofmonth'], 30)
+            self.eq(reqdict['hour'], 8)
+            self.eq(reqdict['minute'], 0)
+
+            reqdict, incunit, incval = cron['recs'][1]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 7)
+            self.eq(reqdict['dayofmonth'], 12)
+            self.eq(reqdict['hour'], 8)
+            self.eq(reqdict['minute'], 0)
+
+            reqdict, incunit, incval = cron['recs'][2]
+            self.eq(incunit, 'year')
+            self.eq(incval, 1)
+            self.eq(reqdict['month'], 12)
+            self.eq(reqdict['dayofmonth'], 10)
+            self.eq(reqdict['hour'], 0)
+            self.eq(reqdict['minute'], 0)
+
+            # modify period to minutely with an increment
+            msgs = await core.stormlist('cron.mod $guid --period minutely/10', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.len(1, cron['recs'])
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(reqdict, {})
+            self.eq(incunit, 'minute')
+            self.eq(incval, 10)
+
+            # a minutely job can be converted to a supported period and back
+            msgs = await core.stormlist('cron.mod $guid --period hourly@:00', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            self.eq(cron['recs'][0][1], 'hour')
+
+            msgs = await core.stormlist('cron.mod $guid --period minutely', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+            crons = await core.listCronJobs()
+            cron = [c for c in crons if c['iden'] == guid][0]
+            reqdict, incunit, incval = cron['recs'][0]
+            self.eq(reqdict, {})
+            self.eq(incunit, 'minute')
+            self.eq(incval, 1)
+
+            # sad
+
+            # modify non-existent cron job
+            msgs = await core.stormlist('cron.mod nonexistent { $lib.print(modified) }')
+            self.stormIsInErr('does not match any valid', msgs)
+
+            # modify with no arguments
+            msgs = await core.stormlist('cron.mod $guid', opts=opts)
+            self.stormIsInErr('One of the argument <query> or --period option is required.', msgs)
+
+            # modify with invalid period
+            cdef = {'creator': core.auth.rootuser.iden,
+                    'storm': '$lib.print(test)',
+                    'reqs': {'hour': 10},
+                    'incunit': 'day',
+                    'incvals': 1}
+            adef = await core.addCronJob(cdef)
+            guid = adef.get('iden')
+            opts = {'vars': {'guid': guid}}
+            msgs = await core.stormlist('cron.mod $guid --period invalid', opts=opts)
+            self.stormIsInErr('Unknown period', msgs)
+
+            # modify with invalid weekday
+            msgs = await core.stormlist('cron.mod $guid --period weekly/badday', opts=opts)
+            self.stormIsInErr('Invalid weekday', msgs)
+
+    async def test_cron_affinity(self):
+
+        async with self.getTestCore() as core:
+
+            # Test creating a cron job with affinity
+            cdef = {
+                'creator': core.auth.rootuser.iden,
+                'storm': '$lib.print(test)',
+                'reqs': {'hour': 10},
+                'incunit': 'day',
+                'incvals': 1,
+                'affinity': 'mysvc.cortex...',
+            }
+            adef = await core.addCronJob(cdef)
+            guid = adef.get('iden')
+            self.eq(adef.get('affinity'), 'mysvc.cortex...')
+
+            # Verify affinity in pack
+            opts = {'vars': {'guid': guid}}
+            cdef = await core.callStorm('return($lib.cron.get($guid).pack())', opts=opts)
+            self.eq(cdef.get('affinity'), 'mysvc.cortex...')
+
+            # Verify pprint includes affinity
+            job = await core.callStorm('return($lib.cron.get($guid).pprint())', opts=opts)
+            self.eq(job.get('affinity'), 'mysvc.cortex...')
+
+            # Verify cron.stat includes affinity
+            msgs = await core.stormlist(f'cron.stat {guid}')
+            self.stormIsInPrint('affinity:', msgs)
+            self.stormIsInPrint('mysvc.cortex...', msgs)
+
+            # Modify affinity via set
+            q = '$cron=$lib.cron.get($guid) $cron.set(affinity, "othersvc.cortex...") return($cron.pack())'
+            cdef = await core.callStorm(q, opts=opts)
+            self.eq(cdef.get('affinity'), 'othersvc.cortex...')
+
+            # Clear affinity
+            q = '$cron=$lib.cron.get($guid) $cron.set(affinity, $lib.null) return($cron.pack())'
+            cdef = await core.callStorm(q, opts=opts)
+            self.none(cdef.get('affinity'))
+
+            # Verify pprint shows (null) when affinity is not set
+            job = await core.callStorm('return($lib.cron.get($guid).pprint())', opts=opts)
+            self.eq(job.get('affinity'), '(null)')
+
+            # Test cron.at with affinity
+            q = 'return($lib.cron.at(query=$q, now=(true), affinity="atsvc.cortex...").pack())'
+            cdef = await core.callStorm(q, opts={'vars': {'q': '$lib.print(at)'}})
+            self.eq(cdef.get('affinity'), 'atsvc.cortex...')
+
+    async def test_cron_affinity_mutual_exclusivity(self):
+
+        async with self.getTestCore() as core:
+
+            # Creating with both pool and affinity should fail
+            cdef = {
+                'creator': core.auth.rootuser.iden,
+                'storm': '$lib.print(test)',
+                'reqs': {'hour': 10},
+                'incunit': 'day',
+                'incvals': 1,
+                'pool': True,
+                'affinity': 'mysvc.cortex...',
+            }
+            with self.raises(s_exc.BadConfValu):
+                await core.addCronJob(cdef)
+
+            # Create with pool, then try to set affinity
+            cdef = {
+                'creator': core.auth.rootuser.iden,
+                'storm': '$lib.print(test)',
+                'reqs': {'hour': 10},
+                'incunit': 'day',
+                'incvals': 1,
+                'pool': True,
+            }
+            adef = await core.addCronJob(cdef)
+            guid = adef.get('iden')
+            opts = {'vars': {'guid': guid}}
+
+            with self.raises(s_exc.BadConfValu):
+                q = '$cron=$lib.cron.get($guid) $cron.set(affinity, "mysvc.cortex...")'
+                await core.callStorm(q, opts=opts)
+
+            # Create with affinity, then try to set pool
+            cdef = {
+                'creator': core.auth.rootuser.iden,
+                'storm': '$lib.print(test)',
+                'reqs': {'hour': 10},
+                'incunit': 'day',
+                'incvals': 1,
+                'affinity': 'mysvc.cortex...',
+            }
+            adef = await core.addCronJob(cdef)
+            guid2 = adef.get('iden')
+            opts2 = {'vars': {'guid': guid2}}
+
+            with self.raises(s_exc.BadConfValu):
+                q = '$cron=$lib.cron.get($guid) $cron.set(pool, $lib.true)'
+                await core.callStorm(q, opts=opts2)
+
+            # Test via storm command
+            msgs = await core.stormlist('cron.add --pool --affinity mysvc... --period daily { $lib.print(test) }')
+            self.stormIsInErr('Cron jobs may not have both affinity and pool set', msgs)
+
+    async def test_cron_affinity_fallback(self):
+
+        async with self.getTestCore() as core:
+
+            # Create a cron with affinity pointing to a non-existent service
+            # It should fall back to local execution
+            with self.getLoggerStream('synapse.lib.agenda',) as stream:
+                cdef = {
+                    'creator': core.auth.rootuser.iden,
+                    'storm': '$lib.queue.gen(afftest).put(ran)',
+                    'reqs': {'now': True},
+                    'affinity': 'nonexistent.cortex...',
+                }
+                await core.addCronJob(cdef)
+
+                await stream.expect('unavailable for cron', timeout=12)
+
+            # Verify the query ran locally (fallback)
+            q = 'return($lib.queue.gen(afftest).get((0), wait=(true)))'
+            valu = await asyncio.wait_for(core.callStorm(q), timeout=12)
+            self.nn(valu)
+
+    async def test_cron_affinity_execution(self):
+
+        async with self.getTestAha() as aha:
+
+            conf00 = {
+                'aha:provision': await aha.addAhaSvcProv('00.cortex')
+            }
+
+            async with self.getTestCore(conf=conf00) as core00:
+
+                prov01 = {'mirror': '00.cortex'}
+                conf01 = {
+                    'aha:provision': await aha.addAhaSvcProv('01.cortex', provinfo=prov01),
+                }
+
+                async with self.getTestCore(conf=conf01) as core01:
+
+                    self.len(1, await core00.nodes('[inet:asn=0]'))
+                    await core01.sync()
+                    self.len(1, await core01.nodes('inet:asn=0'))
+
+                    # Create a cron with affinity pointing to 01.cortex
+                    evt = asyncio.Event()
+
+                    async def task():
+                        async for mesg in core00.behold():
+                            if mesg.get('event') == 'cron:stop':
+                                evt.set()
+
+                    core00.schedCoro(task())
+
+                    guid = s_common.guid()
+                    cdef = {
+                        'creator': core00.auth.rootuser.iden,
+                        'iden': guid,
+                        'storm': '[inet:asn=42]',
+                        'reqs': {'now': True},
+                        'affinity': '01.cortex...',
+                    }
+                    await core00.addCronJob(cdef)
+
+                    self.true(await asyncio.wait_for(evt.wait(), timeout=12))
+
+                    opts = {'vars': {'iden': guid}, 'mirror': False}
+                    get_cron = 'return($lib.cron.get($iden).pack())'
+                    cdef00 = await core00.callStorm(get_cron, opts=opts)
+                    self.eq(cdef00.get('affinity'), '01.cortex...')
+                    self.true(cdef00.get('lastresult', '').startswith('finished successfully'))

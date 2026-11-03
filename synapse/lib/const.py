@@ -39,3 +39,24 @@ day = hour * 24
 week = day * 7
 month = day * 30
 year = day * 365
+
+# function specific constants shared across multiple files
+layer_pdef_csize = 1_000
+layer_pdef_qsize = 10_000
+layer_pdef_csize_max = 1_000
+layer_pdef_qsize_max = 10_000
+assert layer_pdef_csize <= layer_pdef_csize_max
+assert layer_pdef_qsize <= layer_pdef_qsize_max
+
+# HTTP header constants
+MAX_LINE_SIZE = kibibyte * 64
+MAX_FIELD_SIZE = kibibyte * 64
+
+# Axon constants
+AXON_READY_TIMEOUT = 300  # seconds
+
+# Socket constants
+UNIX_SOCKET_PATH_MAX = 103
+
+# The maximum nesting depth of view hooks.
+VIEW_HOOK_MAX_DEPTH = 256

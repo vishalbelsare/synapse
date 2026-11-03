@@ -3,6 +3,126 @@ import synapse.exc as s_exc
 import synapse.lib.types as s_types
 import synapse.lib.module as s_module
 
+dnsreplycodes = (
+    (0, 'NOERROR'),
+    (1, 'FORMERR'),
+    (2, 'SERVFAIL'),
+    (3, 'NXDOMAIN'),
+    (4, 'NOTIMP'),
+    (5, 'REFUSED'),
+    (6, 'YXDOMAIN'),
+    (7, 'YXRRSET'),
+    (8, 'NXRRSET'),
+    (9, 'NOTAUTH'),
+    (10, 'NOTZONE'),
+    (11, 'DSOTYPENI'),
+    (16, 'BADSIG'),
+    (17, 'BADKEY'),
+    (18, 'BADTIME'),
+    (19, 'BADMODE'),
+    (20, 'BADNAME'),
+    (21, 'BADALG'),
+    (22, 'BADTRUNC'),
+    (23, 'BADCOOKIE'),
+)
+
+# IANA DNS Resource Record (RR) TYPEs and QTYPEs.
+dnsquerytypes = (
+    (1, 'A'),
+    (2, 'NS'),
+    (3, 'MD'),
+    (4, 'MF'),
+    (5, 'CNAME'),
+    (6, 'SOA'),
+    (7, 'MB'),
+    (8, 'MG'),
+    (9, 'MR'),
+    (10, 'NULL'),
+    (11, 'WKS'),
+    (12, 'PTR'),
+    (13, 'HINFO'),
+    (14, 'MINFO'),
+    (15, 'MX'),
+    (16, 'TXT'),
+    (17, 'RP'),
+    (18, 'AFSDB'),
+    (19, 'X25'),
+    (20, 'ISDN'),
+    (21, 'RT'),
+    (22, 'NSAP'),
+    (23, 'NSAP-PTR'),
+    (24, 'SIG'),
+    (25, 'KEY'),
+    (26, 'PX'),
+    (27, 'GPOS'),
+    (28, 'AAAA'),
+    (29, 'LOC'),
+    (30, 'NXT'),
+    (31, 'EID'),
+    (32, 'NIMLOC'),
+    (33, 'SRV'),
+    (34, 'ATMA'),
+    (35, 'NAPTR'),
+    (36, 'KX'),
+    (37, 'CERT'),
+    (38, 'A6'),
+    (39, 'DNAME'),
+    (40, 'SINK'),
+    (41, 'OPT'),
+    (42, 'APL'),
+    (43, 'DS'),
+    (44, 'SSHFP'),
+    (45, 'IPSECKEY'),
+    (46, 'RRSIG'),
+    (47, 'NSEC'),
+    (48, 'DNSKEY'),
+    (49, 'DHCID'),
+    (50, 'NSEC3'),
+    (51, 'NSEC3PARAM'),
+    (52, 'TLSA'),
+    (53, 'SMIMEA'),
+    (55, 'HIP'),
+    (56, 'NINFO'),
+    (57, 'RKEY'),
+    (58, 'TALINK'),
+    (59, 'CDS'),
+    (60, 'CDNSKEY'),
+    (61, 'OPENPGPKEY'),
+    (62, 'CSYNC'),
+    (63, 'ZONEMD'),
+    (64, 'SVCB'),
+    (65, 'HTTPS'),
+    (99, 'SPF'),
+    (100, 'UINFO'),
+    (101, 'UID'),
+    (102, 'GID'),
+    (103, 'UNSPEC'),
+    (104, 'NID'),
+    (105, 'L32'),
+    (106, 'L64'),
+    (107, 'LP'),
+    (108, 'EUI48'),
+    (109, 'EUI64'),
+    (249, 'TKEY'),
+    (250, 'TSIG'),
+    (251, 'IXFR'),
+    (252, 'AXFR'),
+    (253, 'MAILB'),
+    (254, 'MAILA'),
+    (255, 'ANY'),
+    (256, 'URI'),
+    (257, 'CAA'),
+    (258, 'AVC'),
+    (259, 'DOA'),
+    (260, 'AMTRELAY'),
+    (261, 'RESINFO'),
+    (262, 'WALLET'),
+    (263, 'CLA'),
+    (264, 'IPN'),
+    (32768, 'TA'),
+    (32769, 'DLV'),
+)
+
 class DnsName(s_types.Str):
 
     def postTypeInit(self):
@@ -124,13 +244,13 @@ class DnsModule(s_module.CoreModule):
 
                 ('inet:dns:txt', ('comp', {'fields': (('fqdn', 'inet:fqdn'), ('txt', 'str'))}), {
                     'ex': '(hehe.vertex.link,"fancy TXT record")',
-                    'doc': 'The result of a DNS MX record lookup.'}),
+                    'doc': 'The result of a DNS TXT record lookup.'}),
 
                 ('inet:dns:type', ('int', {}), {
                     'doc': 'A DNS query/answer type integer.'}),
 
                 ('inet:dns:query',
-                    ('comp', {'fields': (('client', 'inet:client'), ('name', 'inet:dns:name'), ('type', 'int'))}), {
+                    ('comp', {'fields': (('client', 'inet:client'), ('name', 'inet:dns:name'), ('type', ('int', {'enums': dnsquerytypes, 'enums:strict': False})))}), {
                         'ex': '(1.2.3.4, woot.com, 1)',
                         'doc': 'A DNS query unique to a given client.'}),
 
@@ -145,6 +265,10 @@ class DnsModule(s_module.CoreModule):
 
                 ('inet:dns:wild:aaaa', ('comp', {'fields': (('fqdn', 'inet:fqdn'), ('ipv6', 'inet:ipv6'))}), {
                     'doc': 'A DNS AAAA wild card record and the IPv6 it resolves to.'}),
+
+                ('inet:dns:dynreg', ('guid', {}), {
+                    'doc': 'A dynamic DNS registration.'}),
+
             ),
 
             'forms': (
@@ -192,11 +316,11 @@ class DnsModule(s_module.CoreModule):
                 )),
 
                 ('inet:dns:soa', {}, (
-                    ('fqdn', ('inet:fqdn', {}), {'ro': True,
+                    ('fqdn', ('inet:fqdn', {}), {
                          'doc': 'The domain queried for its SOA record.'}),
-                    ('ns', ('inet:fqdn', {}), {'ro': True,
+                    ('ns', ('inet:fqdn', {}), {
                          'doc': 'The domain (MNAME) returned in the SOA record.'}),
-                    ('email', ('inet:email', {}), {'ro': True,
+                    ('email', ('inet:email', {}), {
                          'doc': 'The email address (RNAME) returned in the SOA record.'}),
                 )),
 
@@ -213,7 +337,7 @@ class DnsModule(s_module.CoreModule):
                     ('name:ipv4', ('inet:ipv4', {}), {}),
                     ('name:ipv6', ('inet:ipv6', {}), {}),
                     ('name:fqdn', ('inet:fqdn', {}), {}),
-                    ('type', ('int', {}), {'ro': True, }),
+                    ('type', ('int', {'enums': dnsquerytypes, 'enums:strict': False}), {'ro': True, }),
                 )),
 
                 ('inet:dns:request', {}, (
@@ -225,11 +349,11 @@ class DnsModule(s_module.CoreModule):
                     ('query:name:ipv4', ('inet:ipv4', {}), {}),
                     ('query:name:ipv6', ('inet:ipv6', {}), {}),
                     ('query:name:fqdn', ('inet:fqdn', {}), {}),
-                    ('query:type', ('int', {}), {}),
+                    ('query:type', ('int', {'enums': dnsquerytypes, 'enums:strict': False}), {}),
 
                     ('server', ('inet:server', {}), {}),
 
-                    ('reply:code', ('int', {}), {
+                    ('reply:code', ('int', {'enums': dnsreplycodes, 'enums:strict': False}), {
                         'doc': 'The DNS server response code.'}),
 
                     ('exe', ('file:bytes', {}), {
@@ -251,33 +375,38 @@ class DnsModule(s_module.CoreModule):
                     ('ttl', ('int', {}), {}),
                     ('request', ('inet:dns:request', {}), {}),
 
-                    ('a', ('inet:dns:a', {}), {'ro': True,
-                        'doc': 'The DNS A record returned by the lookup.',
-                    }),
-                    ('ns', ('inet:dns:ns', {}), {'ro': True,
-                        'doc': 'The DNS NS record returned by the lookup.',
-                    }),
-                    ('rev', ('inet:dns:rev', {}), {'ro': True,
-                        'doc': 'The DNS PTR record returned by the lookup.',
-                    }),
-                    ('aaaa', ('inet:dns:aaaa', {}), {'ro': True,
-                        'doc': 'The DNS AAAA record returned by the lookup.',
-                    }),
-                    ('rev6', ('inet:dns:rev6', {}), {'ro': True,
-                        'doc': 'The DNS PTR record returned by the lookup of an IPv6 address.',
-                    }),
-                    ('cname', ('inet:dns:cname', {}), {'ro': True,
-                        'doc': 'The DNS CNAME record returned by the lookup.',
-                    }),
-                    ('mx', ('inet:dns:mx', {}), {'ro': True,
-                        'doc': 'The DNS MX record returned by the lookup.',
-                    }),
-                    ('soa', ('inet:dns:soa', {}), {'ro': True,
-                        'doc': 'The domain queried for its SOA record.',
-                    }),
-                    ('txt', ('inet:dns:txt', {}), {'ro': True,
-                        'doc': 'The DNS TXT record returned by the lookup.',
-                    }),
+                    ('a', ('inet:dns:a', {}), {
+                        'doc': 'The DNS A record returned by the lookup.'}),
+
+                    ('ns', ('inet:dns:ns', {}), {
+                        'doc': 'The DNS NS record returned by the lookup.'}),
+
+                    ('rev', ('inet:dns:rev', {}), {
+                        'doc': 'The DNS PTR record returned by the lookup.'}),
+
+                    ('aaaa', ('inet:dns:aaaa', {}), {
+                        'doc': 'The DNS AAAA record returned by the lookup.'}),
+
+                    ('rev6', ('inet:dns:rev6', {}), {
+                        'doc': 'The DNS PTR record returned by the lookup of an IPv6 address.'}),
+
+                    ('cname', ('inet:dns:cname', {}), {
+                        'doc': 'The DNS CNAME record returned by the lookup.'}),
+
+                    ('mx', ('inet:dns:mx', {}), {
+                        'doc': 'The DNS MX record returned by the lookup.'}),
+
+                    ('mx:priority', ('int', {}), {
+                        'doc': 'The DNS MX record priority.'}),
+
+                    ('soa', ('inet:dns:soa', {}), {
+                        'doc': 'The domain queried for its SOA record.'}),
+
+                    ('txt', ('inet:dns:txt', {}), {
+                        'doc': 'The DNS TXT record returned by the lookup.'}),
+
+                    ('time', ('time', {}), {
+                        'doc': 'The time that the DNS response was transmitted.'}),
                 )),
 
                 ('inet:dns:wild:a', {}, (
@@ -292,6 +421,36 @@ class DnsModule(s_module.CoreModule):
                         'doc': 'The domain containing a wild card record.'}),
                     ('ipv6', ('inet:ipv6', {}), {'ro': True,
                         'doc': 'The IPv6 address returned by wild card resolutions.'}),
+                )),
+
+                ('inet:dns:dynreg', {}, (
+
+                    ('fqdn', ('inet:fqdn', {}), {
+                        'doc': 'The FQDN registered within a dynamic DNS provider.'}),
+
+                    ('provider', ('ou:org', {}), {
+                        'doc': 'The organization which provides the dynamic DNS FQDN.'}),
+
+                    ('provider:name', ('ou:name', {}), {
+                        'doc': 'The name of the organization which provides the dynamic DNS FQDN.'}),
+
+                    ('provider:fqdn', ('inet:fqdn', {}), {
+                        'doc': 'The FQDN of the organization which provides the dynamic DNS FQDN.'}),
+
+                    ('contact', ('ps:contact', {}), {
+                        'doc': 'The contact information of the registrant.'}),
+
+                    ('created', ('time', {}), {
+                        'doc': 'The time that the dynamic DNS registration was first created.'}),
+
+                    ('client', ('inet:client', {}), {
+                        'doc': 'The network client address used to register the dynamic FQDN.'}),
+
+                    ('client:ipv4', ('inet:ipv4', {}), {
+                        'doc': 'The client IPv4 address used to register the dynamic FQDN.'}),
+
+                    ('client:ipv6', ('inet:ipv6', {}), {
+                        'doc': 'The client IPv6 address used to register the dynamic FQDN.'}),
                 )),
             )
 

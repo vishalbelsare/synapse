@@ -23,12 +23,15 @@ class CmdBossTest(s_t_utils.SynTest):
             self.true(outp.expect('0 tasks found.'))
 
             async def runLongStorm():
-                async for _ in core.storm(f'[ test:str=foo test:str={"x"*100} ] | sleep 10 | [ test:str=endofquery ]'):
+                async for _ in core.storm(f'[ test:str=foo test:str={"x" * 100} ] | sleep 10 | [ test:str=endofquery ]'):
                     evnt.set()
 
             task = realcore.schedCoro(runLongStorm())
 
             self.true(await asyncio.wait_for(evnt.wait(), timeout=6))
+
+            stasks = [t for t in realcore.boss.tasks.values() if t.name == 'storm']
+            self.true(len(stasks) == 1 and stasks[0].info.get('view') == realcore.view.iden)
 
             # Verify that the long query got truncated
             outp.clear()
@@ -99,7 +102,9 @@ class CmdBossTest(s_t_utils.SynTest):
                 self.true(toutp.expect('0 tasks found.'))
 
                 # Try killing from the unprivileged user
-                await self.asyncraises(s_exc.AuthDeny, tcore.kill(iden))
+                with self.raises(s_exc.AuthDeny):
+                    await tcore.kill(iden)
+
                 toutp.clear()
                 await tcmdr.runCmdLine('kill %s' % (iden,))
                 self.true(toutp.expect('no matching process found.'))

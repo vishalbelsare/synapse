@@ -27,8 +27,8 @@ HEXSTR_PRIVATE_PRIME_Q = 'c53b9c8dfb3dda04d16c7f779a02b3b8c7b44bf876dc88ad562778
                          '1bef7207fa489e398041787cfbd155f1034a207d517f06bc76a044262484f82f0c6a887f776b1dce837408999d8' \
                          '8dd33a96c7f80e23719e77a11075d337bf9cc47d7dbf98e341b81c23f165dd15ccfd2973ab'
 
-TEST_MD5 = hashlib.md5(b'test').hexdigest()
-TEST_SHA1 = hashlib.sha1(b'test').hexdigest()
+TEST_MD5 = hashlib.md5(b'test', usedforsecurity=False).hexdigest()
+TEST_SHA1 = hashlib.sha1(b'test', usedforsecurity=False).hexdigest()
 TEST_SHA256 = hashlib.sha256(b'test').hexdigest()
 TEST_SHA384 = hashlib.sha384(b'test').hexdigest()
 TEST_SHA512 = hashlib.sha512(b'test').hexdigest()
@@ -44,14 +44,49 @@ class CryptoModelTest(s_t_utils.SynTest):
 
             nodes = await core.nodes('''
                 crypto:currency:address=btc/1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2
+                [ :chain={[ crypto:currency:chain=* :id=ABC-123 :name="Vertex Coin" :symbol=VTX ]} ]
                 [ :seed={
-                    [ crypto:key=* :algorithm=aes256 :private=00000000 :public=ffffffff :seed:passwd=s3cret :seed:algorithm=pbkdf2 ]
+                    [ crypto:key=*
+                        :algorithm=aes256
+                        :mode=CBC
+                        :iv=41414141
+                        :iv:text=AAAA
+                        :private=00000000
+                        :private:text=hehe
+                        :private:md5=$md5
+                        :private:sha1=$sha1
+                        :private:sha256=$sha256
+                        :public=ffffffff
+                        :public:md5=$md5
+                        :public:sha1=$sha1
+                        :public:sha256=$sha256
+                        :public:text=haha
+                        :seed:passwd=s3cret
+                        :seed:algorithm=pbkdf2
+                        +(decrypts)> {[ file:bytes=* ]}
+                    ]
                 }]
-            ''')
+            ''', opts={'vars': {'md5': TEST_MD5, 'sha1': TEST_SHA1, 'sha256': TEST_SHA256}})
 
+            self.len(1, await core.nodes('crypto:currency:address -> crypto:currency:chain +:id=ABC-123 +:name="vertex coin" +:symbol=VTX'))
             self.len(1, await core.nodes('crypto:algorithm=aes256'))
-            self.len(1, await core.nodes('crypto:key:algorithm=aes256 +:private=00000000 +:public=ffffffff +:seed:algorithm=pbkdf2 +:seed:passwd=s3cret'))
+            self.len(1, await core.nodes('''
+                    crypto:key:algorithm=aes256
+                        +:private=00000000
+                        +:public=ffffffff
+                        +:seed:algorithm=pbkdf2
+                        +:seed:passwd=s3cret
+                        +:mode=cbc
+                        +:iv=41414141
+            '''))
+            self.len(1, await core.nodes('it:dev:str=AAAA -> crypto:key'))
+            self.len(1, await core.nodes('it:dev:str=hehe -> crypto:key'))
+            self.len(1, await core.nodes('it:dev:str=haha -> crypto:key'))
             self.len(1, await core.nodes('inet:passwd=s3cret -> crypto:key -> crypto:currency:address'))
+
+            self.len(2, await core.nodes('crypto:key -> hash:md5'))
+            self.len(2, await core.nodes('crypto:key -> hash:sha1'))
+            self.len(2, await core.nodes('crypto:key -> hash:sha256'))
 
             nodes = await core.nodes('inet:client=1.2.3.4 -> crypto:currency:client -> crypto:currency:address')
             self.eq(nodes[0].get('coin'), 'btc')
@@ -76,23 +111,33 @@ class CryptoModelTest(s_t_utils.SynTest):
                 'output': hashlib.sha256(b'qwer').hexdigest(),
             }}
 
-            payors = await core.nodes('[ crypto:payment:input=* :transaction=(t1,) :address=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2) :value=30 ]')
+            payors = await core.nodes('[ crypto:payment:input=* :index=0 :transaction=(t1,) :address=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2) :value=30 ]')
             self.eq(payors[0].get('value'), '30')
+            self.eq(payors[0].get('index'), 0)
             self.eq(payors[0].get('address'), ('btc', '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2'))
 
-            payees = await core.nodes('[ crypto:payment:output=* :transaction=(t1,) :address=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2) :value=30 ]')
+            payees = await core.nodes('[ crypto:payment:output=* :index=0 :transaction=(t1,) :address=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2) :value=30 ]')
             self.eq(payees[0].get('value'), '30')
+            self.eq(payees[0].get('index'), 0)
             self.eq(payees[0].get('address'), ('btc', '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2'))
+
+            payfees = await core.nodes('[ crypto:payment:fee=(t1, feepayer) :transaction=(t1,) :address=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2) :value=0.0001 ]')
+            self.len(1, payfees)
+            self.eq(payfees[0].get('value'), '0.0001')
+            self.eq(payfees[0].get('address'), ('btc', '1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2'))
+            self.len(1, await core.nodes('crypto:payment:fee -> crypto:currency:transaction'))
+            self.len(1, await core.nodes('crypto:payment:fee -> crypto:currency:address'))
 
             payor = payors[0].ndef[1]
             payee = payees[0].ndef[1]
 
-            nodes = await core.nodes(f'''
+            nodes = await core.nodes('''
                 [
                     crypto:currency:transaction=(t1,)
                         :hash=0x01020304
                         :desc="Woot Woot"
                         :block=(BTC, 998877)
+                        :block:chain={[ crypto:currency:chain=* :name=bitcoin ]}
                         :success=1
                         :status:code=10
                         :status:message=success
@@ -115,6 +160,7 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.eq(node.get('block'), ('btc', 998877))
             self.eq(node.get('block:coin'), 'btc')
             self.eq(node.get('block:offset'), 998877)
+            self.nn(node.get('block:chain'))
             self.eq(node.get('success'), True)
             self.eq(node.get('status:code'), 10)
             self.eq(node.get('status:message'), 'success')
@@ -144,6 +190,7 @@ class CryptoModelTest(s_t_utils.SynTest):
                         :hash=0x01020304
                         :minedby = (btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
                         :time=20211130
+                        :chain={[ crypto:currency:chain=* :name=btcmain ]}
                 ]''')
             self.len(1, nodes)
             node = nodes[0]
@@ -151,6 +198,7 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.eq(node.get('offset'), 12345)
             self.eq(node.get('hash'), '01020304')
             self.eq(node.get('time'), 1638230400000)
+            self.nn(node.get('chain'))
 
             nodes = await core.nodes('''
                 [
@@ -226,10 +274,213 @@ class CryptoModelTest(s_t_utils.SynTest):
 
             nodes = await core.nodes('''
                 [
+                    crypto:smart:effect:minttoken=*
+                        :index=0
+                        :token=(2bdea834252a220b61aadf592cc0de66, 30)
+                        :transaction=*
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('token'))
+            self.nn(node.get('transaction'))
+            self.len(1, await core.nodes('crypto:smart:effect:minttoken -> crypto:smart:token'))
+            self.len(1, await core.nodes('crypto:smart:effect:minttoken -> crypto:currency:transaction'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:burntoken=*
+                        :index=0
+                        :token=(2bdea834252a220b61aadf592cc0de66, 30)
+                        :transaction=*
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('token'))
+            self.nn(node.get('transaction'))
+            self.len(1, await core.nodes('crypto:smart:effect:burntoken -> crypto:smart:token'))
+            self.len(1, await core.nodes('crypto:smart:effect:burntoken -> crypto:currency:transaction'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:proxytoken=*
+                        :index=0
+                        :token=(2bdea834252a220b61aadf592cc0de66, 30)
+                        :transaction=*
+                        :owner=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
+                        :proxy=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('token'))
+            self.nn(node.get('owner'))
+            self.nn(node.get('proxy'))
+            self.len(1, await core.nodes('crypto:smart:effect:minttoken -> crypto:smart:token'))
+            self.len(1, await core.nodes('crypto:smart:effect:minttoken -> crypto:currency:transaction'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:proxytokenall=*
+                        :index=0
+                        :transaction=*
+                        :contract=*
+                        :owner=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
+                        :proxy=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
+                        :approval=$lib.true
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('owner'))
+            self.nn(node.get('proxy'))
+            self.nn(node.get('contract'))
+            self.true(node.get('approval'))
+            self.len(2, await core.nodes('crypto:smart:effect:proxytokenall -> crypto:currency:address'))
+            self.len(1, await core.nodes('crypto:smart:effect:proxytokenall -> crypto:currency:transaction'))
+            self.len(1, await core.nodes('crypto:smart:effect:proxytokenall -> crypto:smart:contract'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:proxytokens=*
+                        :index=0
+                        :transaction=*
+                        :contract=*
+                        :owner=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
+                        :proxy=(btc, 1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2)
+                        :amount=0xff
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('owner'))
+            self.nn(node.get('proxy'))
+            self.nn(node.get('contract'))
+            self.eq(node.get('amount'), 'ff')
+            self.len(2, await core.nodes('crypto:smart:effect:proxytokens -> crypto:currency:address'))
+            self.len(1, await core.nodes('crypto:smart:effect:proxytokens -> crypto:currency:transaction'))
+            self.len(1, await core.nodes('crypto:smart:effect:proxytokens -> crypto:smart:contract'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:freeze=*
+                        :index=0
+                        :transaction=*
+                        :contract=*
+                        :address=(eth, 0xd73d44149deb8aabd4b53197654a286dedfda827)
+                        :frozen=$lib.true
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('contract'))
+            self.eq(node.get('address'), ('eth', '0xd73d44149deb8aabd4b53197654a286dedfda827'))
+            self.true(node.get('frozen'))
+            self.len(1, await core.nodes('crypto:smart:effect:freeze -> crypto:currency:address'))
+            self.len(1, await core.nodes('crypto:smart:effect:freeze -> crypto:currency:transaction'))
+            self.len(1, await core.nodes('crypto:smart:effect:freeze -> crypto:smart:contract'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:seize=*
+                        :index=0
+                        :transaction=*
+                        :contract=*
+                        :address=(eth, 0xd73d44149deb8aabd4b53197654a286dedfda827)
+                        :amount=960007.90
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 0)
+            self.nn(node.get('contract'))
+            self.eq(node.get('address'), ('eth', '0xd73d44149deb8aabd4b53197654a286dedfda827'))
+            self.eq(node.get('amount'), '960007.9')
+            self.len(1, await core.nodes('crypto:smart:effect:seize -> crypto:currency:address'))
+            self.len(1, await core.nodes('crypto:smart:effect:seize -> crypto:currency:transaction'))
+            self.len(1, await core.nodes('crypto:smart:effect:seize -> crypto:smart:contract'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:smart:effect:swaptokens=*
+                        :index=179
+                        :transaction=*
+                        :contract=*
+                        :address=(eth, 0x241ebd14e40899ddb1191c140f85c37917b0505b)
+                        :sent:contract=*
+                        :sent:amount=0.025194371619325567
+                        :received:contract=*
+                        :received:amount=22574.721
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('index'), 179)
+            self.nn(node.get('contract'))
+            self.eq(node.get('address'), ('eth', '0x241ebd14e40899ddb1191c140f85c37917b0505b'))
+            self.nn(node.get('sent:contract'))
+            self.eq(node.get('sent:amount'), '0.025194371619325567')
+            self.nn(node.get('received:contract'))
+            self.eq(node.get('received:amount'), '22574.721')
+            self.len(1, await core.nodes('crypto:smart:effect:swaptokens -> crypto:currency:address'))
+            self.len(1, await core.nodes('crypto:smart:effect:swaptokens -> crypto:currency:transaction'))
+            self.len(3, await core.nodes('crypto:smart:effect:swaptokens -> crypto:smart:contract'))
+
+            nodes = await core.nodes('''
+                [
+                    crypto:currency:bridge:swap=(bridge1,)
+                        :name="deBridge.finance"
+                        :matched=true
+                        :source:transaction=(otxn,)
+                        :source:address=(eth, 0xaaaa)
+                        :source:contract=*
+                        :source:amount=1.5
+                        :target:transaction=(dtxn,)
+                        :target:address=(bsc, 0xbbbb)
+                        :target:contract=*
+                        :target:amount=1490.0
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.eq(node.get('name'), 'deBridge.finance')
+            self.eq(node.get('matched'), True)
+            self.eq(node.get('source:address'), ('eth', '0xaaaa'))
+            self.nn(node.get('source:contract'))
+            self.eq(node.get('source:amount'), '1.5')
+            self.eq(node.get('target:address'), ('bsc', '0xbbbb'))
+            self.nn(node.get('target:contract'))
+            self.eq(node.get('target:amount'), '1490')
+
+            # the swap is reachable from either leg via its indexed transaction prop, and bridges to the other leg
+            self.len(1, await core.nodes('crypto:currency:bridge:swap:source:transaction=(otxn,)'))
+            self.len(1, await core.nodes('crypto:currency:bridge:swap:target:transaction=(dtxn,)'))
+            self.len(2, await core.nodes('crypto:currency:bridge:swap=(bridge1,) -> crypto:currency:transaction'))
+            nodes = await core.nodes('crypto:currency:bridge:swap:source:transaction=(otxn,) :target:transaction -> crypto:currency:transaction')
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('crypto:currency:transaction', s_common.guid(('dtxn',))))
+
+            # is:matched does not imply the target leg is populated
+            nodes = await core.nodes('''
+                [
+                    crypto:currency:bridge:swap=(bridge2,)
+                        :matched=true
+                        :source:transaction=(otxn2,)
+                        :source:address=(eth, 0xcccc)
+                        :source:amount=2.0
+                        :target:transaction=(dtxn2,)
+                ]''')
+            self.len(1, nodes)
+            node = nodes[0]
+            self.nn(node.get('target:transaction'))
+            self.none(node.get('target:address'))
+            self.none(node.get('target:contract'))
+            self.none(node.get('target:amount'))
+
+            nodes = await core.nodes('''
+                [
                     crypto:smart:token=(2bdea834252a220b61aadf592cc0de66, 30)
                         :owner=eth/aaaa
                         :nft:url = https://coin.vertex.link/nfts/30
-                        :nft:meta = $lib.dict(name=WootWoot)
+                        :nft:meta = ({'name':'WootWoot'})
                         :nft:meta:name = WootWoot
                         :nft:meta:description = LoLoL
                         :nft:meta:image = https://vertex.link/favicon.ico
@@ -260,12 +511,18 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.len(1, await core.nodes('crypto:currency:transaction:value=1e-24'))
             self.len(1, await core.nodes('crypto:currency:transaction:value=0.000000000000000000000001'))
 
-            huge = '730750818665451459101841.00000000000000000002'
-            huge2 = '730750818665451459101841.000000000000000000015'
+            huge = '730750818665451459101841.000000000000000000000002'
+            huge2 = '730750818665451459101841.0000000000000000000000015'
+            huge3 = '730750818665451459101841.000000000000000000000001'
 
             self.len(1, await core.nodes(f'[ crypto:currency:transaction=* :value={huge} ]'))
             self.len(1, await core.nodes(f'[ crypto:currency:transaction=* :value={huge2} ]'))
             self.len(2, await core.nodes(f'crypto:currency:transaction:value={huge}'))
+
+            self.len(1, await core.nodes(f'[ crypto:currency:transaction=* :value={huge3} ]'))
+            self.len(2, await core.nodes(f'crypto:currency:transaction:value={huge}'))
+            self.len(2, await core.nodes(f'crypto:currency:transaction:value={huge2}'))
+            self.len(1, await core.nodes(f'crypto:currency:transaction:value={huge3}'))
 
     async def test_norm_lm_ntlm(self):
         async with self.getTestCore() as core:  # type: s_cortex.Cortex
@@ -281,32 +538,102 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.eq(subs, {})
             self.raises(s_exc.BadTypeValu, ntlm.norm, TEST_SHA256)
 
+    async def test_norm_ssdeep(self):
+        async with self.getTestCore() as core:  # type: s_cortex.Cortex
+
+            t = core.model.type('hash:ssdeep')
+
+            # Valid hashes norm cleanly; leading/trailing whitespace is stripped and case sensitivity is maintained
+            testvectors = [
+                ('98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLL:iglLlsHSfxVYVL',
+                 '98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLL:iglLlsHSfxVYVL'),
+                ('98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLLo:iglLlsHSfxVYVLs',
+                 '98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLLo:iglLlsHSfxVYVLs'),
+                ('24:eMPMHYRQBUuJT+Xv51ivpeaxWbktsgWXfSY+Xv51ivpeaxWb00XVFfOrzWXfS:eMPEPUuiUeaOMSqDUeaO0YOOK',
+                 '24:eMPMHYRQBUuJT+Xv51ivpeaxWbktsgWXfSY+Xv51ivpeaxWb00XVFfOrzWXfS:eMPEPUuiUeaOMSqDUeaO0YOOK'),
+                ('3:YC/OQWPDJCp2UDXV8JlB3I/eL3Ju3KOS:YCGfVCilaU3AS',
+                 '3:YC/OQWPDJCp2UDXV8JlB3I/eL3Ju3KOS:YCGfVCilaU3AS'),
+                # Leading/trailing whitespace is stripped
+                ('  98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLL:iglLlsHSfxVYVL  ',
+                 '98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLL:iglLlsHSfxVYVL'),
+                # Spec boundary: hash1 max 64 chars (SPAMSUM_LENGTH)
+                # hash2 max 64 chars (SPAMSUM_LENGTH) when FUZZY_FLAG_NOTRUNC is set,
+                # or 32 chars (SPAMSUM_LENGTH/2) in default truncated mode
+                ('6:' + 'A' * 64 + ':' + 'B' * 32,
+                 '6:' + 'A' * 64 + ':' + 'B' * 32),
+                ('6:' + 'A' * 64 + ':' + 'B' * 64,
+                 '6:' + 'A' * 64 + ':' + 'B' * 64),
+                # Empty hash segments are valid (SYN-11217); the empty file's ssdeep is 3::
+                ('3::', '3::'),
+                ('3:A:', '3:A:'),
+                ('3::A', '3::A'),
+            ]
+
+            for valu, expected in testvectors:
+                norm, subs = t.norm(valu)
+                self.eq(norm, expected, f'{valu=}')
+
+            # Invalid hashes raise BadTypeValu
+            badvectors = [
+                'notanssdeep',
+                'abc:hash1:hash2',
+                '98304:hash1',
+                '0:PYZd:iglL',
+                '2:PYZd:iglL',
+                # Invalid characters in hash segments
+                '98304:PYZd!VAlXLL:iglL',
+                # hash1 exceeds SPAMSUM_LENGTH (64)
+                '98304:' + 'A' * 65 + ':iglL',
+                # hash2 exceeds SPAMSUM_LENGTH (64)
+                '98304:iglL:' + 'A' * 65,
+                # Extra segment
+                '98304:A:B:C',
+            ]
+
+            for valu in badvectors:
+                self.raises(s_exc.BadTypeValu, t.norm, valu)
+
     async def test_forms_crypto_simple(self):
         async with self.getTestCore() as core:  # type: s_cortex.Cortex
-            async with await core.snap() as snap:
-                # md5
-                node = await snap.addNode('hash:md5', TEST_MD5.upper())
-                self.eq(node.ndef, ('hash:md5', TEST_MD5))
-                await self.asyncraises(s_exc.BadTypeValu, snap.addNode('hash:md5', TEST_SHA1))
-                # sha1
-                node = await snap.addNode('hash:sha1', TEST_SHA1.upper())
-                self.eq(node.ndef, ('hash:sha1', TEST_SHA1))
-                await self.asyncraises(s_exc.BadTypeValu, snap.addNode('hash:sha1', TEST_SHA256))
-                # sha256
-                node = await snap.addNode('hash:sha256', TEST_SHA256.upper())
-                self.eq(node.ndef, ('hash:sha256', TEST_SHA256))
-                await self.asyncraises(s_exc.BadTypeValu, snap.addNode('hash:sha256', TEST_SHA384))
-                # sha384
-                node = await snap.addNode('hash:sha384', TEST_SHA384.upper())
-                self.eq(node.ndef, ('hash:sha384', TEST_SHA384))
-                await self.asyncraises(s_exc.BadTypeValu, snap.addNode('hash:sha384', TEST_SHA512))
-                # sha512
-                node = await snap.addNode('hash:sha512', TEST_SHA512.upper())
-                self.eq(node.ndef, ('hash:sha512', TEST_SHA512))
-                await self.asyncraises(s_exc.BadTypeValu, snap.addNode('hash:sha512', TEST_MD5))
+
+            nodes = await core.nodes('[(hash:md5=$valu)]', opts={'vars': {'valu': TEST_MD5.upper()}})
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('hash:md5', TEST_MD5))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('[(hash:md5=$valu)]', opts={'vars': {'valu': TEST_SHA1}})
+
+            nodes = await core.nodes('[(hash:sha1=$valu)]', opts={'vars': {'valu': TEST_SHA1.upper()}})
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('hash:sha1', TEST_SHA1))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('[(hash:sha1=$valu)]', opts={'vars': {'valu': TEST_SHA256}})
+
+            nodes = await core.nodes('[(hash:sha256=$valu)]', opts={'vars': {'valu': TEST_SHA256.upper()}})
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('hash:sha256', TEST_SHA256))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('[(hash:sha256=$valu)]', opts={'vars': {'valu': TEST_SHA384}})
+
+            nodes = await core.nodes('[(hash:sha384=$valu)]', opts={'vars': {'valu': TEST_SHA384.upper()}})
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('hash:sha384', TEST_SHA384))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('[(hash:sha384=$valu)]', opts={'vars': {'valu': TEST_SHA512}})
+
+            nodes = await core.nodes('[(hash:sha512=$valu)]', opts={'vars': {'valu': TEST_SHA512.upper()}})
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('hash:sha512', TEST_SHA512))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('[(hash:sha512=$valu)]', opts={'vars': {'valu': TEST_MD5}})
+
+            ssdeep_hash = '98304:PYZdVAWWlLuKn4messQdqSqkxbpYlXLL:iglLlsHSfxVYVL'
+            nodes = await core.nodes('[(hash:ssdeep=$valu)]', opts={'vars': {'valu': ssdeep_hash}})
+            self.len(1, nodes)
+            self.eq(nodes[0].ndef, ('hash:ssdeep', ssdeep_hash))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('[(hash:ssdeep=$valu)]', opts={'vars': {'valu': 'notanssdeep'}})
 
     async def test_form_rsakey(self):
-        prop = 'rsa:key'
         props = {
             'bits': BITS,
             'priv:exp': HEXSTR_PRIVATE_EXPONENT,
@@ -317,18 +644,19 @@ class CryptoModelTest(s_t_utils.SynTest):
 
         async with self.getTestCore() as core:  # type: s_cortex.Cortex
 
-            async with await core.snap() as snap:
+            opts = {'vars': {'valu': valu, 'p': props}}
+            q = '[(rsa:key=$valu :bits=$p.bits :priv:exp=$p."priv:exp" :priv:p=$p."priv:p" :priv:q=$p."priv:q")]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
+            node = nodes[0]
 
-                node = await snap.addNode(prop, valu, props)
-
-                self.eq(node.ndef[1], (HEXSTR_MODULUS, HEXSTR_PUBLIC_EXPONENT))
-
-                self.eq(node.get('mod'), HEXSTR_MODULUS)
-                self.eq(node.get('bits'), BITS)
-                self.eq(node.get('pub:exp'), HEXSTR_PUBLIC_EXPONENT)
-                self.eq(node.get('priv:exp'), HEXSTR_PRIVATE_EXPONENT)
-                self.eq(node.get('priv:p'), HEXSTR_PRIVATE_PRIME_P)
-                self.eq(node.get('priv:q'), HEXSTR_PRIVATE_PRIME_Q)
+            self.eq(node.ndef[1], (HEXSTR_MODULUS, HEXSTR_PUBLIC_EXPONENT))
+            self.eq(node.get('mod'), HEXSTR_MODULUS)
+            self.eq(node.get('bits'), BITS)
+            self.eq(node.get('pub:exp'), HEXSTR_PUBLIC_EXPONENT)
+            self.eq(node.get('priv:exp'), HEXSTR_PRIVATE_EXPONENT)
+            self.eq(node.get('priv:p'), HEXSTR_PRIVATE_PRIME_P)
+            self.eq(node.get('priv:q'), HEXSTR_PRIVATE_PRIME_Q)
 
     async def test_model_x509(self):
 
@@ -337,7 +665,7 @@ class CryptoModelTest(s_t_utils.SynTest):
             crl = s_common.guid()
             cert = s_common.guid()
             icert = s_common.guid()
-            fileguid = 'guid:' + s_common.guid()
+            fileguid = f'guid:{s_common.guid()}'
 
             nodes = await core.nodes('''
                 [ crypto:x509:cert=$icert
@@ -358,7 +686,7 @@ class CryptoModelTest(s_t_utils.SynTest):
                     :issuer="DN FOO THING"
                     :issuer:cert=$icert
 
-                    :serial=12345
+                    :serial=0000000000000000000000000000000000003039
                     :version=v3
 
                     :validity:notafter=2019
@@ -388,7 +716,7 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.eq(nodes[0].get('subject'), "CN=vertex.link")
             self.eq(nodes[0].get('issuer'), "DN FOO THING")
             self.eq(nodes[0].get('issuer:cert'), icert)
-            self.eq(nodes[0].get('serial'), "12345")
+            self.eq(nodes[0].get('serial'), "0000000000000000000000000000000000003039")
             self.eq(nodes[0].get('version'), 2)
 
             self.eq(nodes[0].get('validity:notafter'), 1546300800000)
@@ -408,6 +736,14 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.eq(nodes[0].get('identities:fqdns'), ('vertex.link', 'woot.com'))
             self.eq(nodes[0].get('identities:ipv4s'), (0x01020304, 0x05050505))
             self.eq(nodes[0].get('identities:ipv6s'), ('ff::11', 'ff::aa'))
+
+            nodes = await core.nodes('[ crypto:x509:cert=* :serial=(1234) ]')
+            self.len(1, nodes)
+            self.eq(nodes[0].get('serial'), '00000000000000000000000000000000000004d2')
+
+            nodes = await core.nodes('[ crypto:x509:cert=* :serial=(-1234) ]')
+            self.len(1, nodes)
+            self.eq(nodes[0].get('serial'), 'fffffffffffffffffffffffffffffffffffffb2e')
 
             nodes = await core.nodes('''
                 [
@@ -434,3 +770,18 @@ class CryptoModelTest(s_t_utils.SynTest):
             self.eq(nodes[0].ndef, ('crypto:x509:revoked', (crl, cert)))
             self.eq(nodes[0].get('crl'), crl)
             self.nn(nodes[0].get('cert'), cert)
+
+            # odd-length serials
+            serials = [
+                '1' * 7,
+                '2' * 9,
+                '3' * 15,
+                '4' * 17,
+                '5' * 31,
+                '6' * 33,
+                '7' * 39,
+            ]
+
+            for serial in serials:
+                msgs = await core.stormlist(f'[crypto:x509:cert=* :serial={serial}]')
+                self.stormHasNoErr(msgs)

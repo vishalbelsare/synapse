@@ -1,32 +1,25 @@
-import sys
-import time
 import asyncio
 import threading
 
 import synapse.exc as s_exc
 import synapse.glob as s_glob
+
 import synapse.lib.coro as s_coro
 import synapse.tests.utils as s_t_utils
 
-class FakeError(Exception): pass
-
-def spawnfunc(x, y=10):
-    return x + y
-
-def spawnsleep(n=10):
-    time.sleep(n)
-    return True
-
-def spawnfakeit():
-    raise FakeError()
-
-def spawnexit():
-    sys.exit(0)
-
-def chkpool():
-    return s_coro.forkpool is None
-
 class CoroTest(s_t_utils.SynTest):
+
+    async def test_coro_chunks(self):
+        async def agen():
+            for i in range(101):
+                yield i
+
+        chunks = []
+        async for chunk in s_coro.chunks(agen()):
+            chunks.append(chunk)
+
+        self.len(1, chunks[1])
+        self.len(100, chunks[0])
 
     async def test_coro_event(self):
 
@@ -88,39 +81,61 @@ class CoroTest(s_t_utils.SynTest):
         # Ensure a generic coroutine is executed on the ioloop thread
         self.eq(s_glob._glob_thrd.ident, await afunc())
 
-    async def test_lib_coro_spawn(self):
+    async def test_lib_coro_deadline(self):
 
-        todo = (spawnfunc, (20,), {'y': 30})
-        self.eq(50, await s_coro.spawn(todo))
+        remaining = s_coro.deadline(None)
+        self.none(remaining())
+        self.none(remaining())
 
-        todo = (spawnsleep, (1.5,), {})
-        self.true(await s_coro.spawn(todo))
+        remaining = s_coro.deadline(0.5)
+        first = remaining()
+        self.isinstance(first, float)
+        self.true(0.0 < first <= 0.5)
 
-        todo = (spawnsleep, (), {})
-        with self.raises(asyncio.TimeoutError):
-            await s_coro.spawn(todo, timeout=0.1)
+        await asyncio.sleep(0.1)
+        second = remaining()
+        self.true(second < first)
 
-        todo = (spawnfakeit, (), {})
-        with self.raises(FakeError):
-            await s_coro.spawn(todo)
+        remaining = s_coro.deadline(0.01)
+        await asyncio.sleep(0.05)
+        self.eq(0.0, remaining())
 
-        todo = (spawnexit, (), {})
-        with self.raises(s_exc.SpawnExit):
-            await s_coro.spawn(todo)
+        remaining = s_coro.deadline(0)
+        self.eq(0.0, remaining())
 
-    async def test_lib_coro_forked(self):
+        with self.raises(s_exc.BadArg):
+            s_coro.deadline(-1)
 
-        self.true(await s_coro.forked(chkpool))
+        with self.raises(s_exc.BadArg):
+            s_coro.deadline(-0.5)
 
-        self.eq(50, await s_coro.forked(spawnfunc, 20, y=30))
+        with self.raises(RuntimeError):
+            await s_coro.executor(s_coro.deadline, 1.0)
 
-        with self.raises(FakeError):
-            await s_coro.forked(spawnfakeit)
+    async def test_lib_coro_create_task(self):
 
-        self.eq(50, await s_coro.forked(spawnfunc, 20, y=30))
+        async def sleep(n):
+            await asyncio.sleep(n)
+            if n == 0:
+                return 1 / 0
+            return n
 
-        def newp():
-            return 23
+        s_coro.create_task(sleep(0.1))
+        s_coro.create_task(sleep(0.15))
+        s_coro.create_task(sleep(0.2))
+        self.len(3, s_coro.bgtasks)
+        results = await s_coro.await_bg_tasks()
+        self.eq(set(results), {0.1, 0.15, 0.2})
+        self.len(0, s_coro.bgtasks)
+        results = await s_coro.await_bg_tasks()
+        self.eq(results, [])
 
-        with self.raises(Exception):
-            await s_coro.forked(newp)
+        s_coro.create_task(sleep(0))
+        results = await s_coro.await_bg_tasks()
+        self.len(1, results)
+        self.isinstance(results[0], ZeroDivisionError)
+
+        task = s_coro.create_task(sleep(10))
+        self.eq([], await s_coro.await_bg_tasks(timeout=0.001))
+        task.cancel()
+        self.eq([], await s_coro.await_bg_tasks())

@@ -8,12 +8,36 @@ class TestsvcApi(s_cell.CellApi, s_stormsvc.StormSvc):
         {
             'name': 'testsvc',
             'version': (0, 0, 1),
+            'onload': '''
+                $lib.time.sleep($lib.globals.get(onload_sleep, 0))
+                $lib.globals.set(testsvc, testsvc-done)
+            ''',
             'commands': (
                 {
                     'name': 'testsvc.test',
-                    'storm': '$lib.print($lib.service.get($cmdconf.svciden).test())',
+                    'storm': '''
+                        $lib.print($lib.service.get($cmdconf.svciden).test())
+                        $lib.print($lib.globals.get(testsvc))
+                    ''',
                 },
             )
+        },
+        {
+            'name': 'testsvcinits',
+            'version': (0, 0, 1),
+            'inits': {
+                'versions': (
+                    {
+                        'name': 'first',
+                        'version': 0,
+                        'inaugural': True,
+                        'query': '''
+                            $lib.time.sleep($lib.globals.get(init_sleep, 0))
+                            $lib.globals.set(testsvcinits, testsvcinits-done)
+                        ''',
+                    },
+                ),
+            },
         },
     )
 
@@ -30,7 +54,7 @@ class Testsvc(s_cell.Cell):
 
     async def __anit__(self, dirn, conf):
         await s_cell.Cell.__anit__(self, dirn, conf=conf)
-        self.secret = self.conf.reqConfValu('secret')
+        self.secret = self.conf.req('secret')
 
     async def test(self):
         return self.secret

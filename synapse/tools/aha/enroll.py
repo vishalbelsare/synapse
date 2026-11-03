@@ -1,26 +1,25 @@
 import os
-import sys
-import asyncio
-import argparse
 
 import synapse.common as s_common
 import synapse.telepath as s_telepath
 
+import synapse.lib.cmd as s_cmd
 import synapse.lib.output as s_output
 import synapse.lib.certdir as s_certdir
+import synapse.lib.msgpack as s_msgpack
 
 descr = '''
 Use a one-time use key to initialize your AHA user enrivonment.
 
 Examples:
 
-    python -m synapse.tools.aha.register tcp://aha.loop.vertex.link:27272/b751e6c3e6fc2dad7a28d67e315e1874
+    python -m synapse.tools.aha.enroll tcp://aha.loop.vertex.link:27272/b751e6c3e6fc2dad7a28d67e315e1874
 
 '''
 
 async def main(argv, outp=s_output.stdout):
 
-    pars = argparse.ArgumentParser(prog='provision', description=descr)
+    pars = s_cmd.Parser(prog='synapse.tools.aha.enroll', outp=outp, description=descr)
     pars.add_argument('onceurl', help='The one-time use AHA user enrollment URL.')
     opts = pars.parse_args(argv)
 
@@ -52,7 +51,7 @@ async def main(argv, outp=s_output.stdout):
 
             capath = certdir.getCaCertPath(ahanetw)
             if capath is not None:
-                os.path.unlink(capath)
+                os.unlink(capath)
 
             byts = await prov.getCaCert()
             capath = certdir.saveCaCertByts(byts)
@@ -60,24 +59,45 @@ async def main(argv, outp=s_output.stdout):
 
             keypath = certdir.getUserKeyPath(username)
             if keypath is not None:
-                os.path.unlink(keypath)
+                os.unlink(keypath)
 
             crtpath = certdir.getUserCertPath(username)
             if crtpath is not None:
-                os.path.unlink(keypath)
+                os.unlink(crtpath)
 
             xcsr = certdir.genUserCsr(username)
             byts = await prov.signUserCsr(xcsr)
             crtpath = certdir.saveUserCertByts(byts)
             outp.printf(f'Saved user certificate: {crtpath}')
 
-            ahaurls = s_telepath.modurl(ahaurls, user=ahauser)
-            if ahaurls not in teleyaml.get('aha:servers'):
-                outp.printf('Updating known AHA servers')
-                servers = list(teleyaml.get('aha:servers'))
-                servers.append(ahaurls)
-                teleyaml['aha:servers'] = servers
-                s_common.yamlsave(teleyaml, yamlpath)
+            if ahaurls is not None:
+                if isinstance(ahaurls, str):
+                    ahaurls = (ahaurls,)
+
+                certname = f'{ahauser}@{ahanetw}'
+                ahaurls = set(s_telepath.modurl(ahaurls, certname=certname))
+                servers = teleyaml.get('aha:servers')
+
+                # repack the servers so lists are tuplized like values
+                # we may get over telepath
+                servers = s_msgpack.deepcopy(servers)
+                if isinstance(servers, str):
+                    servers = [servers]
+                else:
+                    servers = list(servers)
+
+                newurls = ahaurls - set(servers)
+                if newurls:
+                    outp.printf('Updating known AHA servers')
+                    servers.extend(newurls)
+                    teleyaml['aha:servers'] = servers
+                    s_common.yamlsave(teleyaml, yamlpath)
+
+            # cleanup CSR
+            certdir.delUserCsr(username)
+
+    return 0
+
 
 if __name__ == '__main__':  # pragma: no cover
-    sys.exit(asyncio.run(main(sys.argv[1:])))
+    s_cmd.exitmain(main)

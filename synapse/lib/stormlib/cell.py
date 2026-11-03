@@ -2,10 +2,16 @@ import asyncio
 import logging
 
 import synapse.exc as s_exc
+import synapse.lib.autodoc as s_autodoc
 import synapse.lib.stormtypes as s_stormtypes
 
 logger = logging.getLogger(__name__)
 
+def prepHotfixDesc(txt):
+    lines = txt.split('\n')
+    lines = s_autodoc.scrubLines(lines)
+    lines = s_autodoc.ljuster(lines)
+    return lines
 
 storm_missing_autoadds = '''
 $absoluteOrder = $lib.view.list(deporder=$lib.true)
@@ -17,24 +23,24 @@ if $lib.debug {
     }
 }
 
-$queries = ( ${ inet:dns:request:query:name:fqdn $valu=:query:name:fqdn [inet:fqdn=$valu] },
-${ inet:dns:request:query:name:ipv4 $valu=:query:name:ipv4 [inet:ipv4=$valu] },
-${ inet:dns:request:query:name:ipv6 $valu=:query:name:ipv6 [inet:ipv6=$valu] },
-${ inet:dns:query:name:fqdn $valu=:name:fqdn [inet:fqdn=$valu] },
-${ inet:dns:query:name:ipv4 $valu=:name:ipv4 [inet:ipv4=$valu] },
-${ inet:dns:query:name:ipv6 $valu=:name:ipv6 [inet:ipv6=$valu] },
-${ inet:asnet4:net4:min $valu=:net4:min [inet:ipv4=$valu] },
-${ inet:asnet4:net4:max $valu=:net4:max [inet:ipv4=$valu] },
-${ inet:asnet6:net6:min $valu=:net6:min [inet:ipv6=$valu] },
-${ inet:asnet6:net6:max $valu=:net6:max [inet:ipv6=$valu] },
-${ inet:whois:iprec:net4:min $valu=:net4:min [inet:ipv4=$valu] },
-${ inet:whois:iprec:net4:max $valu=:net4:max [inet:ipv4=$valu] },
-${ inet:whois:iprec:net6:min $valu=:net6:min [inet:ipv6=$valu] },
-${ inet:whois:iprec:net6:max $valu=:net6:max [inet:ipv6=$valu] },
-${ it:app:snort:hit:src:ipv4 $valu=:src:ipv4 [inet:ipv4=$valu] },
-${ it:app:snort:hit:src:ipv6 $valu=:src:ipv6 [inet:ipv6=$valu] },
-${ it:app:snort:hit:dst:ipv4 $valu=:dst:ipv4 [inet:ipv4=$valu] },
-${ it:app:snort:hit:dst:ipv6 $valu=:dst:ipv6 [inet:ipv6=$valu] },)
+$queries = ( ${ inet:dns:request:query:name:fqdn [inet:fqdn=:query:name:fqdn] },
+${ inet:dns:request:query:name:ipv4 [inet:ipv4=:query:name:ipv4] },
+${ inet:dns:request:query:name:ipv6 [inet:ipv6=:query:name:ipv6] },
+${ inet:dns:query:name:fqdn [inet:fqdn=:name:fqdn] },
+${ inet:dns:query:name:ipv4 [inet:ipv4=:name:ipv4] },
+${ inet:dns:query:name:ipv6 [inet:ipv6=:name:ipv6] },
+${ inet:asnet4:net4:min [inet:ipv4=:net4:min] },
+${ inet:asnet4:net4:max [inet:ipv4=:net4:max] },
+${ inet:asnet6:net6:min [inet:ipv6=:net6:min] },
+${ inet:asnet6:net6:max [inet:ipv6=:net6:max] },
+${ inet:whois:iprec:net4:min [inet:ipv4=:net4:min] },
+${ inet:whois:iprec:net4:max [inet:ipv4=:net4:max] },
+${ inet:whois:iprec:net6:min [inet:ipv6=:net6:min] },
+${ inet:whois:iprec:net6:max [inet:ipv6=:net6:max] },
+${ it:app:snort:hit:src:ipv4 [inet:ipv4=:src:ipv4] },
+${ it:app:snort:hit:src:ipv6 [inet:ipv6=:src:ipv6] },
+${ it:app:snort:hit:dst:ipv4 [inet:ipv4=:dst:ipv4] },
+${ it:app:snort:hit:dst:ipv6 [inet:ipv6=:dst:ipv6] },)
 
 for $view in $absoluteOrder {
     if $lib.debug { $lib.print('Fixing autoadd data in view {v}', v=$view) }
@@ -63,6 +69,17 @@ for $view in $views {
 }
 '''
 
+storm_migrate_riskhasvuln = '''
+for $view in $lib.view.list(deporder=$lib.true) {
+    view.exec $view.iden {
+        $layer = $lib.layer.get()
+        for ($buid, $sode) in $layer.getStorNodesByForm(risk:hasvuln) {
+            yield $buid
+            $lib.model.migration.s.riskHasVulnToVulnerable($node)
+        }
+    }
+}
+'''
 
 hotfixes = (
     ((1, 0, 0), {
@@ -77,6 +94,20 @@ hotfixes = (
         'desc': 'Populate it:sec:cpe:v2_2 properties from existing CPE where the property is not set.',
         'query': storm_missing_cpe22,
     }),
+    ((4, 0, 0), {
+        'desc': '''
+            Create risk:vulnerable nodes from existing risk:hasvuln nodes.
+
+            This hotfix should only be applied after all logic that would create
+            risk:hasvuln nodes has been updated. The hotfix uses the
+            $lib.model.migration.s.riskHasVulnToVulnerable() function,
+            which can be used directly for testing.
+
+            Tags, tag properties, edges, and node data will all be copied
+            to the risk:vulnerable nodes.
+        ''',
+        'query': storm_migrate_riskhasvuln,
+    }),
 )
 runtime_fixes_key = 'cortex:runtime:stormfixes'
 
@@ -89,6 +120,9 @@ class CellLib(s_stormtypes.Lib):
     A Storm Library for interacting with the Cortex.
     '''
     _storm_locals = (
+        {'name': 'iden', 'desc': 'The Cortex service identifier.',
+         'type': {'type': 'gtor', '_gtorfunc': '_getCellIden',
+                  'returns': {'type': 'str', 'desc': 'The Cortex service identifier.'}}},
         {'name': 'getCellInfo', 'desc': 'Return metadata specific for the Cortex.',
          'type': {'type': 'function', '_funcname': '_getCellInfo', 'args': (),
                   'returns': {'type': 'dict', 'desc': 'A dictionary containing metadata.', }}},
@@ -101,6 +135,14 @@ class CellLib(s_stormtypes.Lib):
         {'name': 'getHealthCheck', 'desc': 'Get healthcheck information about the Cortex.',
          'type': {'type': 'function', '_funcname': '_getHealthCheck', 'args': (),
                   'returns': {'type': 'dict', 'desc': 'A dictionary containing healthcheck information.', }}},
+        {'name': 'getMirrorUrls', 'desc': 'Get mirror Telepath URLs for an AHA configured service.',
+         'type': {'type': 'function', '_funcname': '_getMirrorUrls',
+                  'args': (
+                      {'name': 'name', 'type': 'str', 'default': None,
+                       'desc': 'The name, or iden, of the service to get mirror URLs for '
+                               '(defaults to the Cortex if not provided).'},
+                  ),
+                  'returns': {'type': 'list', 'desc': 'A list of Telepath URLs.', }}},
         {'name': 'hotFixesApply', 'desc': 'Apply known data migrations and fixes via storm.',
          'type': {'type': 'function', '_funcname': '_hotFixesApply', 'args': (),
                   'returns': {'type': 'list',
@@ -118,14 +160,26 @@ class CellLib(s_stormtypes.Lib):
          ''',
          'type': {'type': 'function', '_funcname': '_trimNexsLog',
                   'args': (
-                      {'name': 'consumers', 'type': 'array', 'default': None,
+                      {'name': 'consumers', 'type': 'list', 'default': None,
                        'desc': 'List of Telepath URLs for consumers of the Nexus log.'},
                       {'name': 'timeout', 'type': 'int', 'default': 30,
                        'desc': 'Time (in seconds) to wait for consumers to catch-up before culling.'}
                   ),
                   'returns': {'type': 'int', 'desc': 'The offset that was culled (up to and including).'}}},
+        {'name': 'uptime', 'desc': 'Get update data for the Cortex or a connected Service.',
+         'type': {'type': 'function', '_funcname': '_uptime',
+                  'args': (
+                      {'name': 'name', 'type': 'str', 'default': None,
+                       'desc': 'The name, or iden, of the service to get uptime data for '
+                               '(defaults to the Cortex if not provided).'},
+                  ),
+                  'returns': {'type': 'dict', 'desc': 'A dictionary containing uptime data.', }}},
     )
     _storm_lib_path = ('cell',)
+
+    def __init__(self, runt, name=()):
+        s_stormtypes.Lib.__init__(self, runt, name=name)
+        self.gtors['iden'] = self._getCellIden
 
     def getObjLocals(self):
         return {
@@ -133,15 +187,21 @@ class CellLib(s_stormtypes.Lib):
             'getBackupInfo': self._getBackupInfo,
             'getSystemInfo': self._getSystemInfo,
             'getHealthCheck': self._getHealthCheck,
+            'getMirrorUrls': self._getMirrorUrls,
             'hotFixesApply': self._hotFixesApply,
             'hotFixesCheck': self._hotFixesCheck,
             'trimNexsLog': self._trimNexsLog,
+            'uptime': self._uptime,
         }
+
+    @s_stormtypes.stormfunc(readonly=True)
+    async def _getCellIden(self):
+        return self.runt.snap.core.getCellIden()
 
     async def _hotFixesApply(self):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.stormFixesApply() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
 
         curv = await self.runt.snap.core.getStormVar(runtime_fixes_key, default=(0, 0, 0))
         for vers, info in hotfixes:
@@ -155,7 +215,9 @@ class CellLib(s_stormtypes.Lib):
             assert desc is not None
             assert vars is not None
 
-            await self.runt.printf(f'Applying hotfix {vers} for [{desc}]')
+            title = prepHotfixDesc(desc)[0]
+            await self.runt.printf(f'Applying hotfix {vers} for [{title}]')
+
             try:
                 query = await self.runt.getStormQuery(text)
                 async with self.runt.getSubRuntime(query, opts={'vars': vars}) as runt:
@@ -173,10 +235,11 @@ class CellLib(s_stormtypes.Lib):
 
         return curv
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _hotFixesCheck(self):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.stormFixesCheck() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
 
         curv = await self.runt.snap.core.getStormVar(runtime_fixes_key, default=(0, 0, 0))
 
@@ -186,39 +249,69 @@ class CellLib(s_stormtypes.Lib):
                 continue
 
             dowork = True
-            desc = info.get('desc')
-            await self.runt.printf(f'Would apply fix {vers} for [{desc}]')
+
+            desclines = prepHotfixDesc(info.get('desc'))
+            await self.runt.printf(f'Would apply fix {vers} for [{desclines[0]}]')
+            if len(desclines) > 1:
+                for line in desclines[1:]:
+                    await self.runt.printf(f'    {line}' if line else '')
+            else:
+                await self.runt.printf('')
 
         return dowork
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getCellInfo(self):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.getCellInfo() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
         return await self.runt.snap.core.getCellInfo()
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getSystemInfo(self):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.getSystemInfo() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
         return await self.runt.snap.core.getSystemInfo()
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getBackupInfo(self):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.getBackupInfo() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
         return await self.runt.snap.core.getBackupInfo()
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getHealthCheck(self):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.getHealthCheck() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
         return await self.runt.snap.core.getHealthCheck()
+
+    @s_stormtypes.stormfunc(readonly=True)
+    async def _getMirrorUrls(self, name=None):
+
+        if not self.runt.isAdmin():
+            mesg = '$lib.cell.getMirrorUrls() requires admin privs.'
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
+
+        name = await s_stormtypes.tostr(name, noneok=True)
+
+        if name is None:
+            return await self.runt.snap.core.getMirrorUrls()
+
+        ssvc = self.runt.snap.core.getStormSvc(name)
+        if ssvc is None:
+            mesg = f'No service with name/iden: {name}'
+            raise s_exc.NoSuchName(mesg=mesg)
+
+        await ssvc.proxy.waitready()
+        return await ssvc.proxy.getMirrorUrls()
 
     async def _trimNexsLog(self, consumers=None, timeout=30):
         if not self.runt.isAdmin():
             mesg = '$lib.cell.trimNexsLog() requires admin privs.'
-            raise s_exc.AuthDeny(mesg=mesg)
+            raise s_exc.AuthDeny(mesg=mesg, user=self.runt.user.iden, username=self.runt.user.name)
 
         timeout = await s_stormtypes.toint(timeout, noneok=True)
 
@@ -226,3 +319,23 @@ class CellLib(s_stormtypes.Lib):
             consumers = [await s_stormtypes.tostr(turl) async for turl in s_stormtypes.toiter(consumers)]
 
         return await self.runt.snap.core.trimNexsLog(consumers=consumers, timeout=timeout)
+
+    @s_stormtypes.stormfunc(readonly=True)
+    async def _uptime(self, name=None):
+
+        name = await s_stormtypes.tostr(name, noneok=True)
+
+        if name is None:
+            info = await self.runt.snap.core.getSystemInfo()
+        else:
+            ssvc = self.runt.snap.core.getStormSvc(name)
+            if ssvc is None:
+                mesg = f'No service with name/iden: {name}'
+                raise s_exc.NoSuchName(mesg=mesg)
+            await ssvc.proxy.waitready()
+            info = await ssvc.proxy.getSystemInfo()
+
+        return {
+            'starttime': info['cellstarttime'],
+            'uptime': info['celluptime'],
+        }

@@ -26,7 +26,7 @@ class StormWhoisTest(s_test.SynTest):
             guid_exp = s_common.guid(sorted((props['net4'], str(props['asof']), props['id'])))
             self.len(1, await core.nodes(f'inet:whois:iprec={guid_exp}'))
 
-            stormcmd = '''$props=$lib.dict(net4="10.0.0.0/28", asof=(2554869000000), id='NET-10-0-0-0-1', status=validated)
+            stormcmd = '''$props=({'net4':'10.0.0.0/28', 'asof':(2554869000000), 'id':'NET-10-0-0-0-1', 'status':'validated'})
             return ($lib.inet.whois.guid($props, 'iprec'))
             '''
             guid = await core.callStorm(stormcmd)
@@ -84,8 +84,8 @@ class StormWhoisTest(s_test.SynTest):
             '''
             opts = {'vars': {'props': props}}
             mesgs = await core.stormlist(stormcmd, opts=opts)
-            warn = [m[1]['mesg'] for m in mesgs if m[0] == 'warn']
-            self.isin('Insufficient guid vals identified, using random guid:', warn[0])
+            self.stormIsInWarn('$lib.inet.whois.guid() is deprecated', mesgs)
+            self.stormIsInWarn('Insufficient guid vals identified, using random guid:', mesgs)
             self.len(1, await core.nodes(f'inet:whois:ipquery:fqdn={props["fqdn"]}'))
 
             props = {
@@ -97,8 +97,8 @@ class StormWhoisTest(s_test.SynTest):
             '''
             opts = {'vars': {'props': props}}
             mesgs = await core.stormlist(stormcmd, opts=opts)
-            warn = [m[1]['mesg'] for m in mesgs if m[0] == 'warn']
-            self.isin('Insufficient guid vals identified, using random guid:', warn[0])
+            self.stormIsInWarn('$lib.inet.whois.guid() is deprecated', mesgs)
+            self.stormIsInWarn('Insufficient guid vals identified, using random guid:', mesgs)
             self.len(1, await core.nodes(f'inet:whois:ipcontact:asn={props["asn"]}'))
 
             # Failure cases
@@ -106,10 +106,12 @@ class StormWhoisTest(s_test.SynTest):
                 [(inet:whois:ipcontact=$lib.inet.whois.guid($props, "foobar"))]
             '''
             opts = {'vars': {'props': {}}}
-            await self.asyncraises(s_exc.StormRuntimeError, core.nodes(stormcmd, opts=opts))
+            with self.raises(s_exc.StormRuntimeError):
+                await core.nodes(stormcmd, opts=opts)
 
             stormcmd = '''
                 [(inet:whois:ipcontact=$lib.inet.whois.guid($props, "ipcontact"))]
             '''
             opts = {'vars': {'props': 123}}
-            await self.asyncraises(s_exc.StormRuntimeError, core.nodes(stormcmd, opts=opts))
+            with self.raises(s_exc.StormRuntimeError):
+                await core.nodes(stormcmd, opts=opts)

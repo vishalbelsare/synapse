@@ -46,7 +46,7 @@ class JsonStor(s_base.Base):
             self.dirty.pop(buid, None)
             await asyncio.sleep(0)
 
-    def _incRefObj(self, buid, valu=1):
+    async def _incRefObj(self, buid, valu=1):
 
         refs = 0
 
@@ -62,6 +62,7 @@ class JsonStor(s_base.Base):
         # remove the meta entries
         for lkey, byts in self.slab.scanByPref(buid, db=self.metadb):
             self.slab.pop(lkey, db=self.metadb)
+            await asyncio.sleep(0)
 
         # remove the item data
         self.slab.pop(buid, db=self.itemdb)
@@ -88,7 +89,7 @@ class JsonStor(s_base.Base):
 
         oldb = self.slab.replace(pkey, buid, db=self.pathdb)
         if oldb is not None:
-            self._incRefObj(oldb, -1)
+            await self._incRefObj(oldb, -1)
 
         self.slab.put(buid + b'refs', s_msgpack.en(1), db=self.metadb)
 
@@ -124,7 +125,7 @@ class JsonStor(s_base.Base):
         pkey = self._pathToPkey(path)
         buid = self.slab.pop(pkey, db=self.pathdb)
         if buid is not None:
-            self._incRefObj(buid, valu=-1)
+            await self._incRefObj(buid, valu=-1)
 
     async def setPathLink(self, srcpath, dstpath):
         '''
@@ -140,9 +141,9 @@ class JsonStor(s_base.Base):
 
         oldb = self.slab.pop(srcpkey, db=self.pathdb)
         if oldb is not None:
-            self._incRefObj(oldb, valu=-1)
+            await self._incRefObj(oldb, valu=-1)
 
-        self._incRefObj(buid, valu=1)
+        await self._incRefObj(buid, valu=1)
         self.slab.put(srcpkey, buid, db=self.pathdb)
 
     async def getPathObjProp(self, path, prop):
@@ -219,6 +220,7 @@ class JsonStor(s_base.Base):
 
         step[name] = valu
         self.dirty[buid] = item
+        self.slab.dirty = True
         return True
 
     async def delPathObjProp(self, path, prop):
@@ -234,11 +236,13 @@ class JsonStor(s_base.Base):
         step = item
         names = self._pathToTupl(prop)
         for name in names[:-1]:
-            step = step[name]
+            if (step := step.get(name)) is None:
+                return False
 
         step.pop(names[-1], None)
 
         self.dirty[buid] = item
+        self.slab.dirty = True
         return True
 
     async def cmpDelPathObjProp(self, path, prop, valu):
@@ -262,6 +266,7 @@ class JsonStor(s_base.Base):
 
         step.pop(name, None)
         self.dirty[buid] = item
+        self.slab.dirty = True
         return True
 
     async def popPathObjProp(self, path, prop, defv=None):
@@ -283,7 +288,7 @@ class JsonStor(s_base.Base):
 
         retn = step.pop(names[-1], defv)
         self.dirty[buid] = item
-
+        self.slab.dirty = True
         return retn
 
 class JsonStorApi(s_cell.CellApi):
@@ -435,7 +440,7 @@ class JsonStorCell(s_cell.Cell):
 
     @classmethod
     def getEnvPrefix(cls):
-        return (f'SYN_JSONSTOR', f'SYN_{cls.__name__.upper()}', )
+        return ('SYN_JSONSTOR', f'SYN_{cls.__name__.upper()}', )
 
     async def getPathList(self, path):
         async for item in self.jsonstor.getPathList(path):
@@ -505,9 +510,13 @@ class JsonStorCell(s_cell.Cell):
         await self.multique.rem(name)
         return True
 
-    @s_nexus.Pusher.onPushAuto('q:puts')
-    async def putsQueue(self, name, items, reqid=None):
-        return await self.multique.puts(name, items, reqid=reqid)
+    async def putsQueue(self, name, items):
+        return await self._push('q:puts', name, items)
+
+    @s_nexus.Pusher.onPush('q:puts', passitem=True)
+    async def _putsQueue(self, name, items, nexsitem):
+        nexsoff, nexsmesg = nexsitem
+        return await self.multique.puts(name, items, reqid=nexsoff)
 
     @s_nexus.Pusher.onPushAuto('q:cull')
     async def cullQueue(self, name, offs):

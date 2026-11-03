@@ -1,10 +1,13 @@
 import os
 import copy
+import http
 import regex
 import asyncio
 import logging
+import textwrap
 import contextlib
 import collections
+import contextvars
 
 from collections.abc import Mapping
 
@@ -15,16 +18,19 @@ import synapse.common as s_common
 import synapse.telepath as s_telepath
 import synapse.datamodel as s_datamodel
 
+import synapse.lib.mcp as s_mcp
 import synapse.lib.base as s_base
 import synapse.lib.cell as s_cell
 import synapse.lib.chop as s_chop
 import synapse.lib.coro as s_coro
-import synapse.lib.hive as s_hive
 import synapse.lib.view as s_view
 import synapse.lib.cache as s_cache
+import synapse.lib.const as s_const
 import synapse.lib.layer as s_layer
 import synapse.lib.nexus as s_nexus
+import synapse.lib.oauth as s_oauth
 import synapse.lib.queue as s_queue
+import synapse.lib.scope as s_scope
 import synapse.lib.storm as s_storm
 import synapse.lib.agenda as s_agenda
 import synapse.lib.config as s_config
@@ -32,48 +38,86 @@ import synapse.lib.parser as s_parser
 import synapse.lib.dyndeps as s_dyndeps
 import synapse.lib.grammar as s_grammar
 import synapse.lib.httpapi as s_httpapi
+import synapse.lib.logging as s_logging
 import synapse.lib.msgpack as s_msgpack
 import synapse.lib.modules as s_modules
+import synapse.lib.schemas as s_schemas
 import synapse.lib.spooled as s_spooled
 import synapse.lib.version as s_version
 import synapse.lib.urlhelp as s_urlhelp
+import synapse.lib.hashitem as s_hashitem
 import synapse.lib.jsonstor as s_jsonstor
 import synapse.lib.modelrev as s_modelrev
+import synapse.lib.nodefuse as s_nodefuse
 import synapse.lib.stormsvc as s_stormsvc
 import synapse.lib.lmdbslab as s_lmdbslab
 
-# Importing these registers their commands
-import synapse.lib.stormhttp as s_stormhttp  # NOQA
-import synapse.lib.stormwhois as s_stormwhois  # NOQA
+import synapse.lib.crypto.rsa as s_rsa
 
-import synapse.lib.provenance as s_provenance
+# Importing these registers their commands
+import synapse.lib.stormhttp as s_stormhttp  # noqa: F401
+import synapse.lib.stormwhois as s_stormwhois  # noqa: F401
+
 import synapse.lib.stormtypes as s_stormtypes
 
-import synapse.lib.stormlib.hex as s_stormlib_hex  # NOQA
-import synapse.lib.stormlib.log as s_stormlib_log  # NOQA
-import synapse.lib.stormlib.xml as s_stormlib_xml  # NOQA
-import synapse.lib.stormlib.auth as s_stormlib_auth  # NOQA
-import synapse.lib.stormlib.cell as s_stormlib_cell  # NOQA
-import synapse.lib.stormlib.imap as s_stormlib_imap  # NOQA
-import synapse.lib.stormlib.ipv6 as s_stormlib_ipv6  # NOQA
-import synapse.lib.stormlib.json as s_stormlib_json  # NOQA
-import synapse.lib.stormlib.smtp as s_stormlib_smtp  # NOQA
-import synapse.lib.stormlib.stix as s_stormlib_stix  # NOQA
-import synapse.lib.stormlib.yaml as s_stormlib_yaml  # NOQA
+import synapse.lib.stormlib.aha as s_stormlib_aha  # noqa: F401
+import synapse.lib.stormlib.ecc as s_stormlib_ecc  # noqa: F401
+import synapse.lib.stormlib.env as s_stormlib_env  # noqa: F401
+import synapse.lib.stormlib.gen as s_stormlib_gen  # noqa: F401
+import synapse.lib.stormlib.gis as s_stormlib_gis  # noqa: F401
+import synapse.lib.stormlib.hex as s_stormlib_hex  # noqa: F401
+import synapse.lib.stormlib.jwt as s_stormlib_jwt  # noqa: F401
+import synapse.lib.stormlib.log as s_stormlib_log  # noqa: F401
+import synapse.lib.stormlib.pkg as s_stormlib_pkg  # noqa: F401
+import synapse.lib.stormlib.rsa as s_stormlib_rsa  # noqa: F401
+import synapse.lib.stormlib.xml as s_stormlib_xml  # noqa: F401
+import synapse.lib.stormlib.auth as s_stormlib_auth  # noqa: F401
+import synapse.lib.stormlib.cell as s_stormlib_cell  # noqa: F401
+import synapse.lib.stormlib.imap as s_stormlib_imap  # noqa: F401
+import synapse.lib.stormlib.ipv6 as s_stormlib_ipv6  # noqa: F401
+import synapse.lib.stormlib.json as s_stormlib_json  # noqa: F401
+import synapse.lib.stormlib.math as s_stormlib_math  # noqa: F401
+import synapse.lib.stormlib.mime as s_stormlib_mime  # noqa: F401
+import synapse.lib.stormlib.pack as s_stormlib_pack  # noqa: F401
+import synapse.lib.stormlib.smtp as s_stormlib_smtp  # noqa: F401
+import synapse.lib.stormlib.stix as s_stormlib_stix  # noqa: F401
+import synapse.lib.stormlib.task as s_stormlib_task  # noqa: F401
+import synapse.lib.stormlib.yaml as s_stormlib_yaml  # noqa: F401
+import synapse.lib.stormlib.basex as s_stormlib_basex  # noqa: F401
+import synapse.lib.stormlib.cache as s_stormlib_cache  # noqa: F401
+import synapse.lib.stormlib.graph as s_stormlib_graph  # noqa: F401
+import synapse.lib.stormlib.index as s_stormlib_index  # noqa: F401
+import synapse.lib.stormlib.iters as s_stormlib_iters  # noqa: F401
 import synapse.lib.stormlib.macro as s_stormlib_macro
 import synapse.lib.stormlib.model as s_stormlib_model
-import synapse.lib.stormlib.oauth as s_stormlib_oauth  # NOQA
-import synapse.lib.stormlib.storm as s_stormlib_storm  # NOQA
-import synapse.lib.stormlib.backup as s_stormlib_backup  # NOQA
-import synapse.lib.stormlib.scrape as s_stormlib_scrape  # NOQA
-import synapse.lib.stormlib.infosec as s_stormlib_infosec  # NOQA
-import synapse.lib.stormlib.project as s_stormlib_project  # NOQA
-import synapse.lib.stormlib.version as s_stormlib_version  # NOQA
-import synapse.lib.stormlib.ethereum as s_stormlib_ethereum  # NOQA
-import synapse.lib.stormlib.modelext as s_stormlib_modelext  # NOQA
-import synapse.lib.stormlib.notifications as s_stormlib_notifications  # NOQA
+import synapse.lib.stormlib.oauth as s_stormlib_oauth  # noqa: F401
+import synapse.lib.stormlib.stats as s_stormlib_stats  # noqa: F401
+import synapse.lib.stormlib.storm as s_stormlib_storm  # noqa: F401
+import synapse.lib.stormlib.utils as s_stormlib_utils  # noqa: F401
+import synapse.lib.stormlib.vault as s_stormlib_vault  # noqa: F401
+import synapse.lib.stormlib.backup as s_stormlib_backup  # noqa: F401
+import synapse.lib.stormlib.cortex as s_stormlib_cortex  # noqa: F401
+import synapse.lib.stormlib.hashes as s_stormlib_hashes  # noqa: F401
+import synapse.lib.stormlib.quorum as s_stormlib_quorum  # noqa: F401
+import synapse.lib.stormlib.random as s_stormlib_random  # noqa: F401
+import synapse.lib.stormlib.scrape as s_stormlib_scrape   # noqa: F401
+import synapse.lib.stormlib.infosec as s_stormlib_infosec  # noqa: F401
+import synapse.lib.stormlib.project as s_stormlib_project  # noqa: F401
+import synapse.lib.stormlib.spooled as s_stormlib_spooled  # noqa: F401
+import synapse.lib.stormlib.tabular as s_stormlib_tabular  # noqa: F401
+import synapse.lib.stormlib.version as s_stormlib_version  # noqa: F401
+import synapse.lib.stormlib.easyperm as s_stormlib_easyperm  # noqa: F401
+import synapse.lib.stormlib.ethereum as s_stormlib_ethereum  # noqa: F401
+import synapse.lib.stormlib.modelext as s_stormlib_modelext  # noqa: F401
+import synapse.lib.stormlib.viewhook as s_stormlib_viewhook  # noqa: F401
+import synapse.lib.stormlib.compression as s_stormlib_compression  # noqa: F401
+import synapse.lib.stormlib.notifications as s_stormlib_notifications  # noqa: F401
 
 logger = logging.getLogger(__name__)
+
+# the nesting depth of running view hooks, which is inherited by tasks they start
+ViewHookDepth = contextvars.ContextVar('ViewHookDepth', default=0)
+
 stormlogger = logging.getLogger('synapse.storm')
 
 '''
@@ -88,19 +132,7 @@ SYNC_NODEEDIT = 1   # A nodeedit:  (<offs>, 0, <etyp>, (<etype args>))
 SYNC_LAYR_ADD = 3   # A layer was added
 SYNC_LAYR_DEL = 4   # A layer was deleted
 
-# push/pull def
-reqValidPush = s_config.getJsValidator({
-    'type': 'object',
-    'properties': {
-        'url': {'type': 'string'},
-        'time': {'type': 'number'},
-        'iden': {'type': 'string', 'pattern': s_config.re_iden},
-        'user': {'type': 'string', 'pattern': s_config.re_iden},
-    },
-    'additionalProperties': True,
-    'required': ['iden', 'url', 'user', 'time'],
-})
-reqValidPull = reqValidPush
+MAX_NEXUS_DELTA = 3_600
 
 reqValidTagModel = s_config.getJsValidator({
     'type': 'object',
@@ -112,6 +144,32 @@ reqValidTagModel = s_config.getJsValidator({
     'required': [],
 })
 
+reqValidStormMacro = s_config.getJsValidator({
+    'type': 'object',
+    'properties': {
+        'name': {'type': 'string', 'pattern': '^.{1,491}$'},
+        'iden': {'type': 'string', 'pattern': s_config.re_iden},
+        # user kept for backward compat. remove eventually...
+        'user': {'type': 'string', 'pattern': s_config.re_iden},
+        'creator': {'type': 'string', 'pattern': s_config.re_iden},
+        'desc': {'type': 'string', 'default': ''},
+        'storm': {'type': 'string'},
+        'created': {'type': 'number'},
+        'updated': {'type': 'number'},
+        'permissions': s_msgpack.deepcopy(s_schemas.easyPermSchema),
+    },
+    'required': [
+        'name',
+        'iden',
+        'user',
+        'storm',
+        'creator',
+        'created',
+        'updated',
+        'permissions',
+    ],
+})
+
 def cmprkey_indx(x):
     return x[1]
 
@@ -121,6 +179,42 @@ def cmprkey_buid(x):
 async def wrap_liftgenr(iden, genr):
     async for indx, buid, sode in genr:
         yield iden, (indx, buid), sode
+
+class CortexAxonMixin:
+
+    async def allowed(self, perm, default=False, gateiden=None):
+        # wait for the Axon only once the user has the permission
+        if not await super().allowed(perm, default=default, gateiden=gateiden):
+            return False
+
+        try:
+            await self.cell.getAxon()
+        except s_exc.TimeOut as e:
+            self.sendRestExc(e, status_code=http.HTTPStatus.SERVICE_UNAVAILABLE)
+            return False
+
+        return True
+
+    def getAxon(self):
+        return self.cell.axon
+
+    async def getAxonInfo(self):
+        return self.cell.axoninfo
+
+class CortexAxonHttpHasV1(CortexAxonMixin, s_axon.AxonHttpHasV1):
+    pass
+
+class CortexAxonHttpDelV1(CortexAxonMixin, s_axon.AxonHttpDelV1):
+    pass
+
+class CortexAxonHttpUploadV1(CortexAxonMixin, s_axon.AxonHttpUploadV1):
+    pass
+
+class CortexAxonHttpBySha256V1(CortexAxonMixin, s_axon.AxonHttpBySha256V1):
+    pass
+
+class CortexAxonHttpBySha256InvalidV1(CortexAxonMixin, s_axon.AxonHttpBySha256InvalidV1):
+    pass
 
 class CoreApi(s_cell.CellApi):
     '''
@@ -148,11 +242,6 @@ class CoreApi(s_cell.CellApi):
     def getCoreMods(self):
         return self.cell.getCoreMods()
 
-    def stat(self):
-        self.user.confirm(('status',))
-        s_common.deprecated('stat')
-        return self.cell.stat()
-
     async def getModelDict(self):
         '''
         Return a dictionary which describes the data model.
@@ -161,6 +250,15 @@ class CoreApi(s_cell.CellApi):
             (dict): A model description dictionary.
         '''
         return await self.cell.getModelDict()
+
+    async def getFormsByPrefix(self, prefix):
+        '''
+        Return a list of form names which start with the given prefix.
+
+        Returns:
+            (list): A sorted list of matching form names.
+        '''
+        return await self.cell.getFormsByPrefix(prefix)
 
     async def getModelDefs(self):
         return await self.cell.getModelDefs()
@@ -217,207 +315,20 @@ class CoreApi(s_cell.CellApi):
         opts = self._reqValidStormOpts(opts)
         return await self.cell.feedFromAxon(sha256, opts=opts)
 
-    async def addCronJob(self, cdef):
-        '''
-        Add a cron job to the cortex
-
-        A cron job is a persistently-stored item that causes storm queries to be run in the future.  The specification
-        for the times that the queries run can be one-shot or recurring.
-
-        Args:
-            query (str):  The storm query to execute in the future
-            reqs (Union[Dict[str, Union[int, List[int]]], List[Dict[...]]]):
-                Either a dict of the fixed time fields or a list of such dicts.  The keys are in the set ('year',
-                'month', 'dayofmonth', 'dayofweek', 'hour', 'minute'.  The values must be positive integers, except for
-                the key of 'dayofmonth' in which it may also be a negative integer which represents the number of days
-                from the end of the month with -1 representing the last day of the month.  All values may also be lists
-                of valid values.
-            incunit (Optional[str]):
-                A member of the same set as above, with an additional member 'day'.  If is None (default), then the
-                appointment is one-shot and will not recur.
-            incvals (Union[int, List[int]):
-                A integer or a list of integers of the number of units
-
-        Returns (bytes):
-            An iden that can be used to later modify, query, and delete the job.
-
-        Notes:
-            reqs must have fields present or incunit must not be None (or both)
-            The incunit if not None it must be larger in unit size than all the keys in all reqs elements.
-        '''
-        cdef['creator'] = self.user.iden
-
-        s_common.deprecated('addCronJob')
-        self.user.confirm(('cron', 'add'), gateiden='cortex')
-        return await self.cell.addCronJob(cdef)
-
-    async def delCronJob(self, iden):
-        '''
-        Delete a cron job
-
-        Args:
-            iden (bytes):  The iden of the cron job to be deleted
-        '''
-        s_common.deprecated('delCronJob')
-        self.user.confirm(('cron', 'del'), gateiden=iden)
-        await self.cell.delCronJob(iden)
-
-    async def updateCronJob(self, iden, query):
-        '''
-        Change an existing cron job's query
-
-        Args:
-            iden (bytes):  The iden of the cron job to be changed
-        '''
-        s_common.deprecated('updateCronJob')
-        self.user.confirm(('cron', 'set'), gateiden=iden)
-        await self.cell.updateCronJob(iden, query)
-
-    async def enableCronJob(self, iden):
-        '''
-        Enable a cron job
-
-        Args:
-            iden (bytes):  The iden of the cron job to be changed
-        '''
-        s_common.deprecated('enableCronJob')
-        self.user.confirm(('cron', 'set'), gateiden=iden)
-        await self.cell.enableCronJob(iden)
-
-    async def disableCronJob(self, iden):
-        '''
-        Enable a cron job
-
-        Args:
-            iden (bytes):  The iden of the cron job to be changed
-        '''
-        s_common.deprecated('disableCronJob')
-        self.user.confirm(('cron', 'set'), gateiden=iden)
-        await self.cell.disableCronJob(iden)
-
-    async def listCronJobs(self):
-        '''
-        Get information about all the cron jobs accessible to the current user
-        '''
-        s_common.deprecated('listCronJobs')
-
-        crons = []
-        for cron in await self.cell.listCronJobs():
-
-            if not self.user.allowed(('cron', 'get'), gateiden=cron.get('iden')):
-                continue
-
-            crons.append(cron)
-
-        return crons
-
-    async def editCronJob(self, iden, name, valu):
-        '''
-        Update a value in a cron definition.
-        '''
-        iden = str(iden)
-        name = str(name)
-        self.user.confirm(('cron', 'set', name), gateiden=iden)
-        return await self.cell.editCronJob(iden, name, valu)
-
-    async def setStormCmd(self, cdef):
-        '''
-        Set the definition of a pure storm command in the cortex.
-        '''
-        self.user.confirm(('admin', 'cmds'))
-        return await self.cell.setStormCmd(cdef)
-
-    async def delStormCmd(self, name):
-        '''
-        Remove a pure storm command from the cortex.
-        '''
-        self.user.confirm(('admin', 'cmds'))
-        return await self.cell.delStormCmd(name)
-
     async def _reqDefLayerAllowed(self, perms):
         view = self.cell.getView()
         wlyr = view.layers[0]
         self.user.confirm(perms, gateiden=wlyr.iden)
 
-    async def addNodeTag(self, iden, tag, valu=(None, None)):
-        '''
-        Add a tag to a node specified by iden.
-
-        Args:
-            iden (str): A hex encoded node BUID.
-            tag (str):  A tag string.
-            valu (tuple):  A time interval tuple or (None, None).
-        '''
-        s_common.deprecated('addNodeTag')
-        await self._reqDefLayerAllowed(('node', 'tag', 'add', *tag.split('.')))
-        return await self.cell.addNodeTag(self.user, iden, tag, valu)
-
-    async def delNodeTag(self, iden, tag):
-        '''
-        Delete a tag from the node specified by iden. Deprecated in 2.0.0.
-
-        Args:
-            iden (str): A hex encoded node BUID.
-            tag (str):  A tag string.
-        '''
-        s_common.deprecated('delNodeTag')
-        await self._reqDefLayerAllowed(('node', 'tag', 'del', *tag.split('.')))
-        return await self.cell.delNodeTag(self.user, iden, tag)
-
-    async def setNodeProp(self, iden, name, valu):
-        '''
-        Set a property on a single node. Deprecated in 2.0.0.
-        '''
-        s_common.deprecated('setNodeProp')
-        buid = s_common.uhex(iden)
-
-        async with await self.cell.snap(user=self.user) as snap:
-
-            with s_provenance.claim('coreapi', meth='prop:set', user=snap.user.iden):
-
-                node = await snap.getNodeByBuid(buid)
-                if node is None:
-                    raise s_exc.NoSuchIden(iden=iden)
-
-                prop = node.form.props.get(name)
-                self.user.confirm(('node', 'prop', 'set', prop.full), gateiden=snap.wlyr.iden)
-
-                await node.set(name, valu)
-                return node.pack()
-
-    async def delNodeProp(self, iden, name):
-        '''
-        Delete a property from a single node. Deprecated in 2.0.0.
-        '''
-        s_common.deprecated('delNodeProp')
-        buid = s_common.uhex(iden)
-
-        async with await self.cell.snap(user=self.user) as snap:
-
-            with s_provenance.claim('coreapi', meth='prop:del', user=snap.user.iden):
-
-                node = await snap.getNodeByBuid(buid)
-                if node is None:
-                    raise s_exc.NoSuchIden(iden=iden)
-
-                prop = node.form.props.get(name)
-
-                self.user.confirm(('node', 'prop', 'del', prop.full), gateiden=snap.wlyr.iden)
-
-                await node.pop(name)
-                return node.pack()
-
     async def addNode(self, form, valu, props=None):
         '''
         Deprecated in 2.0.0.
         '''
-        s_common.deprecated('addNode')
+        s_common.deprecated('CoreApi.addNode')
         async with await self.cell.snap(user=self.user) as snap:
             self.user.confirm(('node', 'add', form), gateiden=snap.wlyr.iden)
-            with s_provenance.claim('coreapi', meth='node:add', user=snap.user.iden):
-
-                node = await snap.addNode(form, valu, props=props)
-                return node.pack()
+            node = await snap.addNode(form, valu, props=props)
+            return node.pack()
 
     async def addNodes(self, nodes):
         '''
@@ -431,7 +342,7 @@ class CoreApi(s_cell.CellApi):
 
         Deprecated in 2.0.0
         '''
-        s_common.deprecated('addNodes')
+        s_common.deprecated('CoreApi.addNodes')
 
         # First check that that user may add each form
         done = {}
@@ -445,16 +356,14 @@ class CoreApi(s_cell.CellApi):
             done[formname] = True
 
         async with await self.cell.snap(user=self.user) as snap:
-            with s_provenance.claim('coreapi', meth='node:add', user=snap.user.iden):
 
-                snap.strict = False
+            snap.strict = False
+            async for node in snap.addNodes(nodes):
 
-                async for node in snap.addNodes(nodes):
+                if node is not None:
+                    node = node.pack()
 
-                    if node is not None:
-                        node = node.pack()
-
-                    yield node
+                yield node
 
     async def getFeedFuncs(self):
         '''
@@ -474,7 +383,7 @@ class CoreApi(s_cell.CellApi):
 
         view = self.cell.getView(viewiden, user=self.user)
         if view is None:
-            raise s_exc.NoSuchView(iden=viewiden)
+            raise s_exc.NoSuchView(mesg=f'No such view iden={viewiden}', iden=viewiden)
 
         wlyr = view.layers[0]
         parts = name.split('.')
@@ -489,9 +398,8 @@ class CoreApi(s_cell.CellApi):
                                            })
 
         async with await self.cell.snap(user=self.user, view=view) as snap:
-            with s_provenance.claim('feed:data', name=name, user=snap.user.iden):
-                snap.strict = False
-                await snap.addFeedData(name, items)
+            snap.strict = False
+            await snap.addFeedData(name, items)
 
     async def count(self, text, opts=None):
         '''
@@ -506,18 +414,6 @@ class CoreApi(s_cell.CellApi):
         '''
         opts = self._reqValidStormOpts(opts)
         return await self.cell.count(text, opts=opts)
-
-    async def eval(self, text, opts=None):
-        '''
-        Evaluate a storm query and yield packed nodes.
-
-        NOTE: This API is deprecated as of 2.0.0 and will be removed in 3.0.0
-        '''
-        s_common.deprecated('eval')
-        opts = self._reqValidStormOpts(opts)
-        view = self.cell._viewFromOpts(opts)
-        async for pode in view.iterStormPodes(text, opts=opts):
-            yield pode
 
     async def storm(self, text, opts=None):
         '''
@@ -547,23 +443,18 @@ class CoreApi(s_cell.CellApi):
         '''
         return await self.cell.reqValidStorm(text, opts)
 
-    async def watch(self, wdef):
+    async def isValidStorm(self, text, opts=None):
         '''
-        Hook cortex/view/layer watch points based on a specified watch definition.
+        Check if a Storm query is valid without raising an exception.
 
-        Example:
+        Args:
+            text (str): The text of the Storm query to check.
+            opts (dict): A Storm options dictionary.
 
-            wdef = { 'tags': [ 'foo.bar', 'baz.*' ] }
-
-            async for mesg in core.watch(wdef):
-                dostuff(mesg)
+        Returns:
+            (bool, info): A tuple of (True, {}) if valid, or (False, err) if not.
         '''
-        s_common.deprecated('watch')
-        iden = wdef.get('view', self.cell.view.iden)
-        self.user.confirm(('watch',), gateiden=iden)
-
-        async for mesg in self.cell.watch(wdef):
-            yield mesg
+        return await self.cell.isValidStorm(text, opts)
 
     async def syncLayerNodeEdits(self, offs, layriden=None, wait=True):
         '''
@@ -575,84 +466,21 @@ class CoreApi(s_cell.CellApi):
         '''
         layr = self.cell.getLayer(layriden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=layriden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {layriden}', iden=layriden)
 
         self.user.confirm(('sync',), gateiden=layr.iden)
 
         async for item in self.cell.syncLayerNodeEdits(layr.iden, offs, wait=wait):
             yield item
 
-    @s_cell.adminapi()
-    async def splices(self, offs=None, size=None, layriden=None):
-        '''
-        Return the list of splices at the given offset.
-        '''
-        s_common.deprecated('splices')
-        layr = self.cell.getLayer(layriden)
-        count = 0
-        async for mesg in layr.splices(offs=offs, size=size):
-            count += 1
-            if not count % 1000:
-                await asyncio.sleep(0)
-            yield mesg
-
-    @s_cell.adminapi()
-    async def splicesBack(self, offs=None, size=None):
-        '''
-        Return the list of splices backwards from the given offset.
-        '''
-        s_common.deprecated('splicesBack')
-        count = 0
-        async for mesg in self.cell.view.layers[0].splicesBack(offs=offs, size=size):
-            count += 1
-            if not count % 1000:  # pragma: no cover
-                await asyncio.sleep(0)
-            yield mesg
-
-    async def spliceHistory(self):
-        '''
-        Yield splices backwards from the end of the splice log.
-
-        Will only return the user's own splices unless they are an admin.
-        '''
-        s_common.deprecated('spliceHistory')
-        async for splice in self.cell.spliceHistory(self.user):
-            yield splice
-
-    @s_cell.adminapi()
-    async def provStacks(self, offs, size):
-        '''
-        Return stream of (iden, provenance stack) tuples at the given offset.
-        '''
-        count = 0
-        for iden, stack in self.cell.provstor.provStacks(offs, size):
-            count += 1
-            if not count % 1000:
-                await asyncio.sleep(0)
-            yield s_common.ehex(iden), stack
-
-    @s_cell.adminapi()
-    async def getProvStack(self, iden: str):
-        '''
-        Return the provenance stack associated with the given iden.
-
-        Args:
-            iden (str):  the iden of the provenance stack
-
-        Note: the iden appears on each splice entry as the 'prov' property
-        '''
-        if iden is None:
-            return None
-
-        return self.cell.provstor.getProvStack(s_common.uhex(iden))
-
-    async def getPropNorm(self, prop, valu):
+    async def getPropNorm(self, prop, valu, typeopts=None):
         '''
         Get the normalized property value based on the Cortex data model.
 
         Args:
             prop (str): The property to normalize.
             valu: The value to normalize.
+            typeopts: A Synapse type opts dictionary used to further normalize the value.
 
         Returns:
             (tuple): A two item tuple, containing the normed value and the info dictionary.
@@ -661,15 +489,16 @@ class CoreApi(s_cell.CellApi):
             s_exc.NoSuchProp: If the prop does not exist.
             s_exc.BadTypeValu: If the value fails to normalize.
         '''
-        return await self.cell.getPropNorm(prop, valu)
+        return await self.cell.getPropNorm(prop, valu, typeopts=typeopts)
 
-    async def getTypeNorm(self, name, valu):
+    async def getTypeNorm(self, name, valu, typeopts=None):
         '''
         Get the normalized type value based on the Cortex data model.
 
         Args:
             name (str): The type to normalize.
             valu: The value to normalize.
+            typeopts: A Synapse type opts dictionary used to further normalize the value.
 
         Returns:
             (tuple): A two item tuple, containing the normed value and the info dictionary.
@@ -678,7 +507,16 @@ class CoreApi(s_cell.CellApi):
             s_exc.NoSuchType: If the type does not exist.
             s_exc.BadTypeValu: If the value fails to normalize.
         '''
-        return await self.cell.getTypeNorm(name, valu)
+        return await self.cell.getTypeNorm(name, valu, typeopts=typeopts)
+
+    async def addType(self, typename, basetype, typeopts, typeinfo):
+        '''
+        Add an extended type to the data model.
+
+        Extended types must begin with _
+        '''
+        self.user.confirm(('model', 'type', 'add', typename))
+        return await self.cell.addType(typename, basetype, typeopts, typeinfo)
 
     async def addForm(self, formname, basetype, typeopts, typeinfo):
         '''
@@ -751,9 +589,18 @@ class CoreApi(s_cell.CellApi):
         self.user.confirm(('model', 'tagprop', 'del'))
         return await self.cell.delTagProp(name)
 
-    async def addStormPkg(self, pkgdef):
+    async def addEdge(self, edge, edgeinfo):
+        '''
+        Add an extended edge definition to the data model.
+
+        Extended edge definitions must use a verb which begins with _
+        '''
+        self.user.confirm(('model', 'edge', 'add'))
+        return await self.cell.addEdge(edge, edgeinfo)
+
+    async def addStormPkg(self, pkgdef, verify=False):
         self.user.confirm(('pkg', 'add'))
-        return await self.cell.addStormPkg(pkgdef)
+        return await self.cell.addStormPkg(pkgdef, verify=verify)
 
     async def delStormPkg(self, iden):
         self.user.confirm(('pkg', 'del'))
@@ -799,14 +646,6 @@ class CoreApi(s_cell.CellApi):
     async def delStormDmon(self, iden):
         return await self.cell.delStormDmon(iden)
 
-    @s_cell.adminapi(log=True)
-    async def enableMigrationMode(self):
-        await self.cell._enableMigrationMode()
-
-    @s_cell.adminapi(log=True)
-    async def disableMigrationMode(self):
-        await self.cell._disableMigrationMode()
-
     @s_cell.adminapi()
     async def cloneLayer(self, iden, ldef=None):
 
@@ -850,7 +689,8 @@ class CoreApi(s_cell.CellApi):
         Returns:
             AsyncIterator[Tuple(buid, valu)]
         '''
-        self.user.confirm(('layer', 'lift', layriden))
+        if not self.user.allowed(('layer', 'lift', layriden)):
+            self.user.confirm(('layer', 'read', layriden))
         async for item in self.cell.iterFormRows(layriden, form, stortype=stortype, startvalu=startvalu):
             yield item
 
@@ -868,7 +708,8 @@ class CoreApi(s_cell.CellApi):
         Returns:
             AsyncIterator[Tuple(buid, valu)]
         '''
-        self.user.confirm(('layer', 'lift', layriden))
+        if not self.user.allowed(('layer', 'lift', layriden)):
+            self.user.confirm(('layer', 'read', layriden))
         async for item in self.cell.iterPropRows(layriden, form, prop, stortype=stortype, startvalu=startvalu):
             yield item
 
@@ -885,7 +726,8 @@ class CoreApi(s_cell.CellApi):
         Returns:
             AsyncIterator[Tuple(buid, valu)]
         '''
-        self.user.confirm(('layer', 'lift', layriden))
+        if not self.user.allowed(('layer', 'lift', layriden)):
+            self.user.confirm(('layer', 'read', layriden))
         async for item in self.cell.iterUnivRows(layriden, prop, stortype=stortype, startvalu=startvalu):
             yield item
 
@@ -906,7 +748,8 @@ class CoreApi(s_cell.CellApi):
             This yields (buid, (tagvalu, form)) instead of just buid, valu in order to allow resuming an interrupted
             call by feeding the last value retrieved into starttupl
         '''
-        self.user.confirm(('layer', 'lift', layriden))
+        if not self.user.allowed(('layer', 'lift', layriden)):
+            self.user.confirm(('layer', 'read', layriden))
         async for item in self.cell.iterTagRows(layriden, tag, form=form, starttupl=starttupl):
             yield item
 
@@ -925,32 +768,21 @@ class CoreApi(s_cell.CellApi):
         Returns:
             AsyncIterator[Tuple(buid, valu)]
         '''
-        self.user.confirm(('layer', 'lift', layriden))
+        if not self.user.allowed(('layer', 'lift', layriden)):
+            self.user.confirm(('layer', 'read', layriden))
         async for item in self.cell.iterTagPropRows(layriden, tag, prop, form=form, stortype=stortype,
                                                     startvalu=startvalu):
             yield item
 
-    async def getPermDef(self, perm):
-        '''
-        Return a perm definition if it is present in getPermDefs() output.
-        '''
-        return await self.cell.getPermDef(perm)
-
-    async def getPermDefs(self):
-        '''
-        Return a non-comprehensive list of perm definitions.
-        '''
-        return await self.cell.getPermDefs()
-
     async def getAxonUpload(self):
         self.user.confirm(('axon', 'upload'))
-        await self.cell.axready.wait()
+        await self.cell.getAxon()
         upload = await self.cell.axon.upload()
         return await s_axon.UpLoadProxy.anit(self.link, upload)
 
     async def getAxonBytes(self, sha256):
         self.user.confirm(('axon', 'get'))
-        await self.cell.axready.wait()
+        await self.cell.getAxon()
         async for byts in self.cell.axon.get(s_common.uhex(sha256)):
             yield byts
 
@@ -976,7 +808,215 @@ class CoreApi(s_cell.CellApi):
         async for item in self.cell.watchAllUserNotifs(offs=offs):
             yield item
 
-class Cortex(s_cell.Cell):  # type: ignore
+    @s_cell.adminapi()
+    async def getHttpExtApiByPath(self, path):
+        return await self.cell.getHttpExtApiByPath(path)
+
+    async def getViewDef(self, iden):
+        '''
+        Get a view definition by iden.
+        '''
+        return await self.cell.getViewDef(iden, user=self.user)
+
+    async def _reqVaultUser(self, user):
+        if user is None or user == self.user.iden:
+            return self.user
+
+        self.user.reqAdmin()
+        return await self.cell.auth.reqUser(user)
+
+    async def getVaults(self, *, user=None):
+        '''
+        Get the vaults a user can read.
+
+        Args:
+            user (str|None): The iden of the user to check permissions for. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Notes:
+            Vault secrets are removed unless the user has edit permission on the vault.
+
+        Raises:
+            synapse.exc.AuthDeny: A non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+
+        Returns:
+            list: A list of vault definitions.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.getVaults(user=user)
+
+    async def getVault(self, iden, *, user=None):
+        '''
+        Get a vault by iden.
+
+        Args:
+            iden (str): The iden of the vault.
+            user (str|None): The iden of the user to check permissions for. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Notes:
+            Vault secrets are removed unless the user has edit permission on the vault.
+
+        Raises:
+            synapse.exc.AuthDeny: The user does not have read permission on the vault, or a
+                non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+
+        Returns:
+            dict|None: The vault definition, or None if the vault does not exist.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.getVault(iden, user=user)
+
+    async def getVaultByName(self, name, *, user=None):
+        '''
+        Get a vault by name.
+
+        Args:
+            name (str): The name of the vault.
+            user (str|None): The iden of the user to check permissions for. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Notes:
+            Vault secrets are removed unless the user has edit permission on the vault.
+
+        Raises:
+            synapse.exc.AuthDeny: The user does not have read permission on the vault, or a
+                non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+
+        Returns:
+            dict|None: The vault definition, or None if the vault does not exist.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.getVaultByName(name, user=user)
+
+    async def getVaultByType(self, vtype, *, scope=None, user=None):
+        '''
+        Get the vault of a given type for a user.
+
+        If `scope` is not specified, the user, role, and global scopes are searched in that order.
+
+        Args:
+            vtype (str): The vault type.
+            scope (str|None): The vault scope to get (user, role, or global).
+            user (str|None): The iden of the user to get the vault for. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Notes:
+            Vault secrets are removed unless the user has edit permission on the vault.
+
+        Raises:
+            synapse.exc.BadArg: An invalid scope was specified.
+            synapse.exc.AuthDeny: The user does not have read permission on the vault, or a
+                non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+
+        Returns:
+            dict|None: The vault definition, or None if no matching vault exists.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.getVaultByType(vtype, user.iden, scope=scope, user=user)
+
+    async def addVault(self, vdef, *, user=None):
+        '''
+        Add a vault.
+
+        Non-admin users may only add unscoped vaults and user vaults they own.
+
+        Args:
+            vdef (dict): The vault definition, containing name, type, scope, owner, secrets, and configs.
+            user (str|None): The iden of the user to add the vault as. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Raises:
+            synapse.exc.AuthDeny: The user may not add the vault, or a non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+            synapse.exc.DupName: A vault with the same name, or type, scope, and owner already exists.
+            synapse.exc.SchemaViolation: The vault definition is invalid.
+
+        Returns:
+            str: The iden of the new vault.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.addVault(vdef, user=user)
+
+    async def modVault(self, vdef, *, user=None):
+        '''
+        Replace a vault with a full vault definition.
+
+        Changing the vault configs, secrets, or name requires edit permission on the vault.
+        Changing the vault permissions requires admin permission on the vault. The vault
+        type, scope, and owner cannot be changed.
+
+        Args:
+            vdef (dict): The full vault definition, including the vault iden.
+            user (str|None): The iden of the user to modify the vault as. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Raises:
+            synapse.exc.AuthDeny: The user does not have the required permission on the vault,
+                or a non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+            synapse.exc.NoSuchIden: The vault does not exist.
+            synapse.exc.BadArg: The vault definition changes an immutable field or is invalid.
+            synapse.exc.SchemaViolation: The vault definition is invalid.
+
+        Returns:
+            dict: The updated vault definition.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.modVault(vdef, user=user)
+
+    async def setVaultPerm(self, viden, iden, level, *, user=None):
+        '''
+        Set the permission level of a user or role on a vault.
+
+        Requires admin permission on the vault.
+
+        Args:
+            viden (str): The iden of the vault.
+            iden (str): The iden of the user or role to set the permission for.
+            level (int|None): The permission level, or None to remove the permission.
+            user (str|None): The iden of the user to set the permission as. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Raises:
+            synapse.exc.AuthDeny: The user does not have admin permission on the vault, or a
+                non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+            synapse.exc.NoSuchIden: The vault, or user or role, does not exist.
+
+        Returns:
+            dict: The updated vault definition.
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.setVaultPerm(viden, iden, level, user=user)
+
+    async def delVault(self, iden, *, user=None):
+        '''
+        Delete a vault.
+
+        Requires admin permission on the vault.
+
+        Args:
+            iden (str): The iden of the vault.
+            user (str|None): The iden of the user to delete the vault as. Defaults to the caller.
+                Specifying another user requires admin.
+
+        Raises:
+            synapse.exc.AuthDeny: The user does not have admin permission on the vault, or a
+                non-admin specified another user.
+            synapse.exc.NoSuchUser: The specified user does not exist.
+
+        Returns:
+            None
+        '''
+        user = await self._reqVaultUser(user)
+        return await self.cell.delVault(iden, user=user)
+
+class Cortex(s_oauth.OAuthMixin, s_cell.Cell):  # type: ignore
     '''
     A Cortex implements the synapse hypergraph.
 
@@ -992,6 +1032,12 @@ class Cortex(s_cell.Cell):  # type: ignore
     confbase['mirror']['hidedocs'] = False  # type: ignore
     confbase['mirror']['hidecmdl'] = False  # type: ignore
 
+    confbase['safemode']['hidecmdl'] = False
+    confbase['safemode']['description'] = (
+        'Enable safe-mode which disables crons, triggers, dmons, storm '
+        'package onload handlers, view merge tasks, and storm pools.'
+    )
+
     confdefs = {
         'axon': {
             'description': 'A telepath URL for a remote axon.',
@@ -1003,23 +1049,27 @@ class Cortex(s_cell.Cell):  # type: ignore
         },
         'cron:enable': {
             'default': True,
-            'description': 'Enable cron jobs running.',
+            'description': 'Deprecated. This option no longer controls cron execution and will be removed in Synapse 3.0.',
             'type': 'boolean'
         },
         'trigger:enable': {
             'default': True,
-            'description': 'Enable triggers running.',
+            'description': 'Deprecated. This option no longer controls trigger execution and will be removed in Synapse 3.0.',
             'type': 'boolean'
         },
         'layer:lmdb:map_async': {
             'default': True,
-            'description': 'Set the default lmdb:map_async value in LMDB layers.',
-            'type': 'boolean'
+            'description': 'Deprecated. This value is ignored.',
+            'type': 'boolean',
+            'hidecmdl': True,
+            'hideconf': True,
         },
         'layer:lmdb:max_replay_log': {
             'default': 10000,
-            'description': 'Set the max size of the replay log for all layers.',
-            'type': 'integer'
+            'description': 'Deprecated. This value is ignored.',
+            'type': 'integer',
+            'hidecmdl': True,
+            'hideconf': True,
         },
         'layers:lockmemory': {
             'default': False,
@@ -1031,10 +1081,16 @@ class Cortex(s_cell.Cell):  # type: ignore
             'description': 'Whether nodeedits are logged in each layer.',
             'type': 'boolean'
         },
-        'provenance:en': {
+        'layers:cache:size': {
+            'default': None,
+            'description': 'Default buid cache size for new layers.',
+            'type': ['integer', 'null'],
+        },
+        'provenance:en': {  # TODO: Remove in 3.0.0
             'default': False,
-            'description': 'Enable provenance tracking for all writes.',
-            'type': 'boolean'
+            'description': 'This no longer does anything.',
+            'type': 'boolean',
+            'hideconf': True,
         },
         'max:nodes': {
             'description': 'Maximum number of nodes which are allowed to be stored in a Cortex.',
@@ -1044,7 +1100,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         },
         'modules': {
             'default': [],
-            'description': 'A list of module classes to load.',
+            'description': 'Deprecated. A list of module classes to load.',
             'type': 'array'
         },
         'storm:log': {
@@ -1083,7 +1139,8 @@ class Cortex(s_cell.Cell):  # type: ignore
     cellapi = CoreApi
     viewapi = s_view.ViewApi
     layerapi = s_layer.LayerApi
-    hiveapi = s_hive.HiveApi
+
+    _mcp_ctor = s_mcp.CortexMcp
 
     viewctor = s_view.View.anit
     layrctor = s_layer.Layer.anit
@@ -1092,29 +1149,39 @@ class Cortex(s_cell.Cell):  # type: ignore
     async def initServiceStorage(self):
 
         # NOTE: we may not make *any* nexus actions in this method
+        self.macrodb = self.slab.initdb('storm:macros')
+        self.httpextapidb = self.slab.initdb('http:ext:apis')
+        self.viewhookdb = self.slab.initdb('view:hooks')
 
         if self.inaugural:
-            await self.cellinfo.set('cortex:version', s_version.version)
+            self.cellinfo.set('cortex:version', s_version.version)
 
         corevers = self.cellinfo.get('cortex:version')
         s_version.reqVersion(corevers, reqver, exc=s_exc.BadStorageVersion,
                              mesg='cortex version in storage is incompatible with running software')
+
+        self.viewmeta = self.slab.initdb('view:meta')
 
         self.views = {}
         self.layers = {}
         self.viewsbylayer = collections.defaultdict(list)
 
         self.modules = {}
-        self.splicers = {}
         self.feedfuncs = {}
         self.stormcmds = {}
 
         self.maxnodes = self.conf.get('max:nodes')
         self.nodecount = 0
 
+        self.migration = False
+        self._migration_lock = asyncio.Lock()
+        if __debug__:
+            self._migration_evnt = asyncio.Event()
+
         self.stormmods = {}     # name: mdef
         self.stormpkgs = {}     # name: pkgdef
-        self.stormvars = None   # type: s_hive.HiveDict
+        self.stormvars = None   # type: s_lmdbslab.SafeKeyVal
+        self.stormpkgvars = {}  # type: Dict[str, s_lmdbslab.SafeKeyVal]
 
         self.svcsbyiden = {}
         self.svcsbyname = {}
@@ -1125,42 +1192,48 @@ class Cortex(s_cell.Cell):  # type: ignore
         self._runtPropSetFuncs = {}
         self._runtPropDelFuncs = {}
 
-        self.ontagadds = collections.defaultdict(list)
-        self.ontagdels = collections.defaultdict(list)
-        self.ontagaddglobs = s_cache.TagGlobs()
-        self.ontagdelglobs = s_cache.TagGlobs()
-
         self.tagvalid = s_cache.FixedCache(self._isTagValid, size=1000)
         self.tagprune = s_cache.FixedCache(self._getTagPrune, size=1000)
 
-        self.permdefs = None
-        self.permlook = None
-
         self.querycache = s_cache.FixedCache(self._getStormQuery, size=10000)
 
+        # $lib.crypto.jwt JWKS caches: jwks_uri -> (expiry_epoch_seconds, jwkset) and
+        # jwks_uri -> asyncio.Lock for per-uri single-flight fetching.
+        self.jwkscache = {}
+        self.jwkslocks = {}
+
+        self.stormpool = None
+        self.stormpoolurl = None
+        self.stormpoolopts = None
+
         self.libroot = (None, {}, {})
+        self.stormlibs = []
+
         self.bldgbuids = {}  # buid -> (Node, Event)  Nodes under construction
 
         self.axon = None  # type: s_axon.AxonApi
+        self.jsonstor = None  # type: s_jsonstor.JsonStorApi
         self.axready = asyncio.Event()
+        self.axoninfo = {}
+
+        self.nodeeditwindows = set()
 
         self.view = None  # The default/main view
 
-        proven = self.conf.get('provenance:en')
-
-        self.provstor = await s_provenance.ProvStor.anit(self.dirn, proven=proven)
-        self.onfini(self.provstor.fini)
+        self._cortex_permdefs = []
+        self._initCorePerms()
 
         # Reset the storm:log:level from the config value to an int for internal use.
-        self.conf['storm:log:level'] = s_common.normLogLevel(self.conf.get('storm:log:level'))
+        self.conf['storm:log:level'] = s_logging.normLogLevel(self.conf.get('storm:log:level'))
         self.stormlog = self.conf.get('storm:log')
         self.stormloglvl = self.conf.get('storm:log:level')
 
         # generic fini handler for the Cortex
         self.onfini(self._onCoreFini)
 
-        await self._initCoreHive()
-        self._initSplicers()
+        self.cortexdata = self.slab.getSafeKeyVal('cortex')
+
+        await self._initCoreInfo()
         self._initStormLibs()
         self._initFeedFuncs()
 
@@ -1169,8 +1242,28 @@ class Cortex(s_cell.Cell):  # type: ignore
         self.stormiface_scrape = self.conf.get('storm:interface:scrape')
 
         self._initCortexHttpApi()
+        self._exthttpapis = {}  # iden -> adef; relies on cpython ordered dictionary behavior.
+        self._exthttpapiorder = b'exthttpapiorder'
+        self._exthttpapicache = s_cache.FixedCache(self._getHttpExtApiByPath, size=1000)
+        self._initCortexExtHttpApi()
 
-        self.model = s_datamodel.Model()
+        self.viewhooks = {}  # iden -> hdef
+        self._initViewHooks()
+
+        self.model = s_datamodel.Model(core=self)
+
+        await self._bumpCellVers('cortex:extmodel', (
+            (1, self._migrateTaxonomyIface),
+        ), nexs=False)
+
+        await self._bumpCellVers('cortex:storage', (
+            (1, self._storUpdateMacros),
+            (4, self._storCortexHiveMigration),
+            (5, self._storCleanQueueAuthGates),
+            (6, self._storCleanCronAuthGates),
+            (7, self._storMigrDmonDdefView),
+            (8, self._storBackfillCreated),
+        ), nexs=False)
 
         # Perform module loading
         await self._loadCoreMods()
@@ -1179,6 +1272,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         # Initialize our storage and views
         await self._initCoreAxon()
+        await self._initJsonStor()
 
         await self._initCoreLayers()
         await self._initCoreViews()
@@ -1187,27 +1281,27 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         self.addHealthFunc(self._cortexHealth)
 
+        await self._initOAuthManager()
+
+        self.stormdmondefs = self.cortexdata.getSubKeyVal('storm:dmons:')
         self.stormdmons = await s_storm.DmonManager.anit(self)
         self.onfini(self.stormdmons)
-        self.agenda = await s_agenda.Agenda.anit(self)
-        self.onfini(self.agenda)
         await self._initStormDmons()
 
-        self.trigson = self.conf.get('trigger:enable')
+        self.agenda = await s_agenda.Agenda.anit(self)
+        self.onfini(self.agenda)
+
+        await self._initStormGraphs()
 
         await self._initRuntFuncs()
 
-        taghive = await self.hive.open(('cortex', 'tagmeta'))
-        cmdhive = await self.hive.open(('cortex', 'storm', 'cmds'))
-        pkghive = await self.hive.open(('cortex', 'storm', 'packages'))
-        svchive = await self.hive.open(('cortex', 'storm', 'services'))
-
-        self.taghive = await taghive.dict()
-        self.cmdhive = await cmdhive.dict()
-        self.pkghive = await pkghive.dict()
-        self.svchive = await svchive.dict()
+        self.tagmeta = self.cortexdata.getSubKeyVal('tagmeta:')
+        self.cmddefs = self.cortexdata.getSubKeyVal('storm:cmds:')
+        self.pkgdefs = self.cortexdata.getSubKeyVal('storm:packages:')
+        self.svcdefs = self.cortexdata.getSubKeyVal('storm:services:')
 
         await self._initDeprLocks()
+        await self._warnDeprLocks()
 
         # Finalize coremodule loading & give svchive a shot to load
         await self._initPureStormCmds()
@@ -1218,7 +1312,380 @@ class Cortex(s_cell.Cell):  # type: ignore
             'multiqueue': self.multiqueue,
         })
 
-        await self.auth.addAuthGate('cortex', 'cortex')
+        # TODO - Remove this in 3.0.0
+        ag = await self.auth.addAuthGate('cortex', 'cortex')
+        for useriden in ag.gateusers.keys():
+            user = self.auth.user(useriden)
+            if user is None:
+                continue
+
+            mesg = f'User {useriden} ({user.name}) has a rule on the "cortex" authgate. This authgate is not used ' \
+                   f'for permission checks and will be removed in Synapse v3.0.0.'
+            logger.warning(mesg)
+        for roleiden in ag.gateroles.keys():
+            role = self.auth.role(roleiden)
+            if role is None:
+                continue
+
+            mesg = f'Role {roleiden} ({role.name}) has a rule on the "cortex" authgate. This authgate is not used ' \
+                   f'for permission checks and will be removed in Synapse v3.0.0.'
+            logger.warning(mesg)
+
+        self._initVaults()
+
+    async def _storCortexHiveMigration(self):
+
+        logger.warning('migrating Cortex data out of hive')
+
+        viewdefs = self.cortexdata.getSubKeyVal('view:info:')
+        async with await self.hive.open(('cortex', 'views')) as viewnodes:
+            for view_iden, node in viewnodes:
+                viewdict = await node.dict()
+                viewinfo = viewdict.pack()
+                viewinfo.setdefault('iden', view_iden)
+                viewdefs.set(view_iden, viewinfo)
+
+                trigdict = self.cortexdata.getSubKeyVal(f'view:{view_iden}:trigger:')
+                async with await node.open(('triggers',)) as trignodes:
+                    for iden, trig in trignodes:
+                        valu = trig.valu
+                        if valu.get('view', s_common.novalu) != view_iden:
+                            valu['view'] = view_iden
+                        trigdict.set(iden, valu)
+
+        layrdefs = self.cortexdata.getSubKeyVal('layer:info:')
+        async with await self.hive.open(('cortex', 'layers')) as layrnodes:
+            for iden, node in layrnodes:
+                layrdict = await node.dict()
+                layrinfo = layrdict.pack()
+                pushs = layrinfo.get('pushs', {})
+                if pushs:
+                    for pdef in pushs.values():
+                        pdef.setdefault('chunk:size', s_const.layer_pdef_csize)
+                        pdef.setdefault('queue:size', s_const.layer_pdef_qsize)
+
+                pulls = layrinfo.get('pulls', {})
+                if pulls:
+                    pulls = layrinfo.get('pulls', {})
+                    for pdef in pulls.values():
+                        pdef.setdefault('chunk:size', s_const.layer_pdef_csize)
+                        pdef.setdefault('queue:size', s_const.layer_pdef_qsize)
+
+                layrdefs.set(iden, layrinfo)
+
+        migrs = (
+            (('agenda', 'appts'), 'agenda:appt:'),
+            (('cortex', 'tagmeta'), 'tagmeta:'),
+            (('cortex', 'storm', 'cmds'), 'storm:cmds:'),
+            (('cortex', 'storm', 'vars'), 'storm:vars:'),
+            (('cortex', 'storm', 'dmons'), 'storm:dmons:'),
+            (('cortex', 'storm', 'packages'), 'storm:packages:'),
+            (('cortex', 'storm', 'services'), 'storm:services:'),
+            (('cortex', 'model', 'forms'), 'model:forms:'),
+            (('cortex', 'model', 'props'), 'model:props:'),
+            (('cortex', 'model', 'univs'), 'model:univs:'),
+            (('cortex', 'model', 'tagprops'), 'model:tagprops:'),
+            (('cortex', 'model', 'deprlocks'), 'model:deprlocks:'),
+        )
+
+        for hivepath, kvpref in migrs:
+            subkv = self.cortexdata.getSubKeyVal(kvpref)
+            async with await self.hive.open(hivepath) as hivenode:
+                for name, node in hivenode:
+                    subkv.set(name, node.valu)
+
+        logger.warning('...Cortex data migration complete!')
+
+    async def _viewNomergeToProtected(self):
+        for view in self.views.values():
+            nomerge = view.info.get('nomerge', False)
+            await view.setViewInfo('protected', nomerge)
+            await view.setViewInfo('nomerge', None)
+
+    async def _storCleanQueueAuthGates(self):
+
+        logger.warning('removing AuthGates for Queues which no longer exist')
+
+        path = os.path.join(self.dirn, 'slabs', 'queues.lmdb')
+
+        async with await s_lmdbslab.Slab.anit(path) as slab:
+            async with await slab.getMultiQueue('cortex:queue', nexsroot=self.nexsroot) as multiqueue:
+                for info in self.auth.getAuthGates():
+                    if info.type == 'queue':
+                        iden = info.iden
+                        name = info.iden.split(':', 1)[1]
+                        if not multiqueue.exists(name):
+                            await self.auth.delAuthGate(info.iden)
+
+        logger.warning('...Queue AuthGate cleanup complete!')
+
+    async def _storCleanCronAuthGates(self):
+
+        logger.warning('removing AuthGates for CronJobs which no longer exist')
+
+        apptdefs = self.cortexdata.getSubKeyVal('agenda:appt:')
+
+        for info in self.auth.getAuthGates():
+            if info.type == 'cronjob':
+                if apptdefs.get(info.iden) is None:
+                    await self.auth.delAuthGate(info.iden)
+
+        logger.warning('...CronJob AuthGate cleanup complete!')
+
+    async def _storMigrDmonDdefView(self):
+        logger.warning('migrating storm dmon ddefs to remove top-level view key')
+        validkeys = ('name', 'storm', 'user', 'iden', 'enabled', 'stormopts')
+        subkv = self.cortexdata.getSubKeyVal('storm:dmons:')
+        for iden, ddef in subkv.items():
+            extrakeys = [k for k in ddef if k not in validkeys]
+            if extrakeys:
+                for k in extrakeys:
+                    ddef.pop(k)
+                subkv.set(iden, ddef)
+        logger.warning('...storm dmon ddef migration complete!')
+
+    async def _storBackfillCreated(self):
+        logger.warning('backfilling created on views, layers, cron jobs, and triggers')
+
+        def backfill(subkv):
+            for iden, info in subkv.items():
+                if info.get('created') is None:
+                    info['created'] = 0
+                    subkv.set(iden, info)
+
+        backfill(self.cortexdata.getSubKeyVal('layer:info:'))
+        backfill(self.cortexdata.getSubKeyVal('agenda:appt:'))
+
+        viewdefs = self.cortexdata.getSubKeyVal('view:info:')
+        backfill(viewdefs)
+
+        for iden in list(viewdefs.keys()):
+            backfill(self.cortexdata.getSubKeyVal(f'view:{iden}:trigger:'))
+
+        logger.warning('...created backfill complete!')
+
+    async def _storUpdateMacros(self):
+        for name, node in await self.hive.open(('cortex', 'storm', 'macros')):
+
+            try:
+
+                info = {
+                    'name': name,
+                    'storm': node.valu.get('storm'),
+                }
+
+                user = node.valu.get('user')
+                if user is not None:
+                    info['user'] = user
+
+                created = node.valu.get('created')
+                if created is not None:
+                    info['created'] = created
+
+                edited = node.valu.get('edited')
+                if edited is not None:
+                    info['updated'] = edited
+
+                    if info.get('created') is None:
+                        info['created'] = edited
+
+                mdef = self._initStormMacro(info)
+
+                await self._addStormMacro(mdef)
+
+            except Exception as e:
+                logger.exception(f'Macro migration error for macro: {name} (skipped).')
+
+    def getStormMacro(self, name, user=None):
+
+        if not name:
+            raise s_exc.BadArg(mesg='Macro names must be at least 1 character long')
+
+        if len(name) > 491:
+            raise s_exc.BadArg(mesg='Macro names may only be up to 491 chars.')
+
+        byts = self.slab.get(name.encode(), db=self.macrodb)
+        if byts is None:
+            return None
+
+        mdef = s_msgpack.un(byts)
+
+        if user is not None:
+            mesg = f'User requires read permission on macro: {name}.'
+            self._reqEasyPerm(mdef, user, s_cell.PERM_READ, mesg=mesg)
+
+        return mdef
+
+    def reqStormMacro(self, name, user=None):
+
+        mdef = self.getStormMacro(name)
+        if mdef is None:
+            raise s_exc.NoSuchName(mesg=f'Macro name not found: {name}')
+
+        if user is not None:
+            mesg = f'User requires read permission on macro: {name}.'
+            self._reqEasyPerm(mdef, user, s_cell.PERM_READ, mesg=mesg)
+
+        return mdef
+
+    def _reqStormMacroPerm(self, user, name, level):
+        mdef = self.reqStormMacro(name)
+        mesg = f'User requires {s_cell.permnames.get(level)} permission on macro: {name}'
+
+        if level == s_cell.PERM_EDIT and (
+            user.allowed(('storm', 'macro', 'edit')) or
+            user.allowed(('storm', 'macro', 'admin'))):
+            return mdef
+
+        if level == s_cell.PERM_ADMIN and user.allowed(('storm', 'macro', 'admin')):
+            return mdef
+
+        self._reqEasyPerm(mdef, user, level, mesg=mesg)
+        return mdef
+
+    async def addStormMacro(self, mdef, user=None):
+
+        if user is None:
+            user = self.auth.rootuser
+
+        user.confirm(('storm', 'macro', 'add'), default=True)
+
+        mdef = self._initStormMacro(mdef, user=user)
+
+        reqValidStormMacro(mdef)
+
+        return await self._push('storm:macro:add', mdef)
+
+    def _initStormMacro(self, mdef, user=None):
+
+        if user is None:
+            user = self.auth.rootuser
+
+        mdef['iden'] = s_common.guid()
+
+        now = s_common.now()
+
+        mdef.setdefault('updated', now)
+        mdef.setdefault('created', now)
+
+        useriden = mdef.get('user', user.iden)
+
+        mdef['user'] = useriden
+        mdef['creator'] = useriden
+
+        mdef.setdefault('storm', '')
+        self._initEasyPerm(mdef)
+
+        mdef['permissions']['users'][useriden] = s_cell.PERM_ADMIN
+
+        return mdef
+
+    @s_nexus.Pusher.onPush('storm:macro:add')
+    async def _addStormMacro(self, mdef):
+        name = mdef.get('name')
+        reqValidStormMacro(mdef)
+
+        # idempotency protection...
+        oldv = self.getStormMacro(name)
+        if oldv is not None and oldv.get('iden') != mdef.get('iden'):
+            raise s_exc.BadArg(mesg=f'Duplicate macro name: {name}')
+
+        self.slab.put(name.encode(), s_msgpack.en(mdef), db=self.macrodb)
+        await self.feedBeholder('storm:macro:add', {'macro': mdef})
+        return mdef
+
+    async def delStormMacro(self, name, user=None):
+
+        if user is not None:
+            self._reqStormMacroPerm(user, name, s_cell.PERM_ADMIN)
+
+        return await self._push('storm:macro:del', name)
+
+    @s_nexus.Pusher.onPush('storm:macro:del')
+    async def _delStormMacro(self, name):
+        if not name:
+            raise s_exc.BadArg(mesg='Macro names must be at least 1 character long')
+
+        byts = self.slab.pop(name.encode(), db=self.macrodb)
+
+        if byts is not None:
+            macro = s_msgpack.un(byts)
+            await self.feedBeholder('storm:macro:del', {'name': name, 'iden': macro.get('iden')})
+            return macro
+
+    async def modStormMacro(self, name, info, user=None):
+        if user is not None:
+            self._reqStormMacroPerm(user, name, s_cell.PERM_EDIT)
+        return await self._push('storm:macro:mod', name, info)
+
+    @s_nexus.Pusher.onPush('storm:macro:mod')
+    async def _modStormMacro(self, name, info):
+
+        mdef = self.getStormMacro(name)
+        if mdef is None:
+            return
+
+        mdef.update(info)
+
+        reqValidStormMacro(mdef)
+
+        newname = info.get('name')
+        if newname is not None and newname != name:
+
+            byts = self.slab.get(newname.encode(), db=self.macrodb)
+            if byts is not None:
+                raise s_exc.DupName(mesg=f'A macro named {newname} already exists!', name=newname)
+
+            self.slab.put(newname.encode(), s_msgpack.en(mdef), db=self.macrodb)
+            self.slab.pop(name.encode(), db=self.macrodb)
+        else:
+            self.slab.put(name.encode(), s_msgpack.en(mdef), db=self.macrodb)
+
+        await self.feedBeholder('storm:macro:mod', {'macro': mdef, 'info': info})
+        return mdef
+
+    async def setStormMacroPerm(self, name, scope, iden, level, user=None):
+
+        if user is not None:
+            self._reqStormMacroPerm(user, name, s_cell.PERM_ADMIN)
+
+        return await self._push('storm:macro:set:perm', name, scope, iden, level)
+
+    @s_nexus.Pusher.onPush('storm:macro:set:perm')
+    async def _setStormMacroPerm(self, name, scope, iden, level):
+
+        mdef = self.reqStormMacro(name)
+        await self._setEasyPerm(mdef, scope, iden, level)
+
+        reqValidStormMacro(mdef)
+
+        self.slab.put(name.encode(), s_msgpack.en(mdef), db=self.macrodb)
+
+        info = {
+            'scope': scope,
+            'iden': iden,
+            'level': level
+        }
+
+        await self.feedBeholder('storm:macro:set:perm', {'macro': mdef, 'info': info})
+        return mdef
+
+    async def getStormMacros(self, user=None):
+
+        retn = []
+
+        for lkey, byts in self.slab.scanByFull(db=self.macrodb):
+
+            await asyncio.sleep(0)
+
+            mdef = s_msgpack.un(byts)
+
+            if user is not None and not self._hasEasyPerm(mdef, user, s_cell.PERM_READ):
+                continue
+
+            retn.append(mdef)
+
+        return retn
 
     async def getStormIfaces(self, name):
 
@@ -1241,44 +1708,250 @@ class Cortex(s_cell.Cell):  # type: ignore
         self.modsbyiface[name] = tuple(mods)
         return mods
 
-    async def getPermDef(self, perm):
-        if self.permlook is None:
-            permdefs = await self.getPermDefs()
-            self.permlook = {p['perm']: p for p in permdefs}
-        return self.permlook.get(tuple(perm))
+    def _initCorePerms(self):
+        self._cortex_permdefs.extend((
+            {'perm': ('axon',), 'gate': 'cortex',
+             'desc': 'Controls all Axon permissions.'},
+            {'perm': ('axon', 'upload'), 'gate': 'cortex',
+             'desc': 'Controls the ability to upload a file to the Axon.'},
+            {'perm': ('axon', 'get'), 'gate': 'cortex',
+             'desc': 'Controls the ability to retrieve a file from the Axon.'},
+            {'perm': ('axon', 'has'), 'gate': 'cortex',
+             'desc': 'Controls the ability to check if the Axon contains a file.'},
+            {'perm': ('axon', 'del'), 'gate': 'cortex',
+             'desc': 'Controls the ability to remove a file from the Axon.'},
 
-    async def getPermDefs(self):
-        if self.permdefs is None:
-            self.permdefs = await self._getPermDefs()
-        return self.permdefs
+            {'perm': ('layer',), 'gate': 'cortex',
+             'desc': 'Controls all layer permissions.'},
+            {'perm': ('layer', 'add'), 'gate': 'cortex',
+             'desc': 'Controls the ability to add Layers to the cortex.'},
+            {'perm': ('layer', 'del'), 'gate': 'layer',
+             'desc': 'Controls the ability to delete a Layer.'},
+            {'perm': ('layer', 'read'), 'gate': 'layer',
+             'desc': 'Controls the ability to read/lift from a Layer.'},
+            {'perm': ('layer', 'read', '<layer>'), 'gate': 'cortex',
+             'desc': 'Controls the ability to read/lift from a specific Layer.'},
 
-    async def _getPermDefs(self):
+            {'perm': ('layer', 'set'), 'gate': 'layer',
+             'desc': 'Controls setting any layer property.'},
+            {'perm': ('layer', 'set', 'name'), 'gate': 'layer',
+             'desc': 'Controls the ability set a layer name.'},
+            {'perm': ('layer', 'set', 'desc'), 'gate': 'layer',
+             'desc': 'Controls the ability set a layer description.'},
+            {'perm': ('layer', 'set', 'readonly'), 'gate': 'layer',
+             'desc': 'Controls the ability set a layer readonly.'},
 
-        permdefs = [
+            {'perm': ('layer', 'write'), 'gate': 'layer',
+             'desc': 'Controls the ability to write to a Layer.'},
+            {'perm': ('layer', 'write', '<layer>'), 'gate': 'cortex',
+             'desc': 'Controls the ability to write to a specific Layer.'},
+
+            {'perm': ('model',), 'gate': 'cortex',
+             'desc': 'Controls all model permissions.'},
+            {'perm': ('model', 'form'), 'gate': 'cortex',
+             'desc': 'Controls all model form permissions.'},
+            {'perm': ('model', 'form', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding extended model forms.'},
+            {'perm': ('model', 'form', 'add', '<form>'), 'gate': 'cortex',
+             'desc': 'Controls access to adding specific extended model forms.',
+             'ex': 'model.form.add._foo:bar'},
+            {'perm': ('model', 'form', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting extended model forms.'},
+            {'perm': ('model', 'form', 'del', '<form>'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting specific extended model forms.',
+             'ex': 'model.form.del._foo:bar'},
+
+            {'perm': ('model', 'type'), 'gate': 'cortex',
+             'desc': 'Controls all model type permissions.'},
+            {'perm': ('model', 'type', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding extended model types.'},
+            {'perm': ('model', 'type', 'add', '<type>'), 'gate': 'cortex',
+             'desc': 'Controls access to adding specific extended model types.',
+             'ex': 'model.type.add._foo:bar'},
+            {'perm': ('model', 'type', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting extended model types.'},
+            {'perm': ('model', 'type', 'del', '<type>'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting specific extended model types.',
+             'ex': 'model.type.del._foo:bar'},
+
+            {'perm': ('model', 'prop'), 'gate': 'cortex',
+             'desc': 'Controls all model property permissions.'},
+            {'perm': ('model', 'prop', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding extended model properties.'},
+            {'perm': ('model', 'prop', 'add', '<form>'), 'gate': 'cortex',
+             'desc': 'Controls access to adding specific extended model properties.',
+             'ex': 'model.prop.add._foo:bar'},
+            {'perm': ('model', 'prop', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting extended model properties and values.'},
+            {'perm': ('model', 'prop', 'del', '<form>'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting specific extended model properties and values.',
+             'ex': 'model.prop.del._foo:bar'},
+
+            {'perm': ('model', 'tagprop'), 'gate': 'cortex',
+             'desc': 'Controls all model tag property permissions.'},
+            {'perm': ('model', 'tagprop', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding extended model tag properties and values.'},
+            {'perm': ('model', 'tagprop', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting extended model tag properties and values.'},
+
+            {'perm': ('model', 'univ'), 'gate': 'cortex',
+             'desc': 'Controls all model universal property permissions.'},
+            {'perm': ('model', 'univ', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding extended model universal properties.'},
+            {'perm': ('model', 'univ', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting extended model universal properties and values.'},
+
+            {'perm': ('model', 'edge'), 'gate': 'cortex',
+             'desc': 'Controls all model edge permissions.'},
+            {'perm': ('model', 'edge', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding extended model edges.'},
+            {'perm': ('model', 'edge', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting extended model edges.'},
+
             {'perm': ('node',), 'gate': 'layer',
-                'desc': 'Controls all node edits in a layer.'},
-            {'perm': ('node', 'add'), 'gate': 'layer', 'expand': True,
-                'desc': 'Controls adding any form of node in a layer.'},
-            {'perm': ('node', 'del'), 'gate': 'layer', 'expand': True,
-                'desc': 'Controls removing any form of node in a layer.'},
+             'desc': 'Controls all node edits in a layer.'},
+            {'perm': ('node', 'add'), 'gate': 'layer',
+             'desc': 'Controls adding any form of node in a layer.'},
+            {'perm': ('node', 'del'), 'gate': 'layer',
+             'desc': 'Controls removing any form of node in a layer.'},
+
+            {'perm': ('node', 'add', '<form>'), 'gate': 'layer',
+             'ex': 'node.add.inet:ipv4',
+             'desc': 'Controls adding a specific form of node in a layer.'},
+            {'perm': ('node', 'del', '<form>'), 'gate': 'layer',
+             'desc': 'Controls removing a specific form of node in a layer.'},
+
+            {'perm': ('node', 'edge'), 'gate': 'layer',
+             'desc': 'Controls all node edge permissions in a layer.'},
+            {'perm': ('node', 'edge', 'add'), 'gate': 'layer',
+             'desc': 'Controls adding light edges to a node.'},
+            {'perm': ('node', 'edge', 'del'), 'gate': 'layer',
+             'desc': 'Controls adding light edges to a node.'},
+
+            {'perm': ('node', 'edge', 'add', '<verb>'), 'gate': 'layer',
+             'desc': 'Controls adding a specific light edge to a node.'},
+            {'perm': ('node', 'edge', 'del', '<verb>'), 'gate': 'layer',
+             'desc': 'Controls adding a specific light edge to a node.'},
 
             {'perm': ('node', 'tag'), 'gate': 'layer',
-                'desc': 'Controls editing any tag on any node in a layer.'},
-            {'perm': ('node', 'tag', 'add'), 'gate': 'layer', 'expand': True,
-                'desc': 'Controls adding any tag on any node in a layer.'},
-            {'perm': ('node', 'tag', 'del'), 'gate': 'layer', 'expand': True,
-                'desc': 'Controls removing any tag on any node in a layer.'},
+             'desc': 'Controls editing any tag on any node in a layer.'},
+            {'perm': ('node', 'tag', 'add'), 'gate': 'layer',
+             'desc': 'Controls adding any tag on any node in a layer.'},
+            {'perm': ('node', 'tag', 'del'), 'gate': 'layer',
+             'desc': 'Controls removing any tag on any node in a layer.'},
+
+            {'perm': ('node', 'tag', 'add', '<tag>'), 'gate': 'layer',
+             'ex': 'node.tag.add.cno.mal.redtree',
+             'desc': 'Controls adding a specific tag on any node in a layer.'},
+            {'perm': ('node', 'tag', 'del', '<tag>'), 'gate': 'layer',
+             'ex': 'node.tag.del.cno.mal.redtree',
+             'desc': 'Controls removing a specific tag on any node in a layer.'},
 
             {'perm': ('node', 'prop'), 'gate': 'layer',
-                'desc': 'Controls editing any prop on any node in the layer.'},
-            {'perm': ('node', 'prop', 'set'), 'gate': 'layer', 'expand': True,
-                'desc': 'Controls setting any prop on any node in a layer.'},
-            {'perm': ('node', 'prop', 'del'), 'gate': 'layer', 'expand': True,
-                'desc': 'Controls removing any prop on any node in a layer.'},
-        ]
+             'desc': 'Controls editing any prop on any node in the layer.'},
 
-        for spkg in await self.getStormPkgs():
+            {'perm': ('node', 'prop', 'set'), 'gate': 'layer',
+             'desc': 'Controls setting any prop on any node in a layer.'},
+            {'perm': ('node', 'prop', 'set', '<form>'), 'gate': 'layer',
+             'ex': 'node.prop.set.inet:ipv4',
+             'desc': 'Controls setting any property on a form of node in a layer.'},
+            {'perm': ('node', 'prop', 'set', '<form>', '<prop>'), 'gate': 'layer',
+             'ex': 'node.prop.set.inet:ipv4.asn',
+             'desc': 'Controls setting a specific property on a form of node in a layer.'},
+
+            {'perm': ('node', 'prop', 'del'), 'gate': 'layer',
+             'desc': 'Controls removing any prop on any node in a layer.'},
+            {'perm': ('node', 'prop', 'del', '<form>'), 'gate': 'layer',
+             'ex': 'node.prop.del.inet:ipv4',
+             'desc': 'Controls removing any property from a form of node in a layer.'},
+            {'perm': ('node', 'prop', 'del', '<form>', '<prop>'), 'gate': 'layer',
+             'ex': 'node.prop.del.inet:ipv4.asn',
+             'desc': 'Controls removing a specific property from a form of node in a layer.'},
+
+            {'perm': ('node', 'data'), 'gate': 'layer',
+             'desc': 'Controls all node data permissions in a layer.'},
+            {'perm': ('node', 'data', 'set'), 'gate': 'layer',
+             'desc': 'Permits a user to set node data in a given layer.'},
+            {'perm': ('node', 'data', 'set', '<varname>'), 'gate': 'layer',
+              'ex': 'node.data.set.hehe',
+             'desc': 'Permits a user to set node data in a given layer for a specific key.'},
+            {'perm': ('node', 'data', 'pop'), 'gate': 'layer',
+             'desc': 'Permits a user to remove node data in a given layer.'},
+            {'perm': ('node', 'data', 'pop', '<varname>'), 'gate': 'layer',
+             'ex': 'node.data.pop.hehe',
+             'desc': 'Permits a user to remove node data in a given layer for a specific key.'},
+
+            {'perm': ('pkg',), 'gate': 'cortex',
+             'desc': 'Controls all package permissions.'},
+            {'perm': ('pkg', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to adding storm packages.'},
+            {'perm': ('pkg', 'del'), 'gate': 'cortex',
+             'desc': 'Controls access to deleting storm packages.'},
+
+            {'perm': ('storm',), 'gate': 'cortex',
+             'desc': 'Controls all Storm permissions.'},
+            {'perm': ('storm', 'asroot', 'cmd', '<cmdname>'), 'gate': 'cortex',
+            'desc': 'Deprecated. Please use Storm modules to implement functionality requiring root privileges.'},
+            {'perm': ('storm', 'asroot', 'mod', '<modname>'), 'gate': 'cortex',
+            'desc': 'Deprecated. Storm modules should use the asroot:perms key to specify the permissions they require.'},
+
+            {'perm': ('storm', 'sudo'), 'gate': 'cortex',
+            'desc': 'Allows the user to run Storm as a global admin. This allows the user to bypass all permission checks.'},
+
+            {'perm': ('storm', 'graph'), 'gate': 'cortex',
+             'desc': 'Controls all Storm graph permissions.'},
+            {'perm': ('storm', 'graph', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to add a storm graph.',
+             'default': True},
+            {'perm': ('storm', 'macro'), 'gate': 'cortex',
+             'desc': 'Controls all Storm macro permissions.'},
+            {'perm': ('storm', 'macro', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to add a storm macro.',
+             'default': True},
+            {'perm': ('storm', 'macro', 'admin'), 'gate': 'cortex',
+             'desc': 'Controls access to edit/set/delete a storm macro.'},
+            {'perm': ('storm', 'macro', 'edit'), 'gate': 'cortex',
+             'desc': 'Controls access to edit a storm macro.'},
+
+            {'perm': ('view',), 'gate': 'cortex',
+             'desc': 'Controls all view permissions.'},
+            {'perm': ('view', 'add'), 'gate': 'cortex',
+             'desc': 'Controls access to add a new view including forks.'},
+            {'perm': ('view', 'del'), 'gate': 'view',
+             'desc': 'Controls access to delete a view.'},
+            {'perm': ('view', 'fork'), 'gate': 'view', 'default': True,
+             'desc': 'Controls access to fork a view.'},
+            {'perm': ('view', 'read'), 'gate': 'view',
+             'desc': 'Controls read access to view.'},
+
+            {'perm': ('view', 'set'), 'gate': 'view',
+             'desc': 'Controls setting any view property.'},
+            {'perm': ('view', 'set', 'name'), 'gate': 'view',
+             'desc': 'Controls access to set a view name.'},
+            {'perm': ('view', 'set', 'desc'), 'gate': 'view',
+             'desc': 'Controls access to set a view description.'},
+            {'perm': ('view', 'set', 'quorum'), 'gate': 'view',
+             'desc': 'Controls access to set a view quorum status.'},
+            {'perm': ('view', 'set', 'parent'), 'gate': 'view',
+             'desc': 'Controls access to set a view parent view.'},
+            {'perm': ('view', 'set', 'protected'), 'gate': 'view',
+             'desc': 'Controls access to set a view protected status.'},
+        ))
+        for pdef in self._cortex_permdefs:
+            s_schemas.reqValidPermDef(pdef)
+
+    def _getPermDefs(self):
+
+        permdefs = list(s_cell.Cell._getPermDefs(self))
+        permdefs.extend(self._cortex_permdefs)
+
+        for spkg in self._getStormPkgs():
             permdefs.extend(spkg.get('perms', ()))
+
+        for (path, ctor) in self.stormlibs:
+            permdefs.extend(ctor._storm_lib_perms)
+
+        permdefs.sort(key=lambda x: x['perm'])
 
         return tuple(permdefs)
 
@@ -1295,6 +1968,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         await self._bumpCellVers('cortex:defaults', (
             (1, self._addAllLayrRead),
+            (2, self._viewNomergeToProtected),
         ))
 
     async def _addAllLayrRead(self):
@@ -1305,15 +1979,13 @@ class Cortex(s_cell.Cell):  # type: ignore
     async def initServiceRuntime(self):
 
         # do any post-nexus initialization here...
-        await self._initJsonStor()
-
         if self.isactive:
             await self._checkNexsIndx()
 
         await self._initCoreMods()
 
-        if self.isactive:
-            await self._checkLayerModels()
+        if not self.safemode:
+            self.addActiveCoro(self.agenda.runloop)
 
         await self._initStormSvcs()
 
@@ -1322,23 +1994,133 @@ class Cortex(s_cell.Cell):  # type: ignore
         self.dmon.share('cortex', self)
 
     async def initServiceActive(self):
-        if self.conf.get('cron:enable'):
-            await self.agenda.start()
+
         await self.stormdmons.start()
+        await self.initStormPool()
+
+        async def _runMigrations():
+            await self.boss.promote('cortex:migration:layers', self.auth.rootuser, background=True, protected=True)
+
+            # Run migrations when this cortex becomes active. This is to prevent
+            # migrations getting skipped in a zero-downtime upgrade path
+            # (upgrade mirror, promote mirror).
+            try:
+                await self._checkLayerModels()
+            finally:
+                if __debug__:
+                    self._migration_evnt.set()
+
+        if self.safemode:
+            if __debug__:
+                self._migration_evnt.set()
+            return
+
         for view in self.views.values():
             await view.initTrigTask()
+            await view.initMergeTask()
 
         for layer in self.layers.values():
             await layer.initLayerActive()
 
+        for pkgdef in list(self.stormpkgs.values()):
+            self._runStormPkgOnload(pkgdef)
+
+        self.runActiveTask(_runMigrations())
+
     async def initServicePassive(self):
-        await self.agenda.stop()
+
+        if __debug__:
+            self._migration_evnt.clear()
+
         await self.stormdmons.stop()
+
         for view in self.views.values():
             await view.finiTrigTask()
+            await view.finiMergeTask()
 
         for layer in self.layers.values():
             await layer.initLayerPassive()
+
+        await self.finiStormPool()
+
+    async def initStormPool(self):
+
+        if self.safemode:
+            return
+
+        try:
+
+            byts = self.slab.get(b'storm:pool', db='cell:conf')
+            if byts is None:
+                return
+
+            url, opts = s_msgpack.un(byts)
+
+            self.stormpoolurl = url
+            self.stormpoolopts = opts
+
+            async def onlink(proxy, urlinfo):
+                _url = s_urlhelp.sanitizeUrl(s_telepath.zipurl(urlinfo))
+                logger.debug(f'Stormpool client connected to {_url}')
+
+            self.stormpool = await s_telepath.open(url, onlink=onlink)
+
+            # make this one a fini weakref vs the fini() handler
+            self.onfini(self.stormpool)
+
+        except Exception as e:  # pragma: no cover
+            logger.exception(f'Error starting stormpool, it will not be available: {e}')
+
+    async def finiStormPool(self):
+
+        if self.stormpool is not None:
+            await self.stormpool.fini()
+            self.stormpool = None
+
+    async def getStormPool(self):
+        byts = self.slab.get(b'storm:pool', db='cell:conf')
+        if byts is None:
+            return None
+        return s_msgpack.un(byts)
+
+    @s_nexus.Pusher.onPushAuto('storm:pool:set')
+    async def setStormPool(self, url, opts):
+
+        s_schemas.reqValidStormPoolOpts(opts)
+
+        info = (url, opts)
+        self.slab.put(b'storm:pool', s_msgpack.en(info), db='cell:conf')
+
+        if self.isactive:
+            await self.finiStormPool()
+            await self.initStormPool()
+
+    @s_nexus.Pusher.onPushAuto('storm:pool:del')
+    async def delStormPool(self):
+
+        self.slab.pop(b'storm:pool', db='cell:conf')
+
+        if self.isactive:
+            await self.finiStormPool()
+
+    @s_nexus.Pusher.onPushAuto('model:lock:prop')
+    async def setPropLocked(self, name, locked):
+        prop = self.model.reqProp(name)
+        self.modellocks.set(f'prop/{name}', locked)
+        prop.locked = locked
+
+    @s_nexus.Pusher.onPushAuto('model:lock:univ')
+    async def setUnivLocked(self, name, locked):
+        prop = self.model.reqUniv(name)
+        self.modellocks.set(f'univ/{name}', locked)
+        for prop in self.model.getAllUnivs(name):
+            prop.locked = locked
+
+    @s_nexus.Pusher.onPushAuto('model:lock:tagprop')
+    async def setTagPropLocked(self, name, locked):
+        prop = self.model.reqTagProp(name)
+        self.modellocks.set(f'tagprop/{name}', locked)
+        prop.locked = locked
 
     @s_nexus.Pusher.onPushAuto('model:depr:lock')
     async def setDeprLock(self, name, locked):
@@ -1356,8 +2138,7 @@ class Cortex(s_cell.Cell):  # type: ignore
             mesg = 'setDeprLock() called on non-existant or non-deprecated form, property, or type.'
             raise s_exc.NoSuchProp(name=name, mesg=mesg)
 
-        self.deprlocks[name] = locked
-        await self.hive.set(('cortex', 'model', 'deprlocks'), self.deprlocks)
+        self.deprlocks.set(name, locked)
 
         for elem in todo:
             elem.locked = locked
@@ -1372,9 +2153,195 @@ class Cortex(s_cell.Cell):  # type: ignore
             if not prop.deprecated:
                 continue
 
+            # Skip universal properties on other props
+            if not prop.isform and prop.univ is not None:
+                continue
+
             retn[prop.full] = prop.locked
 
         return retn
+
+    async def _warnDeprLocks(self):
+        # Check for deprecated properties which are unused and unlocked
+        deprs = await self.getDeprLocks()
+
+        count = 0
+
+        for propname, locked in deprs.items():
+            if locked:
+                continue
+
+            prop = self.model.props.get(propname)
+
+            for layr in self.layers.values():
+                if not prop.isform and prop.isuniv:
+                    if await layr.getUnivPropCount(prop.name, maxsize=1):
+                        break
+
+                else:
+                    if await layr.getPropCount(propname, maxsize=1):
+                        break
+
+                    if await layr.getPropCount(prop.form.name, prop.name, maxsize=1):
+                        break
+            else:
+                count += 1
+
+        if count:
+            mesg = f'Detected {count} deprecated properties unlocked and not in use, '
+            mesg += 'recommend locking (https://v.vtx.lk/deprlock).'
+            logger.warning(mesg)
+
+    async def reqValidStormGraph(self, gdef):
+        for filt in gdef.get('filters', ()):
+            await self.getStormQuery(filt)
+
+        for pivo in gdef.get('pivots', ()):
+            await self.getStormQuery(pivo)
+
+        for form, rule in gdef.get('forms', {}).items():
+            if form != '*' and self.model.form(form) is None:
+                raise s_exc.NoSuchForm.init(form)
+
+            for filt in rule.get('filters', ()):
+                await self.getStormQuery(filt)
+
+            for pivo in rule.get('pivots', ()):
+                await self.getStormQuery(pivo)
+
+    async def addStormGraph(self, gdef, user=None):
+
+        if user is None:
+            user = self.auth.rootuser
+
+        user.confirm(('storm', 'graph', 'add'), default=True)
+
+        self._initEasyPerm(gdef)
+
+        now = s_common.now()
+
+        gdef['iden'] = s_common.guid()
+        gdef['scope'] = 'user'
+        gdef['creator'] = user.iden
+        gdef['created'] = now
+        gdef['updated'] = now
+        gdef['permissions']['users'][user.iden] = s_cell.PERM_ADMIN
+
+        s_schemas.reqValidGdef(gdef)
+
+        await self.reqValidStormGraph(gdef)
+
+        return await self._push('storm:graph:add', gdef)
+
+    @s_nexus.Pusher.onPush('storm:graph:add')
+    async def _addStormGraph(self, gdef):
+        s_schemas.reqValidGdef(gdef)
+
+        await self.reqValidStormGraph(gdef)
+
+        if gdef['scope'] == 'power-up':
+            mesg = 'Power-up graph projections may only be added by power-ups.'
+            raise s_exc.SynErr(mesg=mesg)
+
+        iden = gdef['iden']
+        if self.graphs.get(iden) is not None:
+            return
+
+        self.graphs.set(iden, gdef)
+
+        await self.feedBeholder('storm:graph:add', {'gdef': gdef})
+        return copy.deepcopy(gdef)
+
+    def _reqStormGraphPerm(self, user, iden, level):
+        gdef = self.graphs.get(iden)
+        if gdef is None:
+            gdef = self.pkggraphs.get(iden)
+
+        if gdef is None:
+            mesg = f'No graph projection with iden {iden} exists!'
+            raise s_exc.NoSuchIden(mesg=mesg)
+
+        if gdef['scope'] == 'power-up' and level > s_cell.PERM_READ:
+            mesg = 'Power-up graph projections may not be modified.'
+            raise s_exc.AuthDeny(mesg=mesg, user=user.iden, username=user.name)
+
+        if user is not None:
+            mesg = f'User requires {s_cell.permnames.get(level)} permission on graph: {iden}.'
+            self._reqEasyPerm(gdef, user, level, mesg=mesg)
+
+        return gdef
+
+    async def delStormGraph(self, iden, user=None):
+        self._reqStormGraphPerm(user, iden, s_cell.PERM_ADMIN)
+        return await self._push('storm:graph:del', iden)
+
+    @s_nexus.Pusher.onPush('storm:graph:del')
+    async def _delStormGraph(self, iden):
+        gdef = self.graphs.pop(iden, None)
+        if gdef is not None:
+            await self.feedBeholder('storm:graph:del', {'iden': iden})
+            return gdef
+
+    async def getStormGraph(self, iden, user=None):
+        gdef = self._reqStormGraphPerm(user, iden, s_cell.PERM_READ)
+        return copy.deepcopy(gdef)
+
+    async def getStormGraphs(self, user=None):
+
+        for _, gdef in self.graphs.items():
+
+            await asyncio.sleep(0)
+
+            if user is not None and self._hasEasyPerm(gdef, user, s_cell.PERM_READ):
+                yield copy.deepcopy(gdef)
+
+        for gdef in self.pkggraphs.values():
+
+            await asyncio.sleep(0)
+
+            if user is not None and self._hasEasyPerm(gdef, user, s_cell.PERM_READ):
+                yield copy.deepcopy(gdef)
+
+    async def modStormGraph(self, iden, info, user=None):
+        self._reqStormGraphPerm(user, iden, s_cell.PERM_EDIT)
+        info['updated'] = s_common.now()
+        return await self._push('storm:graph:mod', iden, info)
+
+    @s_nexus.Pusher.onPush('storm:graph:mod')
+    async def _modStormGraph(self, iden, info):
+
+        gdef = self._reqStormGraphPerm(None, iden, s_cell.PERM_EDIT)
+        gdef = copy.deepcopy(gdef)
+        gdef.update(info)
+
+        s_schemas.reqValidGdef(gdef)
+
+        await self.reqValidStormGraph(gdef)
+
+        self.graphs.set(iden, gdef)
+
+        await self.feedBeholder('storm:graph:mod', {'gdef': gdef})
+        return copy.deepcopy(gdef)
+
+    async def setStormGraphPerm(self, gden, scope, iden, level, user=None):
+        self._reqStormGraphPerm(user, gden, s_cell.PERM_ADMIN)
+        return await self._push('storm:graph:set:perm', gden, scope, iden, level, s_common.now())
+
+    @s_nexus.Pusher.onPush('storm:graph:set:perm')
+    async def _setStormGraphPerm(self, gden, scope, iden, level, utime):
+
+        gdef = self._reqStormGraphPerm(None, gden, s_cell.PERM_ADMIN)
+        gdef = copy.deepcopy(gdef)
+        gdef['updated'] = utime
+
+        await self._setEasyPerm(gdef, scope, iden, level)
+
+        s_schemas.reqValidGdef(gdef)
+
+        self.graphs.set(gden, gdef)
+
+        await self.feedBeholder('storm:graph:set:perm', {'gdef': gdef})
+        return copy.deepcopy(gdef)
 
     async def addCoreQueue(self, name, info):
 
@@ -1411,12 +2378,16 @@ class Cortex(s_cell.Cell):  # type: ignore
             raise s_exc.NoSuchName(mesg=mesg)
 
         await self._push('queue:del', name)
-        await self.auth.delAuthGate(f'queue:{name}')
 
     @s_nexus.Pusher.onPush('queue:del')
     async def _delCoreQueue(self, name):
         if not self.multiqueue.exists(name):
             return
+
+        try:
+            await self.auth.delAuthGate(f'queue:{name}')
+        except s_exc.NoSuchAuthGate:
+            pass
 
         await self.multiqueue.rem(name)
 
@@ -1441,12 +2412,12 @@ class Cortex(s_cell.Cell):  # type: ignore
                 return
 
     async def coreQueuePuts(self, name, items):
-        await self._push('queue:puts', name, items)
+        return await self._push('queue:puts', name, items)
 
     @s_nexus.Pusher.onPush('queue:puts', passitem=True)
     async def _coreQueuePuts(self, name, items, nexsitem):
         nexsoff, nexsmesg = nexsitem
-        await self.multiqueue.puts(name, items, reqid=nexsoff)
+        return await self.multiqueue.puts(name, items, reqid=nexsoff)
 
     @s_nexus.Pusher.onPushAuto('queue:cull')
     async def coreQueueCull(self, name, offs):
@@ -1477,14 +2448,14 @@ class Cortex(s_cell.Cell):  # type: ignore
             await core.setTagModel("cno.cve", "regex", (None, None, "[0-9]{4}", "[0-9]{5}"))
 
         '''
-        meta = self.taghive.get(tagname)
+        meta = self.tagmeta.get(tagname)
         if meta is None:
             meta = {}
 
         meta[name] = valu
         reqValidTagModel(meta)
 
-        await self.taghive.set(tagname, meta)
+        self.tagmeta.set(tagname, meta)
 
         # clear cached entries
         if name == 'regex':
@@ -1500,7 +2471,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         Arguments:
             tagname (str): The name of the tag.
         '''
-        await self.taghive.pop(tagname)
+        self.tagmeta.pop(tagname)
         self.tagvalid.clear()
         self.tagprune.clear()
 
@@ -1517,12 +2488,12 @@ class Cortex(s_cell.Cell):  # type: ignore
             (object): The current value of the property.
         '''
 
-        meta = self.taghive.get(tagname)
+        meta = self.tagmeta.get(tagname)
         if meta is None:
             return None
 
         retn = meta.pop(name, None)
-        await self.taghive.set(name, meta)
+        self.tagmeta.set(tagname, meta)
 
         if name == 'regex':
             self.tagvalid.clear()
@@ -1545,7 +2516,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         parts = s_chop.tagpath(tagname)
         for tag in s_chop.tags(tagname):
 
-            meta = self.taghive.get(tag)
+            meta = self.tagmeta.get(tag)
             if meta is None:
                 continue
 
@@ -1559,9 +2530,10 @@ class Cortex(s_cell.Cell):  # type: ignore
                     continue
 
                 if not regex.fullmatch(regx[i], parts[i]):
-                    return False
+                    mesg = f'Tag part ({parts[i]}) of tag ({tagname}) does not match the tag model regex: [{regx[i]}]'
+                    return (False, mesg)
 
-        return True
+        return (True, None)
 
     async def getTagPrune(self, tagname):
         return self.tagprune.get(tagname)
@@ -1578,7 +2550,7 @@ class Cortex(s_cell.Cell):  # type: ignore
                 prune.append(tag)
                 continue
 
-            meta = self.taghive.get(tag)
+            meta = self.tagmeta.get(tag)
             if meta is None:
                 continue
 
@@ -1600,7 +2572,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         Returns:
             (dict): The tag model specification or None.
         '''
-        retn = self.taghive.get(tagname)
+        retn = self.tagmeta.get(tagname)
         if retn is not None:
             return dict(retn)
 
@@ -1611,7 +2583,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         Returns:
             ([(str, dict), ...]): A list of tag model specification tuples.
         '''
-        return list(self.taghive.items())
+        return list(self.tagmeta.items())
 
     async def _finiStor(self):
         await asyncio.gather(*[view.fini() for view in self.views.values()])
@@ -1622,33 +2594,29 @@ class Cortex(s_cell.Cell):  # type: ignore
         async def onSetTrigDoc(node, prop, valu):
             valu = str(valu)
             iden = node.ndef[1]
-            trig = node.snap.view.triggers.get(iden)
             node.snap.user.confirm(('trigger', 'set', 'doc'), gateiden=iden)
-            await trig.set('doc', valu)
+            await node.snap.view.setTriggerInfo(iden, 'doc', valu)
             node.props[prop.name] = valu
 
         async def onSetTrigName(node, prop, valu):
             valu = str(valu)
             iden = node.ndef[1]
-            trig = node.snap.view.triggers.get(iden)
             node.snap.user.confirm(('trigger', 'set', 'name'), gateiden=iden)
-            await trig.set('name', valu)
+            await node.snap.view.setTriggerInfo(iden, 'name', valu)
             node.props[prop.name] = valu
 
         async def onSetCronDoc(node, prop, valu):
             valu = str(valu)
             iden = node.ndef[1]
-            appt = await self.agenda.get(iden)
             node.snap.user.confirm(('cron', 'set', 'doc'), gateiden=iden)
-            await appt.setDoc(valu, nexs=True)
+            await self.editCronJob(iden, 'doc', valu)
             node.props[prop.name] = valu
 
         async def onSetCronName(node, prop, valu):
             valu = str(valu)
             iden = node.ndef[1]
-            appt = await self.agenda.get(iden)
             node.snap.user.confirm(('cron', 'set', 'name'), gateiden=iden)
-            await appt.setName(valu, nexs=True)
+            await self.editCronJob(iden, 'name', valu)
             node.props[prop.name] = valu
 
         self.addRuntPropSet('syn:cron:doc', onSetCronDoc)
@@ -1659,11 +2627,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
     async def _initStormDmons(self):
 
-        node = await self.hive.open(('cortex', 'storm', 'dmons'))
-
-        self.stormdmonhive = await node.dict()
-
-        for iden, ddef in self.stormdmonhive.items():
+        for iden, ddef in self.stormdmondefs.items():
             try:
                 await self.runStormDmon(iden, ddef)
 
@@ -1675,7 +2639,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
     async def _initStormSvcs(self):
 
-        for iden, sdef in self.svchive.items():
+        for iden, sdef in self.svcdefs.items():
 
             try:
                 await self._setStormSvc(sdef)
@@ -1693,6 +2657,16 @@ class Cortex(s_cell.Cell):  # type: ignore
         self.onfini(slab.fini)
 
         self.multiqueue = await slab.getMultiQueue('cortex:queue', nexsroot=self.nexsroot)
+        self.stormpkgqueue = await slab.getMultiQueue('storm:pkg:queue', nexsroot=self.nexsroot)
+
+    async def _initStormGraphs(self):
+        path = os.path.join(self.dirn, 'slabs', 'graphs.lmdb')
+
+        slab = await s_lmdbslab.Slab.anit(path)
+        self.onfini(slab.fini)
+
+        self.pkggraphs = {}
+        self.graphs = s_lmdbslab.SlabDict(slab, db=slab.initdb('graphs'))
 
     async def setStormCmd(self, cdef):
         await self._reqStormCmd(cdef)
@@ -1728,8 +2702,8 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         '''
         name = cdef.get('name')
-        await self._setStormCmd(cdef)
-        await self.cmdhive.set(name, cdef)
+        self._setStormCmd(cdef)
+        self.cmddefs.set(name, cdef)
 
     async def _reqStormCmd(self, cdef):
 
@@ -1769,10 +2743,10 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         return (buid, sodelist)
 
-    async def _mergeSodes(self, layers, genrs, cmprkey, filtercmpr=None):
+    async def _mergeSodes(self, layers, genrs, cmprkey, filtercmpr=None, reverse=False):
         lastbuid = None
         sodes = {}
-        async for layr, (_, buid), sode in s_common.merggenr2(genrs, cmprkey):
+        async for layr, (_, buid), sode in s_common.merggenr2(genrs, cmprkey, reverse=reverse):
             if not buid == lastbuid or layr in sodes:
                 if lastbuid is not None:
                     sodelist = await self._genSodeList(lastbuid, sodes, layers, filtercmpr)
@@ -1801,24 +2775,30 @@ class Cortex(s_cell.Cell):  # type: ignore
         async for sodes in self._mergeSodes(layers, genrs, cmprkey_buid):
             yield sodes
 
-    async def _liftByProp(self, form, prop, layers):
+    async def _liftByProp(self, form, prop, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByProp(form, prop):
+            async for _, buid, sode in layers[0].liftByProp(form, prop, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
         genrs = []
         for layr in layers:
-            genrs.append(wrap_liftgenr(layr.iden, layr.liftByProp(form, prop)))
+            genrs.append(wrap_liftgenr(layr.iden, layr.liftByProp(form, prop, reverse=reverse)))
 
-        async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx):
+        def filtercmpr(sode):
+            if (props := sode.get('props')) is None:
+                return False
+
+            return props.get(prop) is not None
+
+        async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr, reverse=reverse):
             yield sodes
 
-    async def _liftByPropValu(self, form, prop, cmprvals, layers):
+    async def _liftByPropValu(self, form, prop, cmprvals, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByPropValu(form, prop, cmprvals):
+            async for _, buid, sode in layers[0].liftByPropValu(form, prop, cmprvals, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
@@ -1831,15 +2811,15 @@ class Cortex(s_cell.Cell):  # type: ignore
         for cval in cmprvals:
             genrs = []
             for layr in layers:
-                genrs.append(wrap_liftgenr(layr.iden, layr.liftByPropValu(form, prop, (cval,))))
+                genrs.append(wrap_liftgenr(layr.iden, layr.liftByPropValu(form, prop, (cval,), reverse=reverse)))
 
-            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr):
+            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr, reverse=reverse):
                 yield sodes
 
-    async def _liftByPropArray(self, form, prop, cmprvals, layers):
+    async def _liftByPropArray(self, form, prop, cmprvals, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByPropArray(form, prop, cmprvals):
+            async for _, buid, sode in layers[0].liftByPropArray(form, prop, cmprvals, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
@@ -1855,30 +2835,30 @@ class Cortex(s_cell.Cell):  # type: ignore
         for cval in cmprvals:
             genrs = []
             for layr in layers:
-                genrs.append(wrap_liftgenr(layr.iden, layr.liftByPropArray(form, prop, (cval,))))
+                genrs.append(wrap_liftgenr(layr.iden, layr.liftByPropArray(form, prop, (cval,), reverse=reverse)))
 
-            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr):
+            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr, reverse=reverse):
                 yield sodes
 
-    async def _liftByFormValu(self, form, cmprvals, layers):
+    async def _liftByFormValu(self, form, cmprvals, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByFormValu(form, cmprvals):
+            async for _, buid, sode in layers[0].liftByFormValu(form, cmprvals, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
         for cval in cmprvals:
             genrs = []
             for layr in layers:
-                genrs.append(wrap_liftgenr(layr.iden, layr.liftByFormValu(form, (cval,))))
+                genrs.append(wrap_liftgenr(layr.iden, layr.liftByFormValu(form, (cval,), reverse=reverse)))
 
-            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx):
+            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, reverse=reverse):
                 yield sodes
 
-    async def _liftByTag(self, tag, form, layers):
+    async def _liftByTag(self, tag, form, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByTag(tag, form):
+            async for _, buid, sode in layers[0].liftByTag(tag, form, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
@@ -1893,15 +2873,15 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         genrs = []
         for layr in layers:
-            genrs.append(wrap_liftgenr(layr.iden, layr.liftByTag(tag, form)))
+            genrs.append(wrap_liftgenr(layr.iden, layr.liftByTag(tag, form, reverse=reverse)))
 
-        async for sodes in self._mergeSodes(layers, genrs, cmprkey_buid, filtercmpr):
+        async for sodes in self._mergeSodes(layers, genrs, cmprkey_buid, filtercmpr, reverse=reverse):
             yield sodes
 
-    async def _liftByTagValu(self, tag, cmpr, valu, form, layers):
+    async def _liftByTagValu(self, tag, cmpr, valu, form, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByTagValu(tag, cmpr, valu, form):
+            async for _, buid, sode in layers[0].liftByTagValu(tag, cmpr, valu, form, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
@@ -1913,29 +2893,38 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         genrs = []
         for layr in layers:
-            genrs.append(wrap_liftgenr(layr.iden, layr.liftByTagValu(tag, cmpr, valu, form)))
+            genrs.append(wrap_liftgenr(layr.iden, layr.liftByTagValu(tag, cmpr, valu, form, reverse=reverse)))
 
-        async for sodes in self._mergeSodes(layers, genrs, cmprkey_buid, filtercmpr):
+        async for sodes in self._mergeSodes(layers, genrs, cmprkey_buid, filtercmpr, reverse=reverse):
             yield sodes
 
-    async def _liftByTagProp(self, form, tag, prop, layers):
+    async def _liftByTagProp(self, form, tag, prop, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByTagProp(form, tag, prop):
+            async for _, buid, sode in layers[0].liftByTagProp(form, tag, prop, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
         genrs = []
         for layr in layers:
-            genrs.append(wrap_liftgenr(layr.iden, layr.liftByTagProp(form, tag, prop)))
+            genrs.append(wrap_liftgenr(layr.iden, layr.liftByTagProp(form, tag, prop, reverse=reverse)))
 
-        async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx):
+        def filtercmpr(sode):
+            if (tagprops := sode.get('tagprops')) is None:
+                return False
+
+            if (props := tagprops.get(tag)) is None:
+                return False
+
+            return props.get(prop) is not None
+
+        async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr, reverse=reverse):
             yield sodes
 
-    async def _liftByTagPropValu(self, form, tag, prop, cmprvals, layers):
+    async def _liftByTagPropValu(self, form, tag, prop, cmprvals, layers, reverse=False):
         if len(layers) == 1:
             layr = layers[0].iden
-            async for _, buid, sode in layers[0].liftByTagPropValu(form, tag, prop, cmprvals):
+            async for _, buid, sode in layers[0].liftByTagPropValu(form, tag, prop, cmprvals, reverse=reverse):
                 yield (buid, [(layr, sode)])
             return
 
@@ -1951,12 +2940,12 @@ class Cortex(s_cell.Cell):  # type: ignore
         for cval in cmprvals:
             genrs = []
             for layr in layers:
-                genrs.append(wrap_liftgenr(layr.iden, layr.liftByTagPropValu(form, tag, prop, (cval,))))
+                genrs.append(wrap_liftgenr(layr.iden, layr.liftByTagPropValu(form, tag, prop, (cval,), reverse=reverse)))
 
-            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr):
+            async for sodes in self._mergeSodes(layers, genrs, cmprkey_indx, filtercmpr, reverse=reverse):
                 yield sodes
 
-    async def _setStormCmd(self, cdef):
+    def _setStormCmd(self, cdef):
         '''
         Note:
             No change control or persistence
@@ -1972,6 +2961,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         ctor.pkgname = cdef.get('pkgname')
         ctor.svciden = cdef.get('cmdconf', {}).get('svciden', '')
         ctor.forms = cdef.get('forms', {})
+        ctor.deprecated = cdef.get('deprecated', {})
 
         def getStorNode(form):
             ndef = (form.name, form.type.norm(cdef.get('name'))[0])
@@ -2000,6 +2990,18 @@ class Cortex(s_cell.Cell):  # type: ignore
             if ctor.pkgname:
                 props['package'] = ctor.pkgname
 
+            if ctor.deprecated:
+                props['deprecated'] = True
+
+                if (eolvers := ctor.deprecated.get('eolvers')) is not None:
+                    props['deprecated:version'] = eolvers
+
+                if (eoldate := ctor.deprecated.get('eoldate')) is not None:
+                    props['deprecated:date'] = eoldate
+
+                if (mesg := ctor.deprecated.get('mesg')) is not None:
+                    props['deprecated:mesg'] = mesg
+
             pnorms = {}
             for prop, valu in props.items():
                 formprop = form.props.get(prop)
@@ -2016,12 +3018,8 @@ class Cortex(s_cell.Cell):  # type: ignore
         name = cdef.get('name')
         self.stormcmds[name] = ctor
 
-        await self.fire('core:cmd:change', cmd=name, act='add')
-
-    async def _popStormCmd(self, name):
+    def _popStormCmd(self, name):
         self.stormcmds.pop(name, None)
-
-        await self.fire('core:cmd:change', cmd=name, act='del')
 
     async def delStormCmd(self, name):
         '''
@@ -2040,38 +3038,87 @@ class Cortex(s_cell.Cell):  # type: ignore
         if ctor is None:
             return
 
-        cdef = self.cmdhive.get(name)
+        cdef = self.cmddefs.get(name)
         if cdef is None:
             mesg = f'The storm command ({name}) is not dynamic.'
             raise s_exc.CantDelCmd(mesg=mesg)
 
-        await self.cmdhive.pop(name)
+        self.cmddefs.pop(name)
         self.stormcmds.pop(name, None)
 
-        await self.fire('core:cmd:change', cmd=name, act='del')
-
-    async def addStormPkg(self, pkgdef):
+    async def addStormPkg(self, pkgdef, verify=False):
         '''
         Add the given storm package to the cortex.
 
         This will store the package for future use.
         '''
         # do validation before nexs...
+        if verify:
+            pkgcopy = s_msgpack.deepcopy(pkgdef)
+            codesign = pkgcopy.pop('codesign', None)
+            if codesign is None:
+                mesg = 'Storm package is not signed!'
+                raise s_exc.BadPkgDef(mesg=mesg)
+
+            certbyts = codesign.get('cert')
+            if certbyts is None:
+                mesg = 'Storm package has no certificate!'
+                raise s_exc.BadPkgDef(mesg=mesg)
+
+            signbyts = codesign.get('sign')
+            if signbyts is None:
+                mesg = 'Storm package has no signature!'
+                raise s_exc.BadPkgDef(mesg=mesg)
+
+            try:
+                cert = self.certdir.loadCertByts(certbyts.encode('utf-8'))
+            except s_exc.BadCertBytes as e:
+                raise s_exc.BadPkgDef(mesg='Storm package has malformed certificate!') from None
+
+            try:
+                self.certdir.valCodeCert(certbyts.encode())
+            except s_exc.BadCertVerify as e:
+                mesg = e.get('mesg')
+                if mesg:
+                    mesg = f'Storm package has invalid certificate: {mesg}'
+                else:
+                    mesg = 'Storm package has invalid certificate!'
+                raise s_exc.BadPkgDef(mesg=mesg) from None
+
+            pubk = s_rsa.PubKey(cert.public_key())
+            if not pubk.verifyitem(pkgcopy, s_common.uhex(signbyts)):
+                mesg = 'Storm package signature does not match!'
+                raise s_exc.BadPkgDef(mesg=mesg)
+
         await self._normStormPkg(pkgdef)
         return await self._push('pkg:add', pkgdef)
 
     @s_nexus.Pusher.onPush('pkg:add')
     async def _addStormPkg(self, pkgdef):
         name = pkgdef.get('name')
-        olddef = self.pkghive.get(name, None)
+        olddef = self.pkgdefs.get(name, None)
         if olddef is not None:
-            await self._dropStormPkg(olddef)
+            if s_hashitem.hashitem(pkgdef) != s_hashitem.hashitem(olddef):
+                self._dropStormPkg(olddef)
+            else:
+                return
 
-        await self.loadStormPkg(pkgdef)
-        await self.pkghive.set(name, pkgdef)
+        self.loadStormPkg(pkgdef)
+        self._runStormPkgOnload(pkgdef)
+        self.pkgdefs.set(name, pkgdef)
+
+        self._clearPermDefs()
+
+        gates = []
+        perms = []
+        pkgperms = pkgdef.get('perms')
+        if pkgperms:
+            gates = [p['gate'] for p in pkgperms if p.get('gate') is not None]
+            perms = [p['perm'] for p in pkgperms if p.get('perm') is not None]
+        await self.feedBeholder('pkg:add', pkgdef, gates=gates, perms=perms)
 
     async def delStormPkg(self, name):
-        pkgdef = self.pkghive.get(name, None)
+        pkgdef = self.pkgdefs.get(name)
         if pkgdef is None:
             mesg = f'No storm package: {name}.'
             raise s_exc.NoSuchPkg(mesg=mesg)
@@ -2083,24 +3130,37 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         Delete a storm package by name.
         '''
-        pkgdef = await self.pkghive.pop(name, None)
+        pkgdef = self.pkgdefs.pop(name, None)
         if pkgdef is None:
             return
 
-        await self._dropStormPkg(pkgdef)
+        self._dropStormPkg(pkgdef)
+
+        self._clearPermDefs()
+
+        gates = []
+        perms = []
+        pkgperms = pkgdef.get('perms')
+        if pkgperms:
+            gates = [p['gate'] for p in pkgperms if p.get('gate') is not None]
+            perms = [p['perm'] for p in pkgperms if p.get('perm') is not None]
+        await self.feedBeholder('pkg:del', {'name': name}, gates=gates, perms=perms)
 
     async def getStormPkg(self, name):
-        return self.stormpkgs.get(name)
+        return copy.deepcopy(self.stormpkgs.get(name))
 
     async def getStormPkgs(self):
-        return list(self.pkghive.values())
+        return self._getStormPkgs()
+
+    def _getStormPkgs(self):
+        return copy.deepcopy(list(self.pkgdefs.values()))
 
     async def getStormMods(self):
-        return self.stormmods
+        return copy.deepcopy(self.stormmods)
 
     async def getStormMod(self, name, reqvers=None):
 
-        mdef = self.stormmods.get(name)
+        mdef = copy.deepcopy(self.stormmods.get(name))
         if mdef is None or reqvers is None:
             return mdef
 
@@ -2123,7 +3183,7 @@ class Cortex(s_cell.Cell):  # type: ignore
     async def _tryLoadStormPkg(self, pkgdef):
         try:
             await self._normStormPkg(pkgdef, validstorm=False)
-            await self.loadStormPkg(pkgdef)
+            self.loadStormPkg(pkgdef)
 
         except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
             raise
@@ -2132,13 +3192,16 @@ class Cortex(s_cell.Cell):  # type: ignore
             name = pkgdef.get('name', '')
             logger.exception(f'Error loading pkg: {name}, {str(e)}')
 
-    async def _reqStormPkgDeps(self, pkgdef):
+    async def verifyStormPkgDeps(self, pkgdef):
+
+        result = {
+            'requires': [],
+            'conflicts': [],
+        }
 
         deps = pkgdef.get('depends')
         if deps is None:
-            return
-
-        name = pkgdef.get('name')
+            return result
 
         requires = deps.get('requires', ())
         for require in requires:
@@ -2146,33 +3209,77 @@ class Cortex(s_cell.Cell):  # type: ignore
             pkgname = require.get('name')
             cmprvers = require.get('version')
 
-            cpkg = await self.getStormPkg(pkgname)
-            if cpkg is not None:
-                cver = cpkg.get('version')
-                if s_version.matches(cver, cmprvers):
-                    continue
+            item = require.copy()
+            item.setdefault('desc', None)
 
-            mesg = f'Storm package {name} requires {pkgname}{cmprvers}.'
-            raise s_exc.StormPkgRequires(mesg=mesg)
+            cpkg = await self.getStormPkg(pkgname)
+
+            if cpkg is None:
+                item.update({'ok': False, 'actual': None})
+            else:
+                cver = cpkg.get('version')
+                ok = s_version.matches(cver, cmprvers)
+                item.update({'ok': ok, 'actual': cver})
+
+            result['requires'].append(item)
 
         conflicts = deps.get('conflicts', ())
         for conflict in conflicts:
 
             pkgname = conflict.get('name')
+            cmprvers = conflict.get('version')
+
+            item = conflict.copy()
+            item.setdefault('version', None)
+            item.setdefault('desc', None)
 
             cpkg = await self.getStormPkg(pkgname)
+
             if cpkg is None:
+                item.update({'ok': True, 'actual': None})
+            else:
+                cver = cpkg.get('version')
+                ok = cmprvers is not None and not s_version.matches(cver, cmprvers)
+                item.update({'ok': ok, 'actual': cver})
+
+            result['conflicts'].append(item)
+
+        return result
+
+    async def _reqStormPkgDeps(self, pkgdef):
+
+        name = pkgdef.get('name')
+
+        deps = await self.verifyStormPkgDeps(pkgdef)
+
+        for require in deps['requires']:
+
+            if require['ok']:
                 continue
 
-            cmprvers = conflict.get('version')
-            if cmprvers is None:
-                mesg = f'Storm package {name} conflicts with {pkgname}.'
-                raise s_exc.StormPkgConflicts(mesg=mesg)
+            option = ' '
+            if require.get('optional'):
+                option = ' optional '
 
-            cver = cpkg.get('version')
-            if s_version.matches(cver, cmprvers):
-                mesg = f'Storm package {name} conflicts with {pkgname}{cmprvers}.'
-                raise s_exc.StormPkgConflicts(mesg=mesg)
+            mesg = f'Storm package {name}{option}requirement {require.get("name")}{require.get("version")} is currently unmet.'
+            logger.debug(mesg)
+
+        for conflict in deps['conflicts']:
+
+            if conflict['ok']:
+                continue
+
+            mesg = f'Storm package {name} conflicts with {conflict.get("name")}{conflict.get("version") or ""}.'
+            raise s_exc.StormPkgConflicts(mesg=mesg)
+
+    def _reqStormPkgVarType(self, pkgname, vartype):
+        if isinstance(vartype, (tuple, list)):
+            for vtyp in vartype:
+                self._reqStormPkgVarType(pkgname, vtyp)
+        else:
+            if vartype not in self.model.types:
+                mesg = f'Storm package {pkgname} has unknown config var type {vartype}.'
+                raise s_exc.NoSuchType(mesg=mesg, type=vartype)
 
     async def _normStormPkg(self, pkgdef, validstorm=True):
         '''
@@ -2186,26 +3293,51 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         pkgname = pkgdef.get('name')
 
-        # Check minimum synapse version
-        minversion = pkgdef.get('synapse_minversion')
-        if minversion is not None and tuple(minversion) > s_version.version:
-            mesg = f'Storm package {pkgname} requires Synapse {minversion} but ' \
+        # Check synapse version requirement
+        reqversion = pkgdef.get('synapse_version')
+        if reqversion is not None:
+            mesg = f'Storm package {pkgname} requires Synapse {reqversion} but ' \
                    f'Cortex is running {s_version.version}'
-            raise s_exc.BadVersion(mesg=mesg)
+            s_version.reqVersion(s_version.version, reqversion, mesg=mesg)
+
+        elif (minversion := pkgdef.get('synapse_minversion')) is not None:
+            # This is for older packages that might not have the
+            # `synapse_version` field.
+            # TODO: Remove this whole else block after Synapse 3.0.0.
+            if tuple(minversion) > s_version.version:
+                mesg = f'Storm package {pkgname} requires Synapse {minversion} but ' \
+                       f'Cortex is running {s_version.version}'
+                raise s_exc.BadVersion(mesg=mesg)
 
         # Validate storm contents from modules and commands
         mods = pkgdef.get('modules', ())
         cmds = pkgdef.get('commands', ())
         onload = pkgdef.get('onload')
+        inits = pkgdef.get('inits')
         svciden = pkgdef.get('svciden')
 
         if onload is not None and validstorm:
             await self.getStormQuery(onload)
 
+        if inits is not None:
+            lastver = None
+            for initdef in inits.get('versions'):
+                curver = initdef.get('version')
+                if lastver is not None and not curver > lastver:
+                    raise s_exc.BadPkgDef(mesg='Init versions must be monotonically increasing.', version=curver)
+                lastver = curver
+
+                if validstorm:
+                    await self.getStormQuery(initdef.get('query'))
+
         for mdef in mods:
-            mdef.setdefault('modconf', {})
+            modconf = mdef.setdefault('modconf', {})
+            pkgmeta = {'modname': mdef.get('name'), 'pkgname': pkgname}
+            actual_pkgmeta = modconf.setdefault('pkgmeta', pkgmeta)
             if svciden:
-                mdef['modconf']['svciden'] = svciden
+                modconf['svciden'] = svciden
+                if pkgmeta is actual_pkgmeta:
+                    pkgmeta['svciden'] = svciden
 
             if validstorm:
                 modtext = mdef.get('storm')
@@ -2221,10 +3353,29 @@ class Cortex(s_cell.Cell):  # type: ignore
                 cmdtext = cdef.get('storm')
                 await self.getStormQuery(cmdtext)
 
-        # Validate package def (post normalization)
-        s_storm.reqValidPkgdef(pkgdef)
+            if cdef.get('forms') is not None:
+                name = cdef.get('name')
+                mesg = f"Storm command definition 'forms' key is deprecated and will be removed " \
+                       f"in 3.0.0 (command {name} in package {pkgname})"
+                logger.warning(mesg, extra=self.getLogExtra(name=name, pkgname=pkgname))
 
-    async def loadStormPkg(self, pkgdef):
+        for gdef in pkgdef.get('graphs', ()):
+            gdef['iden'] = s_common.guid((pkgname, gdef.get('name')))
+            gdef['scope'] = 'power-up'
+            gdef['power-up'] = pkgname
+
+            if validstorm:
+                await self.reqValidStormGraph(gdef)
+
+        # Validate package def (post normalization)
+        s_schemas.reqValidPkgdef(pkgdef)
+
+        for configvar in pkgdef.get('configvars', ()):
+            self._reqStormPkgVarType(pkgname, configvar.get('type'))
+
+    # N.B. This function is intentionally not async in order to prevent possible user race conditions for code
+    # executing outside of the nexus lock.
+    def loadStormPkg(self, pkgdef):
         '''
         Load a storm package into the storm library for this cortex.
 
@@ -2235,10 +3386,6 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         mods = pkgdef.get('modules', ())
         cmds = pkgdef.get('commands', ())
-
-        if pkgdef.get('perms'):
-            self.permdefs = None
-            self.permlook = None
 
         # now actually load...
         self.stormpkgs[name] = pkgdef
@@ -2258,23 +3405,124 @@ class Cortex(s_cell.Cell):  # type: ignore
         self.stormmods = stormmods
 
         for cdef in cmds:
-            await self._setStormCmd(cdef)
+            self._setStormCmd(cdef)
 
+        for gdef in pkgdef.get('graphs', ()):
+            gdef = copy.deepcopy(gdef)
+            self._initEasyPerm(gdef)
+            self.pkggraphs[gdef['iden']] = gdef
+
+        logger.info(f'Loaded Storm package: {name}@{pkgvers}.', extra=self.getLogExtra(pkg=name, vers=pkgvers))
+
+    def _runStormPkgOnload(self, pkgdef):
+        name = pkgdef.get('name')
+        inits = pkgdef.get('inits')
         onload = pkgdef.get('onload')
-        if onload is not None and self.isactive:
-            async def _onload():
-                try:
-                    async for mesg in self.storm(onload):
-                        if mesg[0] in ('print', 'warn'):
-                            logger.warning(f'onload output: {mesg}')
-                            await asyncio.sleep(0)
-                except asyncio.CancelledError:  # pragma: no cover
-                    raise
-                except Exception:  # pragma: no cover
-                    logger.warning(f'onload failed for package: {name}')
-            self.schedCoro(_onload())
+        pkgvers = pkgdef.get('version')
 
-    async def _dropStormPkg(self, pkgdef):
+        if self.isactive:
+            async def _onload():
+                if self.safemode:
+                    await self.fire('core:pkg:onload:skipped', pkg=name, reason='safemode')
+                    return
+
+                await self.fire('core:pkg:onload:start', pkg=name)
+
+                logextra = self.getLogExtra(pkg=name, vers=pkgvers)
+
+                verskey = 'storage:version'
+
+                curvers = -1
+
+                if inits is None:
+                    await self.setStormPkgVar(name, verskey, -1)
+
+                else:
+                    if (key := inits.get('key')) is not None:
+                        s_common.deprecated('storm package inits.key', eolv='3.0.0')
+                        if key != verskey and (valu := await self.popStormPkgVar(name, key)) is not None:
+                            await self.setStormPkgVar(name, verskey, valu)
+
+                    inaugural = False
+                    curvers = await self.getStormPkgVar(name, verskey)
+                    if curvers is None:
+                        inaugural = True
+                        curvers = -1
+
+                    for initdef in inits['versions']:
+
+                        vers = initdef['version']
+                        vname = initdef['name']
+
+                        if vers <= curvers:
+                            continue
+
+                        if inaugural and not initdef.get('inaugural'):
+                            await self.setStormPkgVar(name, verskey, vers)
+                            continue
+
+                        logextra['params']['initvers'] = vers
+
+                        logger.info(f'{name} starting init vers={vers}: {vname}', extra=logextra)
+
+                        ok = True
+
+                        try:
+                            if (opts := initdef.get('queryopts')) is None:
+                                opts = {}
+                            opts.setdefault('mirror', False)
+
+                            async for mesg in self.storm(initdef['query'], opts=opts):
+                                match mesg[0]:
+                                    case 'print':
+                                        msg = f'{name} init vers={vers} output: {mesg[1].get("mesg")}'
+                                        logger.info(msg, extra=logextra)
+                                    case 'warn':
+                                        msg = f'{name} init vers={vers} output: {mesg[1].get("mesg")}'
+                                        logger.warning(msg, extra=logextra)
+                                    case 'err':
+                                        msg = f'{name} init vers={vers} output: {mesg[1]}'
+                                        logger.error(msg, extra=logextra)
+                                        ok = False
+                                await asyncio.sleep(0)
+                        except asyncio.CancelledError:  # pragma: no cover
+                            raise
+                        except Exception as exc:  # pragma: no cover
+                            msg = f'{name} init failed for vers={vers}: {vname}'
+                            logger.warning(msg, exc_info=exc, extra=logextra)
+                            ok = False
+
+                        if not ok:
+                            break
+
+                        curvers = max(vers, await self.getStormPkgVar(name, verskey, default=-1))
+                        await self.setStormPkgVar(name, verskey, curvers)
+                        logger.info(f'{name} finished init vers={vers}: {vname}', extra=logextra)
+
+                if onload is not None:
+                    try:
+                        async for mesg in self.storm(onload, opts={'mirror': False}):
+                            if mesg[0] == 'print':
+                                logger.info(f'{name} onload output: {mesg[1].get("mesg")}', extra=logextra)
+                            if mesg[0] == 'warn':
+                                logger.warning(f'{name} onload output: {mesg[1].get("mesg")}', extra=logextra)
+                            if mesg[0] == 'err':
+                                logger.error(f'{name} onload output: {mesg[1]}', extra=logextra)
+                            await asyncio.sleep(0)
+                    except asyncio.CancelledError:  # pragma: no cover
+                        raise
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning(f'onload failed for package: {name}', exc_info=exc, extra=logextra)
+
+                    logger.info(f'{name} finished onload', extra=logextra)
+
+                await self.fire('core:pkg:onload:complete', pkg=name, storvers=curvers)
+
+            self.runActiveTask(_onload())
+
+    # N.B. This function is intentionally not async in order to prevent possible user race conditions for code
+    # executing outside of the nexus lock.
+    def _dropStormPkg(self, pkgdef):
         '''
         Reverse the process of loadStormPkg()
         '''
@@ -2285,10 +3533,17 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         for cdef in pkgdef.get('commands', ()):
             name = cdef.get('name')
-            await self._popStormCmd(name)
+            self._popStormCmd(name)
 
         pkgname = pkgdef.get('name')
+        pkgvers = pkgdef.get('version')
+
+        for gdef in pkgdef.get('graphs', ()):
+            self.pkggraphs.pop(gdef['iden'], None)
+
         self.stormpkgs.pop(pkgname, None)
+
+        logger.info(f'Unloaded Storm package: {pkgname}@{pkgvers}.', extra=self.getLogExtra(pkg=pkgname, vers=pkgvers))
 
     def getStormSvc(self, name):
 
@@ -2331,12 +3586,13 @@ class Cortex(s_cell.Cell):  # type: ignore
             return ssvc.sdef
 
         ssvc = await self._setStormSvc(sdef)
-        await self.svchive.set(iden, sdef)
+        self.svcdefs.set(iden, sdef)
 
+        await self.feedBeholder('svc:add', {'name': sdef.get('name'), 'iden': iden})
         return ssvc.sdef
 
     async def delStormSvc(self, iden):
-        sdef = self.svchive.get(iden)
+        sdef = self.svcdefs.get(iden)
         if sdef is None:
             mesg = f'No storm service with iden: {iden}'
             raise s_exc.NoSuchStormSvc(mesg=mesg, iden=iden)
@@ -2348,7 +3604,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         Delete a registered storm service from the cortex.
         '''
-        sdef = self.svchive.get(iden)
+        sdef = self.svcdefs.get(iden)
         if sdef is None:  # pragma: no cover
             return
 
@@ -2360,7 +3616,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         except Exception as e:
             logger.exception(f'service.del hook for service {iden} failed with error: {e}')
 
-        sdef = await self.svchive.pop(iden)
+        sdef = self.svcdefs.pop(iden)
 
         await self._delStormSvcPkgs(iden)
 
@@ -2373,20 +3629,24 @@ class Cortex(s_cell.Cell):  # type: ignore
             self.svcsbysvcname.pop(ssvc.svcname, None)
             await ssvc.fini()
 
+        await self.feedBeholder('svc:del', {'iden': iden, 'name': name, 'svcname': ssvc.svcname})
+
     async def _delStormSvcPkgs(self, iden):
         '''
         Delete storm packages associated with a service.
         '''
-        oldpkgs = []
-        for _, pdef in self.pkghive.items():
-            pkgiden = pdef.get('svciden')
-            if pkgiden and pkgiden == iden:
-                oldpkgs.append(pdef)
-
-        for pkg in oldpkgs:
+        for pkg in self.getStormSvcPkgs(iden):
             name = pkg.get('name')
             if name:
                 await self._delStormPkg(name)
+
+    def getStormSvcPkgs(self, iden):
+        pkgs = []
+        for _, pdef in self.pkgdefs.items():
+            pkgiden = pdef.get('svciden')
+            if pkgiden and pkgiden == iden:
+                pkgs.append(pdef)
+        return pkgs
 
     async def setStormSvcEvents(self, iden, edef):
         '''
@@ -2419,17 +3679,17 @@ class Cortex(s_cell.Cell):  # type: ignore
         Returns:
             dict: An updated storm service definition dictionary.
         '''
-        sdef = self.svchive.get(iden)
+        sdef = self.svcdefs.get(iden)
         if sdef is None:
             mesg = f'No storm service with iden: {iden}'
             raise s_exc.NoSuchStormSvc(mesg=mesg)
 
         sdef['evts'] = edef
-        await self.svchive.set(iden, sdef)
+        self.svcdefs.set(iden, sdef)
         return sdef
 
     async def _runStormSvcAdd(self, iden):
-        sdef = self.svchive.get(iden)
+        sdef = self.svcdefs.get(iden)
         if sdef is None:
             mesg = f'No storm service with iden: {iden}'
             raise s_exc.NoSuchStormSvc(mesg=mesg)
@@ -2446,12 +3706,12 @@ class Cortex(s_cell.Cell):  # type: ignore
             return
 
         sdef['added'] = True
-        await self.svchive.set(iden, sdef)
+        self.svcdefs.set(iden, sdef)
 
     async def runStormSvcEvent(self, iden, name):
         assert name in ('add', 'del')
 
-        sdef = self.svchive.get(iden)
+        sdef = self.svcdefs.get(iden)
         if sdef is None:
             mesg = f'No storm service with iden: {iden}'
             raise s_exc.NoSuchStormSvc(mesg=mesg)
@@ -2484,36 +3744,197 @@ class Cortex(s_cell.Cell):  # type: ignore
     # Global stormvars APIs
 
     async def getStormVar(self, name, default=None):
-        return self.stormvars.get(name, default=default)
+        return self.stormvars.get(name, defv=default)
 
-    @s_nexus.Pusher.onPushAuto('stormvar:pop')
     async def popStormVar(self, name, default=None):
-        return await self.stormvars.pop(name, default=default)
+        ok, valu = await self._push('stormvar:pop', name)
+        if not ok:
+            return default
+        return valu
+
+    @s_nexus.Pusher.onPush('stormvar:pop')
+    async def _popStormVar(self, name, default=None):
+        valu = self.stormvars.pop(name, defv=s_common.novalu)
+        if valu is s_common.novalu:
+            return False, None
+        return True, valu
 
     @s_nexus.Pusher.onPushAuto('stormvar:set')
     async def setStormVar(self, name, valu):
-        return await self.stormvars.set(name, valu)
+        return self.stormvars.set(name, valu)
 
     async def itemsStormVar(self):
         for item in self.stormvars.items():
             yield item
 
+    # Storm package vars APIs
+
+    def _getStormPkgVarKV(self, name):
+        if (pkgvars := self.stormpkgvars.get(name)) is None:
+            self.stormpkgvars[name] = pkgvars = self.cortexdata.getSubKeyVal(f'stormpkg:vars:{name}:')
+        return pkgvars
+
+    async def getStormPkgVar(self, name, key, default=None):
+        pkgvars = self._getStormPkgVarKV(name)
+        return pkgvars.get(key, defv=default)
+
+    async def popStormPkgVar(self, name, key, default=None):
+        pkgvars = self._getStormPkgVarKV(name)
+        if pkgvars.get(key, defv=s_common.novalu) is s_common.novalu:
+            return default
+
+        return await self._push('storm:pkg:var:pop', name, key, default=default)
+
+    @s_nexus.Pusher.onPush('storm:pkg:var:pop')
+    async def _popStormPkgVar(self, name, key, default=None):
+        pkgvars = self._getStormPkgVarKV(name)
+        return pkgvars.pop(key, defv=default)
+
+    async def setStormPkgVar(self, name, key, valu):
+        pkgvars = self._getStormPkgVarKV(name)
+        if pkgvars.get(key, defv=s_common.novalu) == valu:
+            return
+
+        return await self._push('storm:pkg:var:set', name, key, valu)
+
+    @s_nexus.Pusher.onPush('storm:pkg:var:set')
+    async def _setStormPkgVar(self, name, key, valu):
+        pkgvars = self._getStormPkgVarKV(name)
+        return pkgvars.set(key, valu)
+
+    async def iterStormPkgVars(self, name):
+        pkgvars = self._getStormPkgVarKV(name)
+        for item in pkgvars.items():
+            yield item
+
+    async def addStormPkgQueue(self, pkgname, name):
+        guid = s_common.guid((pkgname, name))
+        if self.stormpkgqueue.exists(guid):
+            mesg = f'Queue named {name} already exists for package {pkgname}!'
+            raise s_exc.DupName(mesg=mesg)
+
+        info = {
+            'iden': guid,
+            'name': name,
+            'pkgname': pkgname,
+            'created': s_common.now()
+        }
+
+        await self._push('storm:pkg:queue:add', pkgname, name, info)
+
+    @s_nexus.Pusher.onPush('storm:pkg:queue:add')
+    async def _addStormPkgQueue(self, pkgname, name, info):
+        guid = s_common.guid((pkgname, name))
+        if self.stormpkgqueue.exists(guid):
+            return
+        await self.stormpkgqueue.add(guid, info)
+
+    async def listStormPkgQueues(self, pkgname=None):
+        for pkginfo in self.stormpkgqueue.list():
+            if pkgname is None or pkginfo['meta'].get('pkgname') == pkgname:
+                yield pkginfo
+
+    async def getStormPkgQueue(self, pkgname, name):
+        guid = s_common.guid((pkgname, name))
+        return self.stormpkgqueue.status(guid)
+
+    async def delStormPkgQueue(self, pkgname, name):
+        guid = s_common.guid((pkgname, name))
+        if not self.stormpkgqueue.exists(guid):
+            mesg = f'No queue named {name} exists for package {pkgname}!'
+            raise s_exc.NoSuchName(mesg=mesg)
+
+        await self._push('storm:pkg:queue:del', pkgname, name)
+
+    @s_nexus.Pusher.onPush('storm:pkg:queue:del')
+    async def _delStormPkgQueue(self, pkgname, name):
+        guid = s_common.guid((pkgname, name))
+        if not self.stormpkgqueue.exists(guid):
+            return
+        await self.stormpkgqueue.rem(guid)
+
+    async def stormPkgQueueGet(self, pkgname, name, offs=0, wait=False):
+        guid = s_common.guid((pkgname, name))
+        async for item in self.stormpkgqueue.gets(guid, offs, cull=False, wait=wait):
+            return item
+
+    async def stormPkgQueueGets(self, pkgname, name, offs=0, wait=False, size=None):
+        count = 0
+        guid = s_common.guid((pkgname, name))
+        async for item in self.stormpkgqueue.gets(guid, offs, cull=False, wait=wait):
+
+            yield item
+
+            count += 1
+            if size is not None and count >= size:
+                return
+
+    async def stormPkgQueuePuts(self, pkgname, name, items):
+        return await self._push('storm:pkg:queue:puts', pkgname, name, items)
+
+    @s_nexus.Pusher.onPush('storm:pkg:queue:puts', passitem=True)
+    async def _stormPkgQueuePuts(self, pkgname, name, items, nexsitem):
+        nexsoff, nexsmesg = nexsitem
+        guid = s_common.guid((pkgname, name))
+        return await self.stormpkgqueue.puts(guid, items, reqid=nexsoff)
+
+    @s_nexus.Pusher.onPushAuto('storm:pkg:queue:cull')
+    async def stormPkgQueueCull(self, pkgname, name, offs):
+        guid = s_common.guid((pkgname, name))
+        await self.stormpkgqueue.cull(guid, offs)
+
+    @s_nexus.Pusher.onPushAuto('storm:pkg:queue:pop')
+    async def stormPkgQueuePop(self, pkgname, name, offs):
+        guid = s_common.guid((pkgname, name))
+        return await self.stormpkgqueue.pop(guid, offs)
+
+    async def stormPkgQueueSize(self, pkgname, name):
+        guid = s_common.guid((pkgname, name))
+        return self.stormpkgqueue.size(guid)
+
     async def _cortexHealth(self, health):
         health.update('cortex', 'nominal')
 
+    async def _migrateTaxonomyIface(self):
+
+        extforms = await (await self.hive.open(('cortex', 'model', 'forms'))).dict()
+
+        for formname, basetype, typeopts, typeinfo in extforms.values():
+            try:
+                ifaces = typeinfo.get('interfaces')
+
+                if ifaces and 'taxonomy' in ifaces:
+                    logger.warning(f'Migrating taxonomy interface on form {formname} to meta:taxonomy.')
+
+                    ifaces = set(ifaces)
+                    ifaces.remove('taxonomy')
+                    ifaces.add('meta:taxonomy')
+                    typeinfo['interfaces'] = tuple(ifaces)
+
+                    await extforms.set(formname, (formname, basetype, typeopts, typeinfo))
+
+            except Exception as e:  # pragma: no cover
+                logger.exception(f'Taxonomy migration error for form: {formname} (skipped).')
+
     async def _loadExtModel(self):
 
-        self.extforms = await (await self.hive.open(('cortex', 'model', 'forms'))).dict()
-        self.extprops = await (await self.hive.open(('cortex', 'model', 'props'))).dict()
-        self.extunivs = await (await self.hive.open(('cortex', 'model', 'univs'))).dict()
-        self.exttagprops = await (await self.hive.open(('cortex', 'model', 'tagprops'))).dict()
+        self.exttypes = self.cortexdata.getSubKeyVal('model:types:')
+        self.extforms = self.cortexdata.getSubKeyVal('model:forms:')
+        self.extprops = self.cortexdata.getSubKeyVal('model:props:')
+        self.extunivs = self.cortexdata.getSubKeyVal('model:univs:')
+        self.extedges = self.cortexdata.getSubKeyVal('model:edges:')
+        self.exttagprops = self.cortexdata.getSubKeyVal('model:tagprops:')
+
+        for typename, basetype, typeopts, typeinfo in self.exttypes.values():
+            try:
+                self.model.addType(typename, basetype, typeopts, typeinfo)
+            except Exception as e:
+                logger.warning(f'Extended type ({typename}) error: {e}')
 
         for formname, basetype, typeopts, typeinfo in self.extforms.values():
             try:
                 self.model.addType(formname, basetype, typeopts, typeinfo)
                 form = self.model.addForm(formname, {}, ())
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
             except Exception as e:
                 logger.warning(f'Extended form ({formname}) error: {e}')
             else:
@@ -2525,8 +3946,6 @@ class Cortex(s_cell.Cell):  # type: ignore
         for form, prop, tdef, info in self.extprops.values():
             try:
                 prop = self.model.addFormProp(form, prop, tdef, info)
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
             except Exception as e:
                 logger.warning(f'ext prop ({form}:{prop}) error: {e}')
             else:
@@ -2538,63 +3957,183 @@ class Cortex(s_cell.Cell):  # type: ignore
         for prop, tdef, info in self.extunivs.values():
             try:
                 self.model.addUnivProp(prop, tdef, info)
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
             except Exception as e:
                 logger.warning(f'ext univ ({prop}) error: {e}')
 
         for prop, tdef, info in self.exttagprops.values():
             try:
                 self.model.addTagProp(prop, tdef, info)
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
             except Exception as e:
                 logger.warning(f'ext tag prop ({prop}) error: {e}')
 
-    @contextlib.asynccontextmanager
-    async def watcher(self, wdef):
+        for edge, info in self.extedges.values():
+            try:
+                self.model.addEdge(edge, info)
+            except Exception as e:
+                logger.warning(f'ext edge ({edge}) error: {e}')
 
-        iden = wdef.get('view', self.view.iden)
-
-        view = self.views.get(iden)
-        if view is None:
-            raise s_exc.NoSuchView(iden=iden)
-
-        async with await s_queue.Window.anit(maxsize=10000) as wind:
-
-            tags = wdef.get('tags')
-            if tags is not None:
-
-                tglobs = s_cache.TagGlobs()
-                [tglobs.add(t, True) for t in tags]
-
-                async def ontag(mesg):
-                    name = mesg[1].get('tag')
-                    if not tglobs.get(name):
-                        return
-
-                    await wind.put(mesg)
-
-                for layr in self.view.layers:
-                    layr.on('tag:add', ontag, base=wind)
-                    layr.on('tag:del', ontag, base=wind)
-
-            yield wind
-
-    async def watch(self, wdef):
+    async def getExtModel(self):
         '''
-        Hook cortex/view/layer watch points based on a specified watch definition.
-        ( see CoreApi.watch() docs for details )
-        '''
-        async with self.watcher(wdef) as wind:
-            async for mesg in wind:
-                yield mesg
+        Get all extended model properties in the Cortex.
 
+        Returns:
+            dict: A dictionary containing forms, form properties, universal properties and tag properties.
+        '''
+        ret = collections.defaultdict(list)
+        for typename, basetype, typeopts, typeinfo in self.exttypes.values():
+            ret['types'].append((typename, basetype, typeopts, typeinfo))
+
+        for formname, basetype, typeopts, typeinfo in self.extforms.values():
+            ret['forms'].append((formname, basetype, typeopts, typeinfo))
+
+        for form, prop, tdef, info in self.extprops.values():
+            ret['props'].append((form, prop, tdef, info))
+
+        for prop, tdef, info in self.extunivs.values():
+            ret['univs'].append((prop, tdef, info))
+
+        for prop, tdef, info in self.exttagprops.values():
+            ret['tagprops'].append((prop, tdef, info))
+
+        for edge, info in self.extedges.values():
+            ret['edges'].append((edge, info))
+
+        ret['version'] = (1, 0)
+        return copy.deepcopy(dict(ret))
+
+    async def addExtModel(self, model):
+        '''
+        Add an extended model definition to a Cortex from the output of getExtModel().
+
+        Args:
+            model (dict): An extended model dictionary.
+
+        Returns:
+            Bool: True when the model was added.
+
+        Raises:
+            s_exc.BadFormDef: If a form exists with a different definition than the provided definition.
+            s_exc.BadPropDef: If a property, tagprop, or universal property exists with a different definition
+                              than the provided definition.
+            s_exc.BadEdgeDef: If an edge exists with a different definition than the provided definition.
+        '''
+
+        # Get our current model definition
+        emodl = await self.getExtModel()
+        amodl = collections.defaultdict(list)
+
+        types = {info[0]: info for info in model.get('types', ())}
+        forms = {info[0]: info for info in model.get('forms', ())}
+        props = {(info[0], info[1]): info for info in model.get('props', ())}
+        tagprops = {info[0]: info for info in model.get('tagprops', ())}
+        univs = {info[0]: info for info in model.get('univs', ())}
+        edges = {info[0]: info for info in model.get('edges', ())}
+
+        etyps = {info[0]: info for info in emodl.get('types', ())}
+        efrms = {info[0]: info for info in emodl.get('forms', ())}
+        eprops = {(info[0], info[1]): info for info in emodl.get('props', ())}
+        etagprops = {info[0]: info for info in emodl.get('tagprops', ())}
+        eunivs = {info[0]: info for info in emodl.get('univs', ())}
+        eedges = {info[0]: info for info in emodl.get('edges', ())}
+
+        for (name, info) in types.items():
+            enfo = etyps.get(name)
+            if enfo is None:
+                amodl['types'].append(info)
+                continue
+            if enfo == info:
+                continue
+            mesg = f'Extended type definition differs from existing definition for {name}.'
+            raise s_exc.BadTypeDef(mesg=mesg, name=name)
+
+        for (name, info) in forms.items():
+            enfo = efrms.get(name)
+            if enfo is None:
+                amodl['forms'].append(info)
+                continue
+            if enfo == info:
+                continue
+            mesg = f'Extended form definition differs from existing definition for {name}.'
+            raise s_exc.BadFormDef(mesg=mesg, name=name)
+
+        for (name, info) in props.items():
+            enfo = eprops.get(name)
+            if enfo is None:
+                amodl['props'].append(info)
+                continue
+            if enfo == info:
+                continue
+            mesg = f'Extended prop definition differs from existing definition for {name}'
+            raise s_exc.BadPropDef(mesg=mesg, name=name)
+
+        for (name, info) in tagprops.items():
+            enfo = etagprops.get(name)
+            if enfo is None:
+                amodl['tagprops'].append(info)
+                continue
+            if enfo == info:
+                continue
+            mesg = f'Extended tagprop definition differs from existing definition for {name}'
+            raise s_exc.BadPropDef(mesg=mesg, name=name)
+
+        for (name, info) in univs.items():
+            enfo = eunivs.get(name)
+            if enfo is None:
+                amodl['univs'].append(info)
+                continue
+            if enfo == info:
+                continue
+            mesg = f'Extended universal property definition differs from existing definition for {name}'
+            raise s_exc.BadPropDef(mesg=mesg, name=name)
+
+        for (name, info) in edges.items():
+            enfo = eedges.get(name)
+            if enfo is None:
+                amodl['edges'].append(info)
+                continue
+            if enfo == info:
+                continue
+
+            (n1form, verb, n2form) = info[0]
+            mesg = f'Extended edge definition differs from existing definition for {info[0]}'
+            raise s_exc.BadEdgeDef(mesg=mesg, n1form=n1form, verb=verb, n2form=n2form)
+
+        for typename, basetype, typeopts, typeinfo in amodl['types']:
+            await self.addType(typename, basetype, typeopts, typeinfo)
+
+        for formname, basetype, typeopts, typeinfo in amodl['forms']:
+            await self.addForm(formname, basetype, typeopts, typeinfo)
+
+        for form, prop, tdef, info in amodl['props']:
+            await self.addFormProp(form, prop, tdef, info)
+
+        for prop, tdef, info in amodl['tagprops']:
+            await self.addTagProp(prop, tdef, info)
+
+        for prop, tdef, info in amodl['univs']:
+            await self.addUnivProp(prop, tdef, info)
+
+        for edge, info in amodl['edges']:
+            await self.addEdge(edge, info)
+
+        return True
+
+    @s_cell.from_leader
     async def addUnivProp(self, name, tdef, info):
+        if not isinstance(tdef, tuple):
+            mesg = 'Universal property type definitions should be a tuple.'
+            raise s_exc.BadArg(name=name, mesg=mesg)
+
+        if not isinstance(info, dict):
+            mesg = 'Universal property definitions should be a dict.'
+            raise s_exc.BadArg(name=name, mesg=mesg)
+
         # the loading function does the actual validation...
         if not name.startswith('_'):
             mesg = 'ext univ name must start with "_"'
             raise s_exc.BadPropDef(name=name, mesg=mesg)
+
+        self.model.getTypeClone(tdef)
 
         base = '.' + name
         if base in self.model.props:
@@ -2604,27 +4143,69 @@ class Cortex(s_cell.Cell):  # type: ignore
 
     @s_nexus.Pusher.onPush('model:univ:add')
     async def _addUnivProp(self, name, tdef, info):
+        base = '.' + name
+        if base in self.model.props:
+            return
+
         self.model.addUnivProp(name, tdef, info)
 
-        await self.extunivs.set(name, (name, tdef, info))
+        self.extunivs.set(name, (name, tdef, info))
         await self.fire('core:extmodel:change', prop=name, act='add', type='univ')
+        base = '.' + name
+        univ = self.model.univ(base)
+        if univ:
+            await self.feedBeholder('model:univ:add', univ.pack())
 
+    @s_cell.from_leader
     async def addForm(self, formname, basetype, typeopts, typeinfo):
+        if not isinstance(typeopts, dict):
+            mesg = 'Form type options should be a dict.'
+            raise s_exc.BadArg(form=formname, mesg=mesg)
+
+        if not isinstance(typeinfo, dict):
+            mesg = 'Form type info should be a dict.'
+            raise s_exc.BadArg(form=formname, mesg=mesg)
+
         if not formname.startswith('_'):
             mesg = 'Extended form must begin with "_"'
             raise s_exc.BadFormDef(form=formname, mesg=mesg)
+
         if self.model.form(formname) is not None:
             mesg = f'Form name already exists: {formname}'
             raise s_exc.DupFormName(mesg=mesg)
+
+        if self.model.type(formname) is not None:
+            mesg = f'Type already exists: {formname}'
+            raise s_exc.DupTypeName.init(formname)
+
+        self.model.getTypeClone((basetype, typeopts))
+
         return await self._push('model:form:add', formname, basetype, typeopts, typeinfo)
 
     @s_nexus.Pusher.onPush('model:form:add')
     async def _addForm(self, formname, basetype, typeopts, typeinfo):
+        if self.model.form(formname) is not None:
+            return
+
+        ifaces = typeinfo.get('interfaces')
+
+        if ifaces and 'taxonomy' in ifaces:
+            logger.warning(f'{formname} is using the deprecated taxonomy interface, updating to meta:taxonomy.')
+
+            ifaces = set(ifaces)
+            ifaces.remove('taxonomy')
+            ifaces.add('meta:taxonomy')
+            typeinfo['interfaces'] = tuple(ifaces)
+
         self.model.addType(formname, basetype, typeopts, typeinfo)
         self.model.addForm(formname, {}, ())
 
-        await self.extforms.set(formname, (formname, basetype, typeopts, typeinfo))
+        self.extforms.set(formname, (formname, basetype, typeopts, typeinfo))
         await self.fire('core:extmodel:change', form=formname, act='add', type='form')
+        form = self.model.form(formname)
+        ftyp = self.model.type(formname)
+        if form and ftyp:
+            await self.feedBeholder('model:form:add', {'form': form.pack(), 'type': ftyp.pack()})
 
     async def delForm(self, formname):
         if not formname.startswith('_'):
@@ -2632,56 +4213,249 @@ class Cortex(s_cell.Cell):  # type: ignore
             raise s_exc.BadFormDef(form=formname, mesg=mesg)
 
         if self.model.form(formname) is None:
-            raise s_exc.NoSuchForm(name=formname)
+            raise s_exc.NoSuchForm.init(formname)
 
         return await self._push('model:form:del', formname)
 
     @s_nexus.Pusher.onPush('model:form:del')
     async def _delForm(self, formname):
+        if self.model.form(formname) is None:
+            return
 
         for layr in self.layers.values():
             async for item in layr.iterFormRows(formname):
-                mesg = f'Nodes still exist with form: {formname}'
+                mesg = f'Nodes still exist with form: {formname} in layer {layr.iden}'
                 raise s_exc.CantDelForm(mesg=mesg)
 
         self.model.delForm(formname)
         self.model.delType(formname)
 
-        await self.extforms.pop(formname, None)
+        self.extforms.pop(formname, None)
         await self.fire('core:extmodel:change', form=formname, act='del', type='form')
+        await self.feedBeholder('model:form:del', {'form': formname})
 
+    @s_cell.from_leader
+    async def addType(self, typename, basetype, typeopts, typeinfo):
+        if not isinstance(typeopts, dict):
+            mesg = 'Type options should be a dict.'
+            raise s_exc.BadArg(type=typename, mesg=mesg)
+
+        if not isinstance(typeinfo, dict):
+            mesg = 'Type info should be a dict.'
+            raise s_exc.BadArg(type=typename, mesg=mesg)
+
+        if not typename.startswith('_'):
+            mesg = 'Extended type must begin with "_".'
+            raise s_exc.BadTypeDef(type=typename, mesg=mesg)
+
+        if self.model.type(typename) is not None:
+            raise s_exc.DupTypeName.init(typename)
+
+        if (base := self.model.type(basetype)) is None:
+            mesg = f'Specified base type {basetype} does not exist.'
+            raise s_exc.NoSuchType(mesg=mesg, name=basetype)
+
+        base.clone(typeopts)
+
+        return await self._push('model:type:add', typename, basetype, typeopts, typeinfo)
+
+    @s_nexus.Pusher.onPush('model:type:add')
+    async def _addType(self, typename, basetype, typeopts, typeinfo):
+        if self.model.type(typename) is not None:
+            return
+
+        ifaces = typeinfo.get('interfaces')
+
+        if ifaces and 'taxonomy' in ifaces:
+            logger.warning(f'{typename} is using the deprecated taxonomy interface, updating to meta:taxonomy.')
+
+            ifaces = set(ifaces)
+            ifaces.remove('taxonomy')
+            ifaces.add('meta:taxonomy')
+            typeinfo['interfaces'] = tuple(ifaces)
+
+        self.model.addType(typename, basetype, typeopts, typeinfo)
+
+        self.exttypes.set(typename, (typename, basetype, typeopts, typeinfo))
+        await self.fire('core:extmodel:change', name=typename, act='add', type='type')
+
+        if (_type := self.model.type(typename)) is not None:
+            await self.feedBeholder('model:type:add', {'type': _type.pack()})
+
+    async def delType(self, typename):
+        if not typename.startswith('_'):
+            mesg = 'Extended type must begin with "_".'
+            raise s_exc.BadTypeDef(type=typename, mesg=mesg)
+
+        if self.model.type(typename) is None:
+            raise s_exc.NoSuchType.init(typename)
+
+        return await self._push('model:type:del', typename)
+
+    @s_nexus.Pusher.onPush('model:type:del')
+    async def _delType(self, typename):
+        if self.model.type(typename) is None:
+            return
+
+        self.model.delType(typename)
+
+        self.exttypes.pop(typename, None)
+        await self.fire('core:extmodel:change', name=typename, act='del', type='type')
+        await self.feedBeholder('model:type:del', {'type': typename})
+
+    @s_cell.from_leader
     async def addFormProp(self, form, prop, tdef, info):
+        if not isinstance(tdef, tuple):
+            mesg = 'Form property type definitions should be a tuple.'
+            raise s_exc.BadArg(form=form, mesg=mesg)
+
+        if not isinstance(info, dict):
+            mesg = 'Form property definitions should be a dict.'
+            raise s_exc.BadArg(form=form, mesg=mesg)
+
         if not prop.startswith('_') and not form.startswith('_'):
             mesg = 'Extended prop must begin with "_" or be added to an extended form.'
             raise s_exc.BadPropDef(prop=prop, mesg=mesg)
         _form = self.model.form(form)
         if _form is None:
-            raise s_exc.NoSuchForm(mesg='Form {form} does not exist.', name=form)
+            raise s_exc.NoSuchForm.init(form)
         if _form.prop(prop):
             raise s_exc.DupPropName(mesg=f'Cannot add duplicate form prop {form} {prop}',
                                      form=form, prop=prop)
+
+        self.model.getTypeClone(tdef)
+
         await self._push('model:prop:add', form, prop, tdef, info)
 
     @s_nexus.Pusher.onPush('model:prop:add')
     async def _addFormProp(self, form, prop, tdef, info):
+        if (_form := self.model.form(form)) is not None and _form.prop(prop) is not None:
+            return
+
         _prop = self.model.addFormProp(form, prop, tdef, info)
         if _prop.type.deprecated:
             mesg = f'The extended property {_prop.full} is using a deprecated type {_prop.type.name} which will' \
                    f' be removed in 3.0.0'
             logger.warning(mesg)
 
-        await self.extprops.set(f'{form}:{prop}', (form, prop, tdef, info))
+        full = f'{form}:{prop}'
+        self.extprops.set(full, (form, prop, tdef, info))
         await self.fire('core:extmodel:change', form=form, prop=prop, act='add', type='formprop')
+        prop = self.model.prop(full)
+        if prop:
+            await self.feedBeholder('model:prop:add', {'form': form, 'prop': prop.pack()})
 
     async def delFormProp(self, form, prop):
+        self.reqExtProp(form, prop)
+        return await self._push('model:prop:del', form, prop)
+
+    async def _delAllFormProp(self, formname, propname, meta):
+        '''
+        Delete all instances of a property from all layers.
+
+        NOTE: This does not fire triggers.
+        '''
+        self.reqExtProp(formname, propname)
+
+        fullname = f'{formname}:{propname}'
+        prop = self.model.prop(fullname)
+
+        await self.setPropLocked(fullname, True)
+
+        for layr in list(self.layers.values()):
+
+            genr = layr.iterPropRows(formname, propname)
+
+            async for rows in s_coro.chunks(genr):
+                nodeedits = []
+                for buid, valu in rows:
+                    nodeedits.append((buid, prop.form.name, (
+                        (s_layer.EDIT_PROP_DEL, (prop.name, None, prop.type.stortype), ()),
+                    )))
+
+                await layr.saveNodeEdits(nodeedits, meta)
+                await asyncio.sleep(0)
+
+    async def _delAllUnivProp(self, propname, meta):
+        '''
+        Delete all instances of a universal property from all layers.
+
+        NOTE: This does not fire triggers.
+        '''
+        self.reqExtUniv(propname)
+
+        full = f'.{propname}'
+        prop = self.model.univ(full)
+
+        await self.setUnivLocked(full, True)
+
+        for layr in list(self.layers.values()):
+
+            genr = layr.iterUnivRows(full)
+
+            async for rows in s_coro.chunks(genr):
+                nodeedits = []
+                for buid, valu in rows:
+                    sode = await layr.getStorNode(buid)
+                    nodeedits.append((buid, sode.get('form'), (
+                        (s_layer.EDIT_PROP_DEL, (prop.name, None, prop.type.stortype), ()),
+                    )))
+
+                await layr.saveNodeEdits(nodeedits, meta)
+                await asyncio.sleep(0)
+
+    async def _delAllTagProp(self, propname, meta):
+        '''
+        Delete all instances of a tag property from all layers.
+
+        NOTE: This does not fire triggers.
+        '''
+        self.reqExtTagProp(propname)
+        prop = self.model.getTagProp(propname)
+
+        await self.setTagPropLocked(propname, True)
+
+        for layr in list(self.layers.values()):
+
+            for form, tag, tagprop in layr.getTagProps():
+
+                if tagprop != propname: # pragma: no cover
+                    await asyncio.sleep(0)
+                    continue
+
+                genr = layr.iterTagPropRows(tag, tagprop, form)
+
+                async for rows in s_coro.chunks(genr):
+                    nodeedits = []
+                    for buid, valu in rows:
+                        nodeedits.append((buid, form, (
+                            (s_layer.EDIT_TAGPROP_DEL, (tag, prop.name, None, prop.type.stortype), ()),
+                        )))
+
+                    await layr.saveNodeEdits(nodeedits, meta)
+                    await asyncio.sleep(0)
+
+    def reqExtProp(self, form, prop):
         full = f'{form}:{prop}'
         pdef = self.extprops.get(full)
-
         if pdef is None:
             mesg = f'No ext prop named {full}'
             raise s_exc.NoSuchProp(form=form, prop=prop, mesg=mesg)
+        return pdef
 
-        return await self._push('model:prop:del', form, prop)
+    def reqExtUniv(self, prop):
+        udef = self.extunivs.get(prop)
+        if udef is None:
+            mesg = f'No ext univ named {prop}'
+            raise s_exc.NoSuchUniv(name=prop, mesg=mesg)
+        return udef
+
+    def reqExtTagProp(self, name):
+        pdef = self.exttagprops.get(name)
+        if pdef is None:
+            mesg = f'No tag prop named {name}'
+            raise s_exc.NoSuchTagProp(mesg=mesg, name=name)
+        return pdef
 
     @s_nexus.Pusher.onPush('model:prop:del')
     async def _delFormProp(self, form, prop):
@@ -2696,20 +4470,19 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         for layr in self.layers.values():
             async for item in layr.iterPropRows(form, prop):
-                mesg = f'Nodes still exist with prop: {form}:{prop}'
+                mesg = f'Nodes still exist with prop: {form}:{prop} in layer {layr.iden}'
                 raise s_exc.CantDelProp(mesg=mesg)
 
         self.model.delFormProp(form, prop)
-        await self.extprops.pop(full, None)
+        self.extprops.pop(full, None)
+        self.modellocks.pop(f'prop/{full}', None)
         await self.fire('core:extmodel:change',
                         form=form, prop=prop, act='del', type='formprop')
 
-    async def delUnivProp(self, prop):
-        udef = self.extunivs.get(prop)
-        if udef is None:
-            mesg = f'No ext univ named {prop}'
-            raise s_exc.NoSuchUniv(name=prop, mesg=mesg)
+        await self.feedBeholder('model:prop:del', {'form': form, 'prop': prop})
 
+    async def delUnivProp(self, prop):
+        self.reqExtUniv(prop)
         return await self._push('model:univ:del', prop)
 
     @s_nexus.Pusher.onPush('model:univ:del')
@@ -2724,16 +4497,29 @@ class Cortex(s_cell.Cell):  # type: ignore
         univname = '.' + prop
         for layr in self.layers.values():
             async for item in layr.iterUnivRows(univname):
-                mesg = f'Nodes still exist with universal prop: {prop}'
+                mesg = f'Nodes still exist with universal prop: {prop} in layer {layr.iden}'
                 raise s_exc.CantDelUniv(mesg=mesg)
 
         self.model.delUnivProp(prop)
-        await self.extunivs.pop(prop, None)
+        self.extunivs.pop(prop, None)
+        self.modellocks.pop(f'univ/{prop}', None)
         await self.fire('core:extmodel:change', name=prop, act='del', type='univ')
+        await self.feedBeholder('model:univ:del', {'prop': univname})
 
+    @s_cell.from_leader
     async def addTagProp(self, name, tdef, info):
+        if not isinstance(tdef, tuple):
+            mesg = 'Tag property type definitions should be a tuple.'
+            raise s_exc.BadArg(name=name, mesg=mesg)
+
+        if not isinstance(info, dict):
+            mesg = 'Tag property definitions should be a dict.'
+            raise s_exc.BadArg(name=name, mesg=mesg)
+
         if self.exttagprops.get(name) is not None:
             raise s_exc.DupPropName(name=name)
+
+        self.model.getTypeClone(tdef)
 
         return await self._push('model:tagprop:add', name, tdef, info)
 
@@ -2744,15 +4530,14 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         self.model.addTagProp(name, tdef, info)
 
-        await self.exttagprops.set(name, (name, tdef, info))
+        self.exttagprops.set(name, (name, tdef, info))
         await self.fire('core:tagprop:change', name=name, act='add')
+        tagp = self.model.tagprop(name)
+        if tagp:
+            await self.feedBeholder('model:tagprop:add', tagp.pack())
 
     async def delTagProp(self, name):
-        pdef = self.exttagprops.get(name)
-        if pdef is None:
-            mesg = f'No tag prop named {name}'
-            raise s_exc.NoSuchProp(mesg=mesg, name=name)
-
+        self.reqExtTagProp(name)
         return await self._push('model:tagprop:del', name)
 
     @s_nexus.Pusher.onPush('model:tagprop:del')
@@ -2763,13 +4548,66 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         for layr in self.layers.values():
             if await layr.hasTagProp(name):
-                mesg = f'Nodes still exist with tagprop: {name}'
+                mesg = f'Nodes still exist with tagprop: {name} in layer {layr.iden}'
                 raise s_exc.CantDelProp(mesg=mesg)
 
         self.model.delTagProp(name)
 
-        await self.exttagprops.pop(name, None)
+        self.exttagprops.pop(name, None)
+        self.modellocks.pop(f'tagprop/{name}', None)
         await self.fire('core:tagprop:change', name=name, act='del')
+        await self.feedBeholder('model:tagprop:del', {'tagprop': name})
+
+    @s_cell.from_leader
+    async def addEdge(self, edge, edgeinfo):
+        if not isinstance(edgeinfo, dict):
+            mesg = 'Edge info should be a dict.'
+            raise s_exc.BadArg(mesg=mesg, edgeinfo=edgeinfo)
+
+        (n1form, verb, n2form) = edge
+        if not verb.startswith('_'):
+            mesg = f'Extended edge verb must begin with "_"; got {verb}'
+            raise s_exc.BadEdgeDef(mesg=mesg, n1form=n1form, verb=verb, n2form=n2form)
+
+        if n1form is not None:
+            self.model._reqFormName(n1form)
+
+        if n2form is not None:
+            self.model._reqFormName(n2form)
+
+        if self.model.edge(edge) is not None:
+            raise s_exc.DupEdgeType.init(edge)
+
+        return await self._push('model:edge:add', edge, edgeinfo)
+
+    @s_nexus.Pusher.onPush('model:edge:add')
+    async def _addEdge(self, edge, edgeinfo):
+        if self.model.edge(edge) is not None:
+            return
+
+        self.model.addEdge(edge, edgeinfo)
+
+        self.extedges.set(s_common.guid(edge), (edge, edgeinfo))
+        await self.fire('core:extmodel:change', edge=edge, act='add', type='edge')
+        await self.feedBeholder('model:edge:add', {'edge': edge, 'info': edgeinfo})
+
+    async def delEdge(self, edge):
+        if self.extedges.get(s_common.guid(edge)) is None:
+            raise s_exc.NoSuchEdge.init(edge)
+
+        return await self._push('model:edge:del', edge)
+
+    @s_nexus.Pusher.onPush('model:edge:del')
+    async def _delEdge(self, edge):
+        edgeguid = s_common.guid(edge)
+        if self.extedges.get(edgeguid) is None:
+            return
+
+        self.model.delEdge(edge)
+
+        self.extedges.pop(edgeguid, None)
+        await self.fire('core:extmodel:change', edge=edge, act='del', type='edge')
+        await self.feedBeholder('model:edge:del', {'edge': edge})
 
     async def addNodeTag(self, user, iden, tag, valu=(None, None)):
         '''
@@ -2784,14 +4622,12 @@ class Cortex(s_cell.Cell):  # type: ignore
         buid = s_common.uhex(iden)
         async with await self.snap(user=user) as snap:
 
-            with s_provenance.claim('coreapi', meth='tag:add', user=snap.user.iden):
+            node = await snap.getNodeByBuid(buid)
+            if node is None:
+                raise s_exc.NoSuchIden(iden=iden)
 
-                node = await snap.getNodeByBuid(buid)
-                if node is None:
-                    raise s_exc.NoSuchIden(iden=iden)
-
-                await node.addTag(tag, valu=valu)
-                return node.pack()
+            await node.addTag(tag, valu=valu)
+            return node.pack()
 
     async def addNode(self, user, form, valu, props=None):
 
@@ -2811,21 +4647,24 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         async with await self.snap(user=user) as snap:
 
-            with s_provenance.claim('coreapi', meth='tag:del', user=snap.user.iden):
+            node = await snap.getNodeByBuid(buid)
+            if node is None:
+                raise s_exc.NoSuchIden(iden=iden)
 
-                node = await snap.getNodeByBuid(buid)
-                if node is None:
-                    raise s_exc.NoSuchIden(iden=iden)
-
-                await node.delTag(tag)
-                return node.pack()
+            await node.delTag(tag)
+            return node.pack()
 
     async def _onCoreFini(self):
         '''
         Generic fini handler for cortex components which may change or vary at runtime.
         '''
-        if self.axon:
+        if self.axon is not None:
             await self.axon.fini()
+
+        if self.jsonstor is not None:
+            await self.jsonstor.fini()
+
+        [await wind.fini() for wind in tuple(self.nodeeditwindows)]
 
     async def syncLayerNodeEdits(self, iden, offs, wait=True):
         '''
@@ -2833,7 +4672,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.getLayer(iden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=iden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {iden}', iden=iden)
 
         async for item in layr.syncNodeEdits(offs, wait=wait):
             yield item
@@ -2853,27 +4692,90 @@ class Cortex(s_cell.Cell):  # type: ignore
                 unspecified layers or if offsdict is None.
             wait(bool):  whether to pend and stream value until this layer is fini'd
         '''
-        async def layrgenr(layr, startoff, endoff=None, newlayer=False):
-            if newlayer:
-                yield layr.addoffs, layr.iden, SYNC_LAYR_ADD, (), {}
+        if link := s_scope.get('link'):
+            addrinfo = link.getAddrInfo()
+        else:
+            addrinfo = None
 
-            wait = endoff is None
+        if offsdict is None:
+            offsdict = {}
+        else:
+            offsdict = copy.deepcopy(offsdict)
 
-            if not layr.isfini:
+        async def layrgenr(layr, startoffs):
+            try:
+                async for ioff, nodeedits, meta in layr.syncNodeEdits2(startoffs, wait=False):
+                    yield ioff, layr.iden, SYNC_NODEEDITS, nodeedits, meta
+            except s_exc.IsFini:
+                if layr.isdeleted:
+                    yield layr.deloffs, layr.iden, SYNC_LAYR_DEL, (), {}
 
-                async for ioff, item, meta in layr.syncNodeEdits2(startoff, wait=wait):
-                    if endoff is not None and ioff >= endoff:  # pragma: no cover
+        async def windfini():
+            self.nodeeditwindows.discard(wind)
+
+        async def onlayr(mesg):
+            evnt = SYNC_LAYR_ADD if mesg[0] == 'core:layr:add' else SYNC_LAYR_DEL
+            await wind.put((mesg[1]['iden'], mesg[1]['offs'], None, {'event': evnt}))
+
+        while not self.isfini:
+
+            async with await s_base.Base.anit() as base:
+
+                if wait:
+                    wind = await s_queue.Window.anit(maxsize=s_layer.WINDOW_MAXSIZE * 10)
+                    wind.onfini(windfini)
+                    self.nodeeditwindows.add(wind)
+                    base.onfini(wind)
+                    self.on('core:layr:add', onlayr, base=base)
+                    self.on('core:layr:del', onlayr, base=base)
+
+                logger.debug(f'syncLayersEvents() running catch-up sync link={addrinfo}')
+
+                genrs = []
+                topoffs = 0
+                for layr in self.layers.values():
+                    topoffs = max(topoffs, layr.nodeeditlog.index())
+                    genrs.append(layrgenr(layr, offsdict.get(layr.iden, 0)))
+
+                async for item in s_common.merggenr2(genrs, cmprkey=lambda x: x[0]):
+
+                    if item[2] == SYNC_LAYR_DEL:
+                        offsdict.pop(item[1], None)
+                        yield item
+                        await asyncio.sleep(0)
+                        continue
+
+                    if item[0] >= topoffs:
                         break
 
-                    yield ioff, layr.iden, SYNC_NODEEDITS, item, meta
+                    offsdict[item[1]] = item[0] + 1
 
-            if layr.isdeleted:
-                yield layr.deloffs, layr.iden, SYNC_LAYR_DEL, (), {}
+                    yield item
+                    await asyncio.sleep(0)
 
-        # End of layrgenr
+                if not wait:
+                    return
 
-        async for item in self._syncNodeEdits(offsdict, layrgenr, wait=wait):
-            yield item
+                logger.debug(f'syncLayersEvents() entering live sync link={addrinfo}')
+
+                async for layriden, ioff, nodeedits, meta in wind:
+
+                    if nodeedits is not None:
+                        offsdict[layriden] = ioff + 1
+                        yield ioff, layriden, SYNC_NODEEDITS, nodeedits, meta
+                        await asyncio.sleep(0)
+                        continue
+
+                    if meta['event'] == SYNC_LAYR_ADD:
+                        offsdict[layriden] = ioff + 1
+                        yield ioff, layriden, SYNC_LAYR_ADD, (), {}
+                    elif layriden in offsdict:
+                        yield ioff, layriden, SYNC_LAYR_DEL, (), {}
+                        offsdict.pop(layriden, None)
+                    await asyncio.sleep(0)
+
+            logger.debug(f'syncLayersEvents() exited live sync link={addrinfo}')
+            await self.waitfini(1)
 
     async def syncIndexEvents(self, matchdef, offsdict=None, wait=True):
         '''
@@ -2900,173 +4802,51 @@ class Cortex(s_cell.Cell):  # type: ignore
                 unspecified layers or if offsdict is None.
             wait(bool):  whether to pend and stream value until this layer is fini'd
         '''
-        async def layrgenr(layr, startoff, endoff=None, newlayer=False):
-            ''' Yields matching results from a single layer '''
 
-            if newlayer:
-                yield layr.addoffs, layr.iden, SYNC_LAYR_ADD, ()
+        formm = set(matchdef.get('forms', ()))
+        propm = set(matchdef.get('props', ()))
+        tagsm = set(matchdef.get('tags', ()))
+        tagpm = set(matchdef.get('tagprops', ()))
 
-            wait = endoff is None
-            ioff = startoff
-
-            if not layr.isfini:
-
-                async for ioff, item in layr.syncIndexEvents(startoff, matchdef, wait=wait):
-                    if endoff is not None and ioff >= endoff:  # pragma: no cover
-                        break
-
-                    yield ioff, layr.iden, SYNC_NODEEDIT, item
-
-            if layr.isdeleted:
-                yield layr.deloffs, layr.iden, SYNC_LAYR_DEL, ()
-
-        # End of layrgenr
-
-        async for item in self._syncNodeEdits(offsdict, layrgenr, wait=wait):
-            yield item
-
-    async def _syncNodeEdits(self, offsdict, genrfunc, wait=True):
-        '''
-        Common guts between syncIndexEvents and syncLayersEvents
-
-        First, it streams from the layers up to the current offset, sorted by offset.
-        Then it streams from all the layers simultaneously.
-
-        Args:
-            offsdict(Dict[str, int]): starting nexus/editlog offset per layer.  Defaults to 0 if layer not present
-            genrfunc(Callable): an async generator function that yields tuples that start with an offset.  The input
-               parameters are:
-                layr(Layer): a Layer object
-                startoff(int);  the starting offset
-                endoff(Optional[int]):  the ending offset
-                newlayer(bool):  whether to emit a new layer item first
-            wait(bool): when the end of the log is hit, whether to continue to wait for new entries and yield them
-        '''
-        catchingup = True                   # whether we've caught up to topoffs
-        layrsadded = {}                     # layriden -> True.  Captures all the layers added while catching up
-        todo = set()                        # outstanding futures of active live streaming from layers
-        layrgenrs = {}                      # layriden -> genr.  maps active layers to that layer's async generator
-
-        # The offset to start from once the catch-up phase is complete
-        topoffs = max(layr.nodeeditlog.index() for layr in self.layers.values())
-
-        if offsdict is None:
-            offsdict = {}
-
-        newtodoevent = asyncio.Event()
-
-        async with await s_base.Base.anit() as base:
-
-            def addlayr(layr, newlayer=False):
-                '''
-                A new layer joins the live stream
-                '''
-                genr = genrfunc(layr, topoffs, newlayer=newlayer)
-                layrgenrs[layr.iden] = genr
-                task = base.schedCoro(genr.__anext__())
-                task.iden = layr.iden
-                todo.add(task)
-                newtodoevent.set()
-
-            def onaddlayr(mesg):
-                etyp, event = mesg
-                layriden = event['iden']
-                layr = self.getLayer(layriden)
-                if catchingup:
-                    layrsadded[layr] = True
-                    return
-
-                addlayr(layr, newlayer=True)
-
-            self.on('core:layr:add', onaddlayr, base=base)
-
-            # First, catch up to what was the current offset when we started, guaranteeing order
-
-            genrs = [genrfunc(layr, offsdict.get(layr.iden, 0), endoff=topoffs) for layr in self.layers.values()]
-            async for item in s_common.merggenr(genrs, lambda x, y: x[0] < y[0]):
-                yield item
-
-            catchingup = False
-
-            if not wait:
-                return
-
-            # After we've caught up, read on genrs from all the layers simultaneously
-
-            todo.clear()
-
-            for layr in self.layers.values():
-                if layr not in layrsadded:
-                    addlayr(layr)
-
-            for layr in layrsadded:
-                addlayr(layr, newlayer=True)
-
-            # Also, wake up if we get fini'd
-            finitask = base.schedCoro(self.waitfini())
-            todo.add(finitask)
-
-            newtodotask = base.schedCoro(newtodoevent.wait())
-            todo.add(newtodotask)
-
-            while not self.isfini:
-                newtodoevent.clear()
-                done, _ = await asyncio.wait(todo, return_when=asyncio.FIRST_COMPLETED)
-
-                for donetask in done:
-                    try:
-                        todo.remove(donetask)
-
-                        if donetask is finitask:  # pragma: no cover  # We were fini'd
-                            return
-
-                        if donetask is newtodotask:
-                            newtodotask = base.schedCoro(newtodoevent.wait())
-                            todo.add(newtodotask)
-                            continue
-
-                        layriden = donetask.iden
-
-                        result = donetask.result()
-
-                        yield result
-
-                        # Re-add a task to wait on the next iteration of the generator
-                        genr = layrgenrs[layriden]
-                        task = base.schedCoro(genr.__anext__())
-                        task.iden = layriden
-                        todo.add(task)
-
-                    except StopAsyncIteration:
-                        # Help out the garbage collector
-                        del layrgenrs[layriden]
-
-    async def spliceHistory(self, user):
-        '''
-        Yield splices backwards from the end of the nodeedit log.
-
-        Will only return user's own splices unless they are an admin.
-        '''
-        layr = self.view.layers[0]
+        edit_node = set((s_layer.EDIT_NODE_ADD, s_layer.EDIT_NODE_DEL))
+        edit_prop = set((s_layer.EDIT_PROP_SET, s_layer.EDIT_PROP_DEL))
+        edit_tags = set((s_layer.EDIT_TAG_SET, s_layer.EDIT_TAG_DEL))
+        edit_tagp = set((s_layer.EDIT_TAGPROP_SET, s_layer.EDIT_TAGPROP_DEL))
 
         count = 0
-        async for _, mesg in layr.splicesBack():
-            count += 1
-            if not count % 1000:  # pragma: no cover
-                await asyncio.sleep(0)
 
-            if user.iden == mesg[1]['user'] or user.isAdmin():
-                yield mesg
+        async for ioff, layriden, evnt, nodeedits, _meta in self.syncLayersEvents(offsdict=offsdict, wait=wait):
 
-    async def _initCoreHive(self):
-        stormvarsnode = await self.hive.open(('cortex', 'storm', 'vars'))
-        self.stormvars = await stormvarsnode.dict()
+            if evnt == SYNC_NODEEDITS:
+                for buid, form, edit in nodeedits:
+                    for etyp, vals, meta in edit:
+                        if (
+                            (etyp in edit_node and form in formm) or
+                            (etyp in edit_prop and (vals[0] in propm or f'{form}:{vals[0]}' in propm)) or
+                            (etyp in edit_tags and vals[0] in tagsm) or
+                            (etyp in edit_tagp and (vals[1] in tagpm or f'{vals[0]}:{vals[1]}' in tagpm))
+                        ):
+                            yield ioff, layriden, SYNC_NODEEDIT, (buid, form, etyp, vals, meta)
+                        await asyncio.sleep(0)
+
+                count += 1
+                if count % 1000 == 0:
+                    yield ioff, layriden, SYNC_NODEEDIT, (None, None, s_layer.EDIT_PROGRESS, (), ())
+
+                continue
+
+            yield ioff, layriden, evnt, ()
+
+    async def _initCoreInfo(self):
+        self.stormvars = self.cortexdata.getSubKeyVal('storm:vars:')
         if self.inaugural:
-            await self.stormvars.set(s_stormlib_cell.runtime_fixes_key, s_stormlib_cell.getMaxHotFixes())
-        self.onfini(self.stormvars)
+            self.stormvars.set(s_stormlib_cell.runtime_fixes_key, s_stormlib_cell.getMaxHotFixes())
 
     async def _initDeprLocks(self):
-        self.deprlocks = await self.hive.get(('cortex', 'model', 'deprlocks'), {})  # type: s_hive.Node
+
+        self.deprlocks = self.cortexdata.getSubKeyVal('model:deprlocks:')
+        self.modellocks = self.cortexdata.getSubKeyVal('model:locks:')
+
         # TODO: 3.0.0 conversion will truncate this hive key
 
         if self.inaugural:
@@ -3091,6 +4871,24 @@ class Cortex(s_cell.Cell):  # type: ignore
             _type = self.model.type(name)
             if _type is not None:
                 _type.locked = locked
+
+        for name, locked in self.modellocks.items():
+
+            prop = None
+            elemtype, elemname = name.split('/', 1)
+
+            if elemtype == 'prop':
+                prop = self.model.prop(elemname)
+            elif elemtype == 'univ':
+                prop = self.model.univ(elemname)
+                if prop is not None:
+                    for univ in self.model.getAllUnivs(elemname):
+                        univ.locked = locked
+            elif elemtype == 'tagprop':
+                prop = self.model.getTagProp(elemname)
+
+            if prop is not None:
+                prop.locked = locked
 
     async def _initJsonStor(self):
 
@@ -3117,10 +4915,9 @@ class Cortex(s_cell.Cell):  # type: ignore
                     with open(idenpath, 'w') as fd:
                         fd.write(jsoniden)
 
-            conf = {'cell:guid': jsoniden}
+            # Disable sysctl checks for embedded jsonstor server
+            conf = {'cell:guid': jsoniden, 'health:sysctl:checks': False}
             self.jsonstor = await s_jsonstor.JsonStorCell.anit(path, conf=conf, parent=self)
-
-        self.onfini(self.jsonstor)
 
     async def getJsonObj(self, path):
         if self.jsonurl is not None:
@@ -3194,13 +4991,19 @@ class Cortex(s_cell.Cell):  # type: ignore
         turl = self.conf.get('axon')
         if turl is None:
             path = os.path.join(self.dirn, 'axon')
-            conf = {}
+            # Disable sysctl checks for embedded axon server
+            conf = {'health:sysctl:checks': False}
 
             proxyurl = self.conf.get('http:proxy')
             if proxyurl is not None:
                 conf['http:proxy'] = proxyurl
 
-            self.axon = await s_axon.Axon.anit(path, conf=conf)
+            cadir = self.conf.get('tls:ca:dir')
+            if cadir is not None:
+                conf['tls:ca:dir'] = cadir
+
+            self.axon = await s_axon.Axon.anit(path, conf=conf, parent=self)
+            self.axoninfo = await self.axon.getCellInfo()
             self.axon.onfini(self.axready.clear)
             self.dynitems['axon'] = self.axon
             self.axready.set()
@@ -3211,6 +5014,8 @@ class Cortex(s_cell.Cell):  # type: ignore
 
             async def fini():
                 self.axready.clear()
+
+            self.axoninfo = await proxy.getCellInfo()
 
             proxy.onfini(fini)
             self.axready.set()
@@ -3232,64 +5037,75 @@ class Cortex(s_cell.Cell):  # type: ignore
         self.addStormCmd(s_storm.HelpCmd)
         self.addStormCmd(s_storm.IdenCmd)
         self.addStormCmd(s_storm.SpinCmd)
-        self.addStormCmd(s_storm.SudoCmd)
         self.addStormCmd(s_storm.UniqCmd)
+        self.addStormCmd(s_storm.BatchCmd)
         self.addStormCmd(s_storm.CountCmd)
         self.addStormCmd(s_storm.GraphCmd)
         self.addStormCmd(s_storm.LimitCmd)
         self.addStormCmd(s_storm.MergeCmd)
         self.addStormCmd(s_storm.RunAsCmd)
         self.addStormCmd(s_storm.SleepCmd)
+        self.addStormCmd(s_storm.CopyToCmd)
         self.addStormCmd(s_storm.DivertCmd)
         self.addStormCmd(s_storm.ScrapeCmd)
         self.addStormCmd(s_storm.DelNodeCmd)
         self.addStormCmd(s_storm.LiftByVerb)
         self.addStormCmd(s_storm.MoveTagCmd)
         self.addStormCmd(s_storm.ReIndexCmd)
+        self.addStormCmd(s_storm.ColorizeCmd)
         self.addStormCmd(s_storm.EdgesDelCmd)
         self.addStormCmd(s_storm.ParallelCmd)
         self.addStormCmd(s_storm.TagPruneCmd)
         self.addStormCmd(s_storm.ViewExecCmd)
         self.addStormCmd(s_storm.IntersectCmd)
+        self.addStormCmd(s_storm.MoveNodesCmd)
         self.addStormCmd(s_storm.BackgroundCmd)
-        self.addStormCmd(s_storm.SpliceListCmd)
-        self.addStormCmd(s_storm.SpliceUndoCmd)
         self.addStormCmd(s_stormlib_macro.MacroExecCmd)
+        self.addStormCmd(s_stormlib_storm.StormExecCmd)
+        self.addStormCmd(s_stormlib_stats.StatsCountByCmd)
+        self.addStormCmd(s_stormlib_cortex.StormPoolDelCmd)
+        self.addStormCmd(s_stormlib_cortex.StormPoolGetCmd)
+        self.addStormCmd(s_stormlib_cortex.StormPoolSetCmd)
 
-        for cdef in s_stormsvc.stormcmds:
-            await self._trySetStormCmd(cdef.get('name'), cdef)
+        cmdmods = [
+            s_storm,
+            s_stormsvc,
+            s_stormlib_aha,
+            s_stormlib_auth,
+            s_stormlib_cortex,
+            s_stormlib_gen,
+            s_stormlib_index,
+            s_stormlib_macro,
+            s_stormlib_model,
+            s_stormlib_pkg,
+            s_stormlib_task,
+            s_stormlib_vault,
+            s_stormlib_quorum,
+        ]
 
-        for cdef in s_storm.stormcmds:
-            await self._trySetStormCmd(cdef.get('name'), cdef)
-
-        for cdef in s_stormlib_auth.stormcmds:
-            await self._trySetStormCmd(cdef.get('name'), cdef)
-
-        for cdef in s_stormlib_macro.stormcmds:
-            await self._trySetStormCmd(cdef.get('name'), cdef)
-
-        for cdef in s_stormlib_model.stormcmds:
-            await self._trySetStormCmd(cdef.get('name'), cdef)
+        for cmod in cmdmods:
+            for cdef in cmod.stormcmds:
+                await self._trySetStormCmd(cdef.get('name'), cdef)
 
     async def _initPureStormCmds(self):
         oldcmds = []
-        for name, cdef in self.cmdhive.items():
+        for name, cdef in self.cmddefs.items():
             cmdiden = cdef.get('cmdconf', {}).get('svciden')
-            if cmdiden and self.svchive.get(cmdiden) is None:
+            if cmdiden and self.svcdefs.get(cmdiden) is None:
                 oldcmds.append(name)
             else:
                 await self._trySetStormCmd(name, cdef)
 
         for name in oldcmds:
             logger.warning(f'Removing old command: [{name}]')
-            await self.cmdhive.pop(name)
+            self.cmddefs.pop(name)
 
-        for pkgdef in self.pkghive.values():
+        for pkgdef in self.pkgdefs.values():
             await self._tryLoadStormPkg(pkgdef)
 
     async def _trySetStormCmd(self, name, cdef):
         try:
-            await self._setStormCmd(cdef)
+            self._setStormCmd(cdef)
         except (asyncio.CancelledError, Exception):
             logger.exception(f'Storm command load failed: {name}')
 
@@ -3299,33 +5115,17 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
 
         for path, ctor in s_stormtypes.registry.iterLibs():
-            # Skip libbase which is registered as a default ctor in the storm Runtime
-            if path:
-                self.addStormLib(path, ctor)
+            # Ensure each ctor's permdefs are valid
+            for pdef in ctor._storm_lib_perms:
+                s_schemas.reqValidPermDef(pdef)
 
-    def _initSplicers(self):
-        '''
-        Registration for splice handlers.
-        '''
-        splicers = {
-            'tag:add': self._onFeedTagAdd,
-            'tag:del': self._onFeedTagDel,
-            'node:add': self._onFeedNodeAdd,
-            'node:del': self._onFeedNodeDel,
-            'prop:set': self._onFeedPropSet,
-            'prop:del': self._onFeedPropDel,
-            'tag:prop:set': self._onFeedTagPropSet,
-            'tag:prop:del': self._onFeedTagPropDel,
-        }
-        self.splicers.update(**splicers)
+            self.addStormLib(path, ctor)
 
     def _initFeedFuncs(self):
         '''
         Registration for built-in Cortex feed functions.
         '''
         self.setFeedFunc('syn.nodes', self._addSynNodes)
-        self.setFeedFunc('syn.splice', self._addSynSplice)
-        self.setFeedFunc('syn.nodeedits', self._addSynNodeEdits)
 
     def _initCortexHttpApi(self):
         '''
@@ -3333,30 +5133,445 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         self.addHttpApi('/api/v1/feed', s_httpapi.FeedV1, {'cell': self})
         self.addHttpApi('/api/v1/storm', s_httpapi.StormV1, {'cell': self})
-        self.addHttpApi('/api/v1/watch', s_httpapi.WatchSockV1, {'cell': self})
         self.addHttpApi('/api/v1/storm/call', s_httpapi.StormCallV1, {'cell': self})
         self.addHttpApi('/api/v1/storm/nodes', s_httpapi.StormNodesV1, {'cell': self})
         self.addHttpApi('/api/v1/storm/export', s_httpapi.StormExportV1, {'cell': self})
         self.addHttpApi('/api/v1/reqvalidstorm', s_httpapi.ReqValidStormV1, {'cell': self})
+        self.addHttpApi('/api/v1/isvalidstorm', s_httpapi.IsValidStormV1, {'cell': self})
 
         self.addHttpApi('/api/v1/storm/vars/set', s_httpapi.StormVarsSetV1, {'cell': self})
         self.addHttpApi('/api/v1/storm/vars/get', s_httpapi.StormVarsGetV1, {'cell': self})
         self.addHttpApi('/api/v1/storm/vars/pop', s_httpapi.StormVarsPopV1, {'cell': self})
+
+        self.addHttpApi('/api/v1/vault/list', s_httpapi.VaultListV1, {'cell': self})
+        self.addHttpApi('/api/v1/vault/get', s_httpapi.VaultGetV1, {'cell': self})
+        self.addHttpApi('/api/v1/vault/add', s_httpapi.VaultAddV1, {'cell': self})
+        self.addHttpApi('/api/v1/vault/mod', s_httpapi.VaultModV1, {'cell': self})
+        self.addHttpApi('/api/v1/vault/del', s_httpapi.VaultDelV1, {'cell': self})
 
         self.addHttpApi('/api/v1/model', s_httpapi.ModelV1, {'cell': self})
         self.addHttpApi('/api/v1/model/norm', s_httpapi.ModelNormV1, {'cell': self})
 
         self.addHttpApi('/api/v1/core/info', s_httpapi.CoreInfoV1, {'cell': self})
 
+        self.addHttpApi('/api/v1/axon/files/del', CortexAxonHttpDelV1, {'cell': self})
+        self.addHttpApi('/api/v1/axon/files/put', CortexAxonHttpUploadV1, {'cell': self})
+        self.addHttpApi('/api/v1/axon/files/has/sha256/([0-9a-fA-F]{64}$)', CortexAxonHttpHasV1, {'cell': self})
+        self.addHttpApi('/api/v1/axon/files/by/sha256/([0-9a-fA-F]{64}$)', CortexAxonHttpBySha256V1, {'cell': self})
+        self.addHttpApi('/api/v1/axon/files/by/sha256/(.*)', CortexAxonHttpBySha256InvalidV1, {'cell': self})
+
+        self.addHttpApi('/api/ext/(.*)', s_httpapi.ExtApiHandler, {'cell': self})
+
+    def _initCortexExtHttpApi(self):
+        self._exthttpapis.clear()
+        self._exthttpapicache.clear()
+
+        byts = self.slab.get(self._exthttpapiorder, self.httpextapidb)
+        if byts is None:
+            return
+
+        order = s_msgpack.un(byts)
+
+        for iden in order:
+            byts = self.slab.get(s_common.uhex(iden), self.httpextapidb)
+            if byts is None:  # pragma: no cover
+                logger.error(f'Missing HTTP API definition for iden={iden}')
+                continue
+            adef = s_msgpack.un(byts)
+            self._exthttpapis[adef.get('iden')] = adef
+
+    async def addHttpExtApi(self, adef):
+        path = adef.get('path')
+        try:
+            _ = regex.compile(path)
+        except Exception as e:
+            mesg = f'Invalid path for Extended HTTP API - cannot compile regular expression for [{path}] : {e}'
+            raise s_exc.BadArg(mesg=mesg) from None
+
+        if adef.get('iden') is None:
+            adef['iden'] = s_common.guid()
+
+        iden = adef['iden']
+        if self._exthttpapis.get(iden) is not None:
+            raise s_exc.DupIden(mesg=f'Duplicate iden specified for Extended HTTP API: {iden}', iden=iden)
+
+        adef['created'] = s_common.now()
+        adef['updated'] = adef['created']
+        adef = s_schemas.reqValidHttpExtAPIConf(adef)
+        return await self._push('http:api:add', adef)
+
+    @s_nexus.Pusher.onPush('http:api:add')
+    async def _addHttpExtApi(self, adef):
+        iden = adef.get('iden')
+        self.slab.put(s_common.uhex(iden), s_msgpack.en(adef), db=self.httpextapidb)
+
+        order = self.slab.get(self._exthttpapiorder, db=self.httpextapidb)
+        if order is None:
+            self.slab.put(self._exthttpapiorder, s_msgpack.en([iden]), db=self.httpextapidb)
+        else:
+            order = s_msgpack.un(order)  # type: tuple
+            if iden not in order:
+                # Replay safety
+                order = order + (iden, )  # New handlers go to the end of the list of handlers
+                self.slab.put(self._exthttpapiorder, s_msgpack.en(order), db=self.httpextapidb)
+
+        # Re-initialize the HTTP API list from the index order
+        self._initCortexExtHttpApi()
+        return adef
+
+    @s_nexus.Pusher.onPushAuto('http:api:del')
+    async def delHttpExtApi(self, iden):
+        if s_common.isguid(iden) is False:
+            raise s_exc.BadArg(mesg=f'Must provide an iden. Got {iden}')
+
+        self.slab.pop(s_common.uhex(iden), db=self.httpextapidb)
+
+        byts = self.slab.get(self._exthttpapiorder, self.httpextapidb)
+        order = list(s_msgpack.un(byts))
+        if iden in order:
+            order.remove(iden)
+            self.slab.put(self._exthttpapiorder, s_msgpack.en(order), db=self.httpextapidb)
+
+        self._initCortexExtHttpApi()
+
+        return
+
+    @s_nexus.Pusher.onPushAuto('http:api:mod')
+    async def modHttpExtApi(self, iden, name, valu):
+        # Created, Creator, Updated are not mutable
+        if name in ('name', 'desc', 'runas', 'methods', 'authenticated', 'pool', 'perms', 'readonly', 'vars'):
+            # Schema takes care of these values
+            pass
+        elif name == 'owner':
+            _obj = await self.getUserDef(valu, packroles=False)
+            if _obj is None:
+                raise s_exc.NoSuchUser(mesg=f'Cannot set owner={valu} on extended httpapi, it does not exist.')
+        elif name == 'view':
+            _obj = self.getView(valu)
+            if _obj is None:
+                raise s_exc.NoSuchView(mesg=f'Cannot set view={valu} on extended httpapi, it does not exist.')
+        elif name == 'path':
+            try:
+                _ = regex.compile(valu)
+            except Exception as e:
+                mesg = f'Invalid path for Extended HTTP API - cannot compile regular expression for [{valu}] : {e}'
+                raise s_exc.BadArg(mesg=mesg) from None
+        else:
+            raise s_exc.BadArg(mesg=f'Cannot set {name=} on extended httpapi')
+
+        byts = self.slab.get(s_common.uhex(iden), db=self.httpextapidb)
+        if byts is None:
+            raise s_exc.NoSuchIden(mesg=f'No http api for {iden=}', iden=iden)
+
+        adef = s_msgpack.un(byts)
+        adef[name] = valu
+        adef['updated'] = s_common.now()
+        adef = s_schemas.reqValidHttpExtAPIConf(adef)
+        self.slab.put(s_common.uhex(iden), s_msgpack.en(adef), db=self.httpextapidb)
+
+        self._initCortexExtHttpApi()
+
+        return adef
+
+    @s_nexus.Pusher.onPushAuto('http:api:indx')
+    async def setHttpApiIndx(self, iden, indx):
+        if indx < 0:
+            raise s_exc.BadArg(mesg=f'indx must be greater than or equal to 0; got {indx}')
+        byts = self.slab.get(self._exthttpapiorder, db=self.httpextapidb)
+        if byts is None:
+            raise s_exc.SynErr(mesg='No Extended HTTP handlers registered. Cannot set order.')
+
+        order = list(s_msgpack.un(byts))
+
+        if iden not in order:
+            raise s_exc.NoSuchIden(mesg=f'Extended HTTP API is not set: {iden}')
+
+        if order.index(iden) == indx:
+            return indx
+        order.remove(iden)
+        # indx values > length of the list end up at the end of the list.
+        order.insert(indx, iden)
+        self.slab.put(self._exthttpapiorder, s_msgpack.en(order), db=self.httpextapidb)
+        self._initCortexExtHttpApi()
+        return order.index(iden)
+
+    async def getHttpExtApis(self):
+        return copy.deepcopy(list(self._exthttpapis.values()))
+
+    async def getHttpExtApi(self, iden):
+        adef = self._exthttpapis.get(iden)
+        if adef is None:
+            raise s_exc.NoSuchIden(mesg=f'No extended http api for {iden=}', iden=iden)
+        return copy.deepcopy(adef)
+
+    async def getHttpExtApiByPath(self, path):
+        iden, args = self._exthttpapicache.get(path)
+        adef = copy.deepcopy(self._exthttpapis.get(iden))
+        return adef, args
+
+    def _getHttpExtApiByPath(self, key):
+        # Cache callback.
+        # Returns (iden, args) or (None, ()) for caching.
+        for iden, adef in self._exthttpapis.items():
+            match = regex.fullmatch(adef.get('path'), key)
+            if match is None:
+                continue
+            return iden, match.groups()
+        return None, ()
+
+    def _initViewHooks(self):
+        self.viewhooks.clear()
+
+        hdefs = [s_msgpack.un(byts) for _, byts in self.slab.scanByFull(db=self.viewhookdb)]
+        hdefs.sort(key=lambda hdef: hdef.get('created'))
+
+        for hdef in hdefs:
+            self.viewhooks[hdef.get('iden')] = hdef
+
+    async def addViewHook(self, hdef):
+        '''
+        Add a view hook which runs a Storm query as root on a view lifecycle event.
+
+        Args:
+            hdef (dict): The hook definition containing name, type, storm, creator, and optionally iden and enabled.
+
+        Returns:
+            dict: The new hook definition.
+        '''
+        hdef = dict(hdef)
+        hdef.setdefault('iden', s_common.guid())
+        hdef.setdefault('enabled', True)
+
+        hdef['created'] = s_common.now()
+        hdef['updated'] = hdef['created']
+
+        hdef = s_schemas.reqValidViewHook(hdef)
+
+        iden = hdef['iden']
+        if self.viewhooks.get(iden) is not None:
+            raise s_exc.DupIden(mesg=f'Duplicate iden specified for view hook: {iden}', iden=iden)
+
+        creator = hdef['creator']
+        if self.auth.user(creator) is None:
+            raise s_exc.NoSuchUser(mesg=f'No user found with iden: {creator}', user=creator)
+
+        await self.getStormQuery(hdef['storm'])
+
+        return await self._push('view:hook:add', hdef)
+
+    @s_nexus.Pusher.onPush('view:hook:add')
+    async def _addViewHook(self, hdef):
+        iden = hdef.get('iden')
+        self.viewhooks[iden] = hdef
+        self.slab.put(s_common.uhex(iden), s_msgpack.en(hdef), db=self.viewhookdb)
+        return copy.deepcopy(hdef)
+
+    async def delViewHook(self, iden):
+        '''
+        Delete a view hook.
+
+        Args:
+            iden (str): The iden of the hook.
+        '''
+        if self.viewhooks.get(iden) is None:
+            raise s_exc.NoSuchIden(mesg=f'No view hook for {iden=}', iden=iden)
+
+        return await self._push('view:hook:del', iden)
+
+    @s_nexus.Pusher.onPush('view:hook:del')
+    async def _delViewHook(self, iden):
+        self.viewhooks.pop(iden, None)
+        self.slab.pop(s_common.uhex(iden), db=self.viewhookdb)
+
+    async def modViewHook(self, iden, opts):
+        '''
+        Modify the name, type, storm, or enabled fields of a view hook.
+
+        Args:
+            iden (str): The iden of the hook.
+            opts (dict): The fields to set and their new values.
+
+        Returns:
+            dict: The updated hook definition.
+        '''
+        if not opts:
+            raise s_exc.BadArg(mesg='No view hook fields specified.')
+
+        for name in opts.keys():
+            if name not in ('name', 'type', 'storm', 'enabled'):
+                raise s_exc.BadArg(mesg=f'Cannot set {name=} on view hook', name=name)
+
+        hdef = self.viewhooks.get(iden)
+        if hdef is None:
+            raise s_exc.NoSuchIden(mesg=f'No view hook for {iden=}', iden=iden)
+
+        hdef = copy.deepcopy(hdef)
+        hdef.update(opts)
+        s_schemas.reqValidViewHook(hdef)
+
+        storm = opts.get('storm')
+        if storm is not None:
+            await self.getStormQuery(storm)
+
+        opts = dict(opts)
+        opts['updated'] = s_common.now()
+
+        return await self._push('view:hook:mod', iden, opts)
+
+    @s_nexus.Pusher.onPush('view:hook:mod')
+    async def _modViewHook(self, iden, opts):
+        hdef = self.viewhooks.get(iden)
+        if hdef is None:
+            return None
+
+        hdef = copy.deepcopy(hdef)
+        hdef.update(opts)
+        hdef = s_schemas.reqValidViewHook(hdef)
+
+        self.viewhooks[iden] = hdef
+        self.slab.put(s_common.uhex(iden), s_msgpack.en(hdef), db=self.viewhookdb)
+
+        return copy.deepcopy(hdef)
+
+    async def getViewHook(self, iden):
+        hdef = self.viewhooks.get(iden)
+        if hdef is None:
+            raise s_exc.NoSuchIden(mesg=f'No view hook for {iden=}', iden=iden)
+
+        return copy.deepcopy(hdef)
+
+    async def getViewHooks(self, type=None):
+        hdefs = self.viewhooks.values()
+        if type is not None:
+            hdefs = [hdef for hdef in hdefs if hdef.get('type') == type]
+
+        return copy.deepcopy(list(hdefs))
+
+    def _getRunViewHooks(self, htype):
+        if self.safemode:
+            return []
+
+        return [hdef for hdef in self.viewhooks.values() if hdef.get('type') == htype and hdef.get('enabled')]
+
+    def _reqViewHookDepth(self, htype, **info):
+        depth = ViewHookDepth.get()
+        if depth >= s_const.VIEW_HOOK_MAX_DEPTH:
+            mesg = f'View hooks exceeded the maximum nesting depth of {s_const.VIEW_HOOK_MAX_DEPTH}.'
+            raise s_exc.RecursionLimitHit(mesg=mesg, limit=s_const.VIEW_HOOK_MAX_DEPTH, type=htype, **info)
+
+        return depth
+
+    def _reqCreatedHookDepth(self):
+        '''
+        Raise RecursionLimitHit if a new view's created hooks would exceed VIEW_HOOK_MAX_DEPTH.
+
+        Called before a view is created so a view over the limit is never made.
+        '''
+        if self._getRunViewHooks('created'):
+            self._reqViewHookDepth('created')
+
+    async def _runViewHooks(self, htype, view, errok=False):
+        '''
+        Run the enabled view hooks of the given type in the view, ordered by creation time.
+
+        Hooks run as the root user, in a new task, and do not run in safemode. Hooks run for
+        lifecycle events caused by hook storm, and the tasks it starts, up to a nesting depth
+        of VIEW_HOOK_MAX_DEPTH. Exceptions propagate to the caller unless errok is set, in which
+        case they are logged and the remaining hooks run. If the hook task is cancelled while the
+        caller is not, a SynErr is raised, or logged if errok is set, and the remaining hooks do not run.
+
+        Args:
+            htype (str): The hook type (created, merging, or deleted).
+            view (View): The view the hook storm runs in.
+            errok (bool): Log hook exceptions rather than raising them.
+
+        Returns:
+            bool: True if any hooks ran.
+
+        Raises:
+            s_exc.RecursionLimitHit: If running the hooks would exceed VIEW_HOOK_MAX_DEPTH.
+            s_exc.SynErr: If the hook task is cancelled while the caller is not, and errok is not set.
+        '''
+        hdefs = self._getRunViewHooks(htype)
+        if not hdefs:
+            return False
+
+        depth = self._reqViewHookDepth(htype, view=view.iden)
+
+        hdefs.sort(key=lambda hdef: hdef.get('created'))
+
+        # a new task keeps the python stack from growing with each nesting level
+        task = s_coro.create_task(self._execViewHooks(htype, view, hdefs, depth + 1, errok))
+        s_scope.clone(task)
+
+        try:
+            await task
+
+        except asyncio.CancelledError:
+            # a hook task killed on its own is a hook failure, not a cancel of the caller
+            if asyncio.current_task().cancelling():
+                raise
+
+            mesg = f'A {htype} view hook in view {view.iden} was cancelled.'
+            if not errok:
+                raise s_exc.SynErr(mesg=mesg, type=htype, view=view.iden) from None
+
+            logger.error(mesg, extra=self.getLogExtra(type=htype, view=view.iden))
+
+        return True
+
+    async def _execViewHooks(self, htype, view, hdefs, depth, errok):
+
+        ViewHookDepth.set(depth)
+
+        root = self.auth.rootuser.iden
+        for hdef in hdefs:
+
+            iden = hdef.get('iden')
+
+            # hooks run locally rather than on a storm pool mirror
+            opts = {
+                'user': root,
+                'view': view.iden,
+                'mirror': False,
+                'vars': {'auto': {'iden': iden, 'type': 'view:hook', 'opts': {'type': htype}}},
+            }
+
+            try:
+                await self.callStorm(hdef.get('storm'), opts=opts)
+
+            except Exception:
+                if not errok:
+                    raise
+
+                logger.exception(f'Error running {htype} view hook {iden} in view {view.iden}',
+                                 extra=self.getLogExtra(iden=iden, view=view.iden, creator=hdef.get('creator')))
+
+    async def _runCreatedHooks(self, iden, pack):
+        '''
+        Run the created view hooks for a new view and return its view definition.
+
+        Args:
+            iden (str): The iden of the new view.
+            pack (dict): The view definition of the new view.
+
+        Returns:
+            dict: The view definition repacked after the hooks, or the given one if no hooks ran or a hook
+            deleted the view.
+        '''
+        if not await self._runViewHooks('created', self.reqView(iden), errok=True):
+            return pack
+
+        view = self.getView(iden)
+        if view is None:
+            return pack
+
+        return await view.pack()
+
     async def getCellApi(self, link, user, path):
 
         if not path:
             return await self.cellapi.anit(self, link, user)
-
-        # allow an admin to directly open the cortex hive
-        # (perhaps this should be a Cell() level pattern)
-        if path[0] == 'hive' and user.isAdmin():
-            return await self.hiveapi.anit(self.hive, user)
 
         if path[0] == 'layer':
 
@@ -3368,7 +5583,7 @@ class Cortex(s_cell.Cell):  # type: ignore
             if len(path) == 2:
                 layr = self.getLayer(path[1])
                 if layr is None:
-                    raise s_exc.NoSuchLayer(iden=path[1])
+                    raise s_exc.NoSuchLayer(mesg=f'No such layer {path[1]}', iden=path[1])
 
                 return await self.layerapi.anit(self, link, user, layr)
 
@@ -3384,10 +5599,13 @@ class Cortex(s_cell.Cell):  # type: ignore
             if view is not None:
                 return await self.viewapi.anit(self, link, user, view)
 
-        raise s_exc.NoSuchPath(path=path)
+        raise s_exc.NoSuchPath(mesg=f'Invalid telepath path={path}', path=path)
 
     async def getModelDict(self):
         return self.model.getModelDict()
+
+    async def getFormsByPrefix(self, prefix):
+        return self.model.getFormsByPrefix(prefix)
 
     async def getModelDefs(self):
         return self.model.getModelDefs()
@@ -3402,77 +5620,6 @@ class Cortex(s_cell.Cell):  # type: ignore
             for name, valu in layrcounts.items():
                 counts[name] += valu
         return dict(counts)
-
-    def onTagAdd(self, name, func):
-        '''
-        Register a callback for tag addition.
-
-        Args:
-            name (str): The name of the tag or tag glob.
-            func (function): The callback func(node, tagname, tagval).
-
-        '''
-        # TODO allow name wild cards
-        if '*' in name:
-            self.ontagaddglobs.add(name, func)
-        else:
-            self.ontagadds[name].append(func)
-
-    def offTagAdd(self, name, func):
-        '''
-        Unregister a callback for tag addition.
-
-        Args:
-            name (str): The name of the tag or tag glob.
-            func (function): The callback func(node, tagname, tagval).
-
-        '''
-        if '*' in name:
-            self.ontagaddglobs.rem(name, func)
-            return
-
-        cblist = self.ontagadds.get(name)
-        if cblist is None:
-            return
-        try:
-            cblist.remove(func)
-        except ValueError:
-            pass
-
-    def onTagDel(self, name, func):
-        '''
-        Register a callback for tag deletion.
-
-        Args:
-            name (str): The name of the tag or tag glob.
-            func (function): The callback func(node, tagname, tagval).
-
-        '''
-        if '*' in name:
-            self.ontagdelglobs.add(name, func)
-        else:
-            self.ontagdels[name].append(func)
-
-    def offTagDel(self, name, func):
-        '''
-        Unregister a callback for tag deletion.
-
-        Args:
-            name (str): The name of the tag or tag glob.
-            func (function): The callback func(node, tagname, tagval).
-
-        '''
-        if '*' in name:
-            self.ontagdelglobs.rem(name, func)
-            return
-
-        cblist = self.ontagdels.get(name)
-        if cblist is None:
-            return
-        try:
-            cblist.remove(func)
-        except ValueError:
-            pass
 
     def addRuntLift(self, prop, func):
         '''
@@ -3535,12 +5682,13 @@ class Cortex(s_cell.Cell):  # type: ignore
         return ret
 
     async def _checkLayerModels(self):
-        mrev = s_modelrev.ModelRev(self)
-        await mrev.revCoreLayers()
+        async with self.enterMigrationMode():
+            mrev = s_modelrev.ModelRev(self)
+            await mrev.revCoreLayers()
 
-    async def _loadView(self, node):
+    async def _loadView(self, vdef):
 
-        view = await self.viewctor(self, node)
+        view = await self.viewctor(self, vdef)
 
         self.views[view.iden] = view
         self.dynitems[view.iden] = view
@@ -3564,8 +5712,10 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         defiden = self.cellinfo.get('defaultview')
 
-        for iden, node in await self.hive.open(('cortex', 'views')):
-            view = await self._loadView(node)
+        self.viewdefs = self.cortexdata.getSubKeyVal('view:info:')
+
+        for iden, vdef in self.viewdefs.items():
+            view = await self._loadView(vdef)
             if iden == defiden:
                 self.view = view
 
@@ -3589,7 +5739,7 @@ class Cortex(s_cell.Cell):  # type: ignore
             }
             vdef = await self.addView(vdef, nexs=False)
             iden = vdef.get('iden')
-            await self.cellinfo.set('defaultview', iden)
+            self.cellinfo.set('defaultview', iden)
             self.view = self.getView(iden)
 
         self._calcViewsByLayer()
@@ -3597,21 +5747,26 @@ class Cortex(s_cell.Cell):  # type: ignore
     async def addView(self, vdef, nexs=True):
 
         vdef['iden'] = s_common.guid()
+        vdef['created'] = s_common.now()
+
         vdef.setdefault('parent', None)
         vdef.setdefault('worldreadable', False)
         vdef.setdefault('creator', self.auth.rootuser.iden)
 
-        s_view.reqValidVdef(vdef)
+        s_schemas.reqValidView(vdef)
 
-        if nexs:
-            return await self._push('view:add', vdef)
-        else:
+        if not nexs:
             return await self._addView(vdef)
+
+        self._reqCreatedHookDepth()
+
+        pack = await self._push('view:add', vdef)
+        return await self._runCreatedHooks(vdef['iden'], pack)
 
     @s_nexus.Pusher.onPush('view:add')
     async def _addView(self, vdef):
 
-        s_view.reqValidVdef(vdef)
+        s_schemas.reqValidView(vdef)
 
         iden = vdef['iden']
         if iden in self.views:
@@ -3619,7 +5774,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         for lyriden in vdef['layers']:
             if lyriden not in self.layers:
-                raise s_exc.NoSuchLayer(iden=lyriden)
+                raise s_exc.NoSuchLayer(mesg=f'No such layer {lyriden}', iden=lyriden)
 
         creator = vdef.get('creator', self.auth.rootuser.iden)
         user = await self.auth.reqUser(creator)
@@ -3634,22 +5789,131 @@ class Cortex(s_cell.Cell):  # type: ignore
             role = await self.auth.getRoleByName('all')
             await role.addRule((True, ('view', 'read')), gateiden=iden, nexs=False)
 
-        node = await self.hive.open(('cortex', 'views', iden))
+        self.viewdefs.set(iden, vdef)
 
-        info = await node.dict()
-        for name, valu in vdef.items():
-            await info.set(name, valu)
-
-        view = await self._loadView(node)
+        view = await self._loadView(vdef)
         view.init2()
 
         self._calcViewsByLayer()
-        return await view.pack()
+        pack = await view.pack()
+        await self.feedBeholder('view:add', pack, gates=[iden])
+        return pack
 
-    async def delView(self, iden):
+    async def delViewWithLayer(self, iden, hooks=True):
+        '''
+        Delete a Cortex View and its write Layer if not in use by other View stacks.
+
+        Note:
+            Any children of the View will have their parent View updated to
+            the deleted View's parent (if present). The deleted View's write Layer
+            will also be removed from any child Views which contain it in their
+            Layer stack. If the Layer is used in Views which are not children of
+            the deleted View, the Layer will be preserved, otherwise it will be
+            deleted as well.
+        '''
         view = self.views.get(iden)
         if view is None:
-            raise s_exc.NoSuchView(iden=iden)
+            raise s_exc.NoSuchView(mesg=f'No such view {iden=}', iden=iden)
+
+        if iden == self.view.iden:
+            raise s_exc.SynErr(mesg='Cannot delete the main view')
+
+        if view.info.get('protected'):
+            mesg = f'Cannot delete view ({iden}) that has protected set.'
+            raise s_exc.CantDelView(mesg=mesg)
+
+        if hooks:
+            await self._runViewHooks('deleted', view)
+
+        layriden = view.layers[0].iden
+        pareiden = None
+        if view.parent is not None:
+            pareiden = view.parent.iden
+
+        return await self._push('view:delwithlayer', iden, layriden, newparent=pareiden)
+
+    @s_nexus.Pusher.onPush('view:delwithlayer', passitem=True)
+    async def _delViewWithLayer(self, viewiden, layriden, nexsitem, newparent=None):
+
+        if viewiden == self.view.iden:
+            raise s_exc.SynErr(mesg='Cannot delete the main view')
+
+        if (view := self.views.get(viewiden)) is not None:
+
+            self.viewdefs.pop(viewiden)
+            await view.delete()
+
+            self._calcViewsByLayer()
+            await self.feedBeholder('view:del', {'iden': viewiden}, gates=[viewiden])
+            await self.auth.delAuthGate(viewiden)
+
+        if newparent is not None:
+            newview = self.views.get(newparent)
+
+        layrinuse = False
+        for view in self.viewsbylayer[layriden]:
+            if not view.isForkOf(viewiden):
+                layrinuse = True
+                continue
+
+            view.layers = [lyr for lyr in view.layers if lyr.iden != layriden]
+
+            layridens = [lyr.iden for lyr in view.layers]
+            view.info['layers'] = layridens
+
+            mesg = {'iden': view.iden, 'layers': layridens}
+            await self.feedBeholder('view:setlayers', mesg, gates=[view.iden, layridens[0]])
+
+            if view.parent.iden == viewiden:
+                if newparent is None:
+                    view.parent = None
+                    view.info['parent'] = None
+                else:
+                    view.parent = newview
+                    view.info['parent'] = newparent
+
+                mesg = {'iden': view.iden, 'name': 'parent', 'valu': newparent}
+                await self.feedBeholder('view:set', mesg, gates=[view.iden, layridens[0]])
+
+            self.viewdefs.set(view.iden, view.info)
+
+        if not layrinuse and (layr := self.layers.get(layriden)) is not None:
+            del self.layers[layriden]
+
+            for pdef in layr.layrinfo.get('pushs', {}).values():
+                await self.delActiveCoro(pdef.get('iden'))
+
+            for pdef in layr.layrinfo.get('pulls', {}).values():
+                await self.delActiveCoro(pdef.get('iden'))
+
+            await self.fire('core:layr:del', iden=layr.iden, offs=nexsitem[0])
+            await self.feedBeholder('layer:del', {'iden': layriden}, gates=[layriden])
+            await self.auth.delAuthGate(layriden)
+            self.dynitems.pop(layriden)
+
+            self.layerdefs.pop(layriden)
+            await layr.delete()
+
+            layr.deloffs = nexsitem[0]
+
+    async def delView(self, iden, hooks=True):
+        view = self.views.get(iden)
+        if view is None:
+            raise s_exc.NoSuchView(mesg=f'No such view {iden=}', iden=iden)
+
+        if iden == self.view.iden:
+            raise s_exc.SynErr(mesg='Cannot delete the main view')
+
+        if view.info.get('protected'):
+            mesg = f'Cannot delete view ({iden}) that has protected set.'
+            raise s_exc.CantDelView(mesg=mesg)
+
+        for cview in self.views.values():
+            if cview.parent is not None and cview.parent.iden == iden:
+                raise s_exc.SynErr(mesg='Cannot delete a view that has children')
+
+        if hooks:
+            await self._runViewHooks('deleted', view)
 
         return await self._push('view:del', iden)
 
@@ -3672,16 +5936,17 @@ class Cortex(s_cell.Cell):  # type: ignore
             if cview.parent is not None and cview.parent.iden == iden:
                 raise s_exc.SynErr(mesg='Cannot delete a view that has children')
 
-        await self.hive.pop(('cortex', 'views', iden))
+        self.viewdefs.pop(iden)
         await view.delete()
 
         self._calcViewsByLayer()
+        await self.feedBeholder('view:del', {'iden': iden}, gates=[iden])
         await self.auth.delAuthGate(iden)
 
     async def delLayer(self, iden):
         layr = self.layers.get(iden, None)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=iden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {iden}', iden=iden)
 
         return await self._push('layer:del', iden)
 
@@ -3703,10 +5968,12 @@ class Cortex(s_cell.Cell):  # type: ignore
         for pdef in layr.layrinfo.get('pulls', {}).values():
             await self.delActiveCoro(pdef.get('iden'))
 
+        await self.fire('core:layr:del', iden=layr.iden, offs=nexsitem[0])
+        await self.feedBeholder('layer:del', {'iden': iden}, gates=[iden])
         await self.auth.delAuthGate(iden)
         self.dynitems.pop(iden)
 
-        await self.hive.pop(('cortex', 'layers', iden))
+        self.layerdefs.pop(iden)
 
         await layr.delete()
 
@@ -3720,7 +5987,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         view = self.getView(iden)
         if view is None:
-            raise s_exc.NoSuchView(iden=iden)
+            raise s_exc.NoSuchView(mesg=f'No such view {iden=}', iden=iden)
 
         await view.setLayers(layers)
         self._calcViewsByLayer()
@@ -3744,6 +6011,13 @@ class Cortex(s_cell.Cell):  # type: ignore
             return self.view.layers[0]
 
         return self.layers.get(iden)
+
+    def reqLayer(self, iden=None):
+        layr = self.getLayer(iden=iden)
+        if layr is None:
+            mesg = f'No layer found with iden: {iden}'
+            raise s_exc.NoSuchLayer(mesg=mesg, iden=iden)
+        return layr
 
     def listLayers(self):
         return self.layers.values()
@@ -3787,11 +6061,19 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         return view
 
+    def reqView(self, iden, mesg=None):
+        view = self.getView(iden)
+        if view is None: # pragma: no cover
+            if mesg is None:
+                mesg = f'No view with iden: {iden}'
+            raise s_exc.NoSuchView(mesg=mesg, iden=iden)
+        return view
+
     def listViews(self):
         return list(self.views.values())
 
-    async def getViewDef(self, iden):
-        view = self.getView(iden=iden)
+    async def getViewDef(self, iden, user=None):
+        view = self.getView(iden=iden, user=user)
         if view is not None:
             return await view.pack()
 
@@ -3823,6 +6105,8 @@ class Cortex(s_cell.Cell):  # type: ignore
         ldef = ldef or {}
 
         ldef['iden'] = s_common.guid()
+        ldef['created'] = s_common.now()
+
         ldef.setdefault('creator', self.auth.rootuser.iden)
         ldef.setdefault('lockmemory', self.conf.get('layers:lockmemory'))
         ldef.setdefault('logedits', self.conf.get('layers:logedits'))
@@ -3834,6 +6118,60 @@ class Cortex(s_cell.Cell):  # type: ignore
             return await self._push('layer:add', ldef)
         else:
             return await self._addLayer(ldef, (None, None))
+
+    async def _twinLayer(self, oldlayr):
+
+        newldef = s_msgpack.deepcopy(oldlayr.layrinfo)
+
+        newldef.pop('iden', None)
+
+        newldef = await self.addLayer(newldef)
+        newlayr = self.reqLayer(newldef.get('iden'))
+
+        oldinfo = self.auth.reqAuthGate(oldlayr.iden).pack()
+
+        for userinfo in oldinfo.get('users', ()):
+
+            user = self.auth.user(userinfo.get('iden'))
+            if user is None: # pragma: no cover
+                continue
+
+            if userinfo.get('admin'):
+                await user.setAdmin(True, gateiden=newlayr.iden)
+
+            for rule in userinfo.get('rules', ()):
+                await user.addRule(rule, gateiden=newlayr.iden)
+
+        for roleinfo in oldinfo.get('roles', ()):
+
+            role = self.auth.role(roleinfo.get('iden'))
+            if role is None: # pragma: no cover
+                continue
+
+            for rule in roleinfo.get('rules', ()):
+                await role.addRule(rule, gateiden=newlayr.iden)
+
+        return newlayr
+
+    @s_nexus.Pusher.onPushAuto('layer:swap')
+    async def swapLayer(self, oldiden, newiden):
+        '''
+        Atomically swap out a layer from all views that contain it.
+        '''
+        self.reqLayer(oldiden)
+        self.reqLayer(newiden)
+
+        for view in list(self.views.values()):
+            await asyncio.sleep(0)
+
+            oldlayers = view.info.get('layers')
+            if oldiden not in oldlayers:
+                continue
+
+            newlayers = list(oldlayers)
+            newlayers[oldlayers.index(oldiden)] = newiden
+
+            await view._setLayerIdens(newlayers)
 
     @s_nexus.Pusher.onPush('layer:add', passitem=True)
     async def _addLayer(self, ldef, nexsitem):
@@ -3851,13 +6189,9 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         user = await self.auth.reqUser(creator)
 
-        node = await self.hive.open(('cortex', 'layers', iden))
+        self.layerdefs.set(iden, ldef)
 
-        layrinfo = await node.dict()
-        for name, valu in ldef.items():
-            await layrinfo.set(name, valu)
-
-        layr = await self._initLayr(layrinfo, nexsoffs=nexsitem[0])
+        layr = await self._initLayr(ldef, nexsoffs=nexsitem[0])
         await user.setAdmin(True, gateiden=iden, logged=False)
 
         # forward wind the new layer to the current model version
@@ -3868,7 +6202,9 @@ class Cortex(s_cell.Cell):  # type: ignore
         else:
             await layr.initLayerPassive()
 
-        return await layr.pack()
+        pack = await layr.pack()
+        await self.feedBeholder('layer:add', pack, gates=[iden])
+        return pack
 
     def _checkMaxNodes(self, delta=1):
 
@@ -3910,7 +6246,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         for pdef in layrinfo.get('pulls', {}).values():
             await self.runLayrPull(layr, pdef)
 
-        await self.fire('core:layr:add', iden=layr.iden)
+        await self.fire('core:layr:add', iden=layr.iden, offs=layr.addoffs)
 
         return layr
 
@@ -3921,15 +6257,14 @@ class Cortex(s_cell.Cell):  # type: ignore
         return await s_layer.Layer.anit(self, layrinfo)
 
     async def _initCoreLayers(self):
-        node = await self.hive.open(('cortex', 'layers'))
-        for _, node in node:
-            layrinfo = await node.dict()
-            await self._initLayr(layrinfo)
+        self.layerdefs = self.cortexdata.getSubKeyVal('layer:info:')
+        for ldef in self.layerdefs.values():
+            await self._initLayr(ldef)
 
     @s_nexus.Pusher.onPushAuto('layer:push:add')
     async def addLayrPush(self, layriden, pdef):
 
-        reqValidPush(pdef)
+        s_schemas.reqValidPush(pdef)
 
         iden = pdef.get('iden')
 
@@ -3947,7 +6282,9 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         pushs[iden] = pdef
 
-        await layr.layrinfo.set('pushs', pushs)
+        layr.layrinfo['pushs'] = pushs
+        self.layerdefs.set(layr.iden, layr.layrinfo)
+
         await self.runLayrPush(layr, pdef)
 
     @s_nexus.Pusher.onPushAuto('layer:push:del')
@@ -3965,13 +6302,15 @@ class Cortex(s_cell.Cell):  # type: ignore
         if pdef is None:
             return
 
-        await layr.layrinfo.set('pushs', pushs)
+        layr.layrinfo['pushs'] = pushs
+        self.layerdefs.set(layr.iden, layr.layrinfo)
+
         await self.delActiveCoro(pushiden)
 
     @s_nexus.Pusher.onPushAuto('layer:pull:add')
     async def addLayrPull(self, layriden, pdef):
 
-        reqValidPull(pdef)
+        s_schemas.reqValidPull(pdef)
 
         iden = pdef.get('iden')
 
@@ -3988,7 +6327,9 @@ class Cortex(s_cell.Cell):  # type: ignore
             return
 
         pulls[iden] = pdef
-        await layr.layrinfo.set('pulls', pulls)
+
+        layr.layrinfo['pulls'] = pulls
+        self.layerdefs.set(layr.iden, layr.layrinfo)
 
         await self.runLayrPull(layr, pdef)
 
@@ -4007,7 +6348,9 @@ class Cortex(s_cell.Cell):  # type: ignore
         if pdef is None:
             return
 
-        await layr.layrinfo.set('pulls', pulls)
+        layr.layrinfo['pulls'] = pulls
+        self.layerdefs.set(layr.iden, layr.layrinfo)
+
         await self.delActiveCoro(pulliden)
 
     async def runLayrPush(self, layr, pdef):
@@ -4016,7 +6359,8 @@ class Cortex(s_cell.Cell):  # type: ignore
         # push() will refire as needed
 
         async def push():
-            async with await self.boss.promote(f'layer push: {layr.iden} {iden}', self.auth.rootuser):
+            taskname = f'layer push: {layr.iden} {iden}'
+            async with await self.boss.promote(taskname, self.auth.rootuser, background=True):
                 async with await s_telepath.openurl(url) as proxy:
                     await self._pushBulkEdits(layr, proxy, pdef)
 
@@ -4028,7 +6372,8 @@ class Cortex(s_cell.Cell):  # type: ignore
         # pull() will refire as needed
 
         async def pull():
-            async with await self.boss.promote(f'layer pull: {layr.iden} {iden}', self.auth.rootuser):
+            taskname = f'layer pull: {layr.iden} {iden}'
+            async with await self.boss.promote(taskname, self.auth.rootuser, background=True):
                 async with await s_telepath.openurl(url) as proxy:
                     await self._pushBulkEdits(proxy, layr, pdef)
 
@@ -4038,18 +6383,25 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         iden = pdef.get('iden')
         user = pdef.get('user')
-
         gvar = f'push:{iden}'
+        # TODO Remove the defaults in 3.0.0
+        csize = pdef.get('chunk:size', s_const.layer_pdef_csize)
+        qsize = pdef.get('queue:size', s_const.layer_pdef_qsize)
+        soffs = max(pdef.get('offs', 0), 0)
 
         async with await s_base.Base.anit() as base:
 
-            queue = s_queue.Queue(maxsize=10000)
+            queue = s_queue.Queue(maxsize=qsize)
 
             async def fill():
 
                 try:
-                    filloffs = await self.getStormVar(gvar, -1)
-                    async for item in layr0.syncNodeEdits(filloffs + 1, wait=True):
+                    if (filloffs := await self.getStormVar(gvar)) is not None:
+                        filloffs += 1
+                    else:
+                        filloffs = soffs
+
+                    async for item in layr0.syncNodeEdits(filloffs, wait=True):
                         await queue.put(item)
                     await queue.close()
 
@@ -4070,7 +6422,7 @@ class Cortex(s_cell.Cell):  # type: ignore
                 for offs, edits in chunk:
                     # prevent push->push->push nodeedits growth
                     alledits.extend(edits)
-                    if len(alledits) > 1000:
+                    if len(alledits) > csize:
                         await layr1.storNodeEdits(alledits, meta)
                         await self.setStormVar(gvar, offs)
                         alledits.clear()
@@ -4087,10 +6439,7 @@ class Cortex(s_cell.Cell):  # type: ignore
                 await self.setNexsIndx(maxindx)
 
     async def saveLayerNodeEdits(self, layriden, edits, meta):
-        layr = self.getLayer(layriden)
-        if layr is None:
-            mesg = f'No layer found with iden: {layriden}'
-            raise s_exc.NoSuchLayer(mesg=mesg)
+        layr = self.reqLayer(layriden)
         return await layr.saveNodeEdits(edits, meta)
 
     async def cloneLayer(self, iden, ldef=None):
@@ -4107,7 +6456,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.layers.get(iden, None)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=iden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {iden}', iden=iden)
 
         ldef = ldef or {}
         ldef['iden'] = s_common.guid()
@@ -4129,24 +6478,20 @@ class Cortex(s_cell.Cell):  # type: ignore
         newpath = s_common.gendir(self.dirn, 'layers', newiden)
         await layr.clone(newpath)
 
-        node = await self.hive.open(('cortex', 'layers', iden))
-        copynode = await self.hive.open(('cortex', 'layers', newiden))
+        copyinfo = self.layerdefs.get(iden)
 
-        layrinfo = await node.dict()
-        copyinfo = await copynode.dict()
-        for name, valu in layrinfo.items():
-            await copyinfo.set(name, valu)
+        for name, valu in copyinfo.items():
+            ldef.setdefault(name, valu)
 
-        for name, valu in ldef.items():
-            await copyinfo.set(name, valu)
+        self.layerdefs.set(newiden, ldef)
 
-        copylayr = await self._initLayr(copyinfo, nexsoffs=nexsitem[0])
+        copylayr = await self._initLayr(ldef, nexsoffs=nexsitem[0])
 
         creator = copyinfo.get('creator')
         user = await self.auth.reqUser(creator)
         await user.setAdmin(True, gateiden=newiden, logged=False)
 
-        return await copylayr.pack()
+        return ldef
 
     def addStormCmd(self, ctor):
         '''
@@ -4161,14 +6506,21 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         Add a storm dmon task.
         '''
-        iden = s_common.guid()
-        ddef['iden'] = iden
+        if ddef.get('iden') is None:
+            ddef['iden'] = s_common.guid()
+
+        if await self.getStormDmon(ddef['iden']) is not None:
+            mesg = f'Duplicate iden specified for dmon: {ddef["iden"]}'
+            raise s_exc.DupIden(mesg=mesg)
+
+        s_schemas.reqValidDdef(ddef)
+
         return await self._push('storm:dmon:add', ddef)
 
     @s_nexus.Pusher.onPushAuto('storm:dmon:bump')
     async def bumpStormDmon(self, iden):
-        ddef = self.stormdmonhive.get(iden)
-        if ddef is None:
+        ddef = self.stormdmondefs.get(iden)
+        if ddef is None or not ddef.get('enabled', True):
             return False
 
         if self.isactive:
@@ -4184,7 +6536,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         Args:
             iden (str): User iden.
         '''
-        for dmoniden, ddef in list(self.stormdmonhive.items()):
+        for dmoniden, ddef in list(self.stormdmondefs.items()):
             if ddef.get('user') == iden:
                 await self.bumpStormDmon(dmoniden)
 
@@ -4200,7 +6552,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         dmon.enabled = True
         dmon.ddef['enabled'] = True
 
-        await self.stormdmonhive.set(iden, dmon.ddef)
+        self.stormdmondefs.set(iden, dmon.ddef)
 
         if self.isactive:
             await dmon.run()
@@ -4220,7 +6572,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         dmon.enabled = False
         dmon.ddef['enabled'] = False
 
-        await self.stormdmonhive.set(iden, dmon.ddef)
+        self.stormdmondefs.set(iden, dmon.ddef)
 
         if self.isactive:
             await dmon.stop()
@@ -4241,14 +6593,15 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         dmon = await self.runStormDmon(iden, ddef)
 
-        await self.stormdmonhive.set(iden, ddef)
+        self.stormdmondefs.set(iden, ddef)
+        await self.fire('storm:dmon:add', iden=iden)
         return dmon.pack()
 
     async def delStormDmon(self, iden):
         '''
         Stop and remove a storm dmon.
         '''
-        ddef = self.stormdmonhive.get(iden)
+        ddef = self.stormdmondefs.get(iden)
         if ddef is None:
             mesg = f'No storm daemon exists with iden {iden}.'
             raise s_exc.NoSuchIden(mesg=mesg)
@@ -4257,10 +6610,11 @@ class Cortex(s_cell.Cell):  # type: ignore
 
     @s_nexus.Pusher.onPush('storm:dmon:del')
     async def _delStormDmon(self, iden):
-        ddef = await self.stormdmonhive.pop(iden)
+        ddef = self.stormdmondefs.pop(iden)
         if ddef is None:  # pragma: no cover
             return
         await self.stormdmons.popDmon(iden)
+        await self.fire('storm:dmon:del', iden=iden)
 
     def getStormCmd(self, name):
         return self.stormcmds.get(name)
@@ -4268,7 +6622,7 @@ class Cortex(s_cell.Cell):  # type: ignore
     async def runStormDmon(self, iden, ddef):
 
         # validate ddef before firing task
-        s_storm.reqValidDdef(ddef)
+        s_schemas.reqValidDdef(ddef)
 
         dmon = self.stormdmons.getDmon(iden)
         if dmon is not None:
@@ -4283,16 +6637,25 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         return dmon
 
+    @s_cell.from_leader
     async def getStormDmon(self, iden):
         return self.stormdmons.getDmonDef(iden)
 
+    @s_cell.from_leader
     async def getStormDmons(self):
         return self.stormdmons.getDmonDefs()
 
+    @s_cell.from_leader
     async def getStormDmonLog(self, iden):
         return self.stormdmons.getDmonRunlog(iden)
 
     def addStormLib(self, path, ctor):
+
+        self.stormlibs.append((path, ctor))
+
+        # Skip libbase which is registered as a default ctor in the storm Runtime
+        if not path:
+            return
 
         root = self.libroot
         # (name, {kids}, {funcs})
@@ -4318,9 +6681,45 @@ class Cortex(s_cell.Cell):  # type: ignore
     def getStormCmds(self):
         return list(self.stormcmds.items())
 
-    async def getAxon(self):
-        await self.axready.wait()
-        return self.axon.iden
+    async def getAxon(self, timeout=s_const.AXON_READY_TIMEOUT):
+        '''
+        Wait for the Axon to be ready and return its iden.
+
+        Args:
+            timeout (int): The maximum number of seconds to wait, or None to wait indefinitely.
+
+        Returns:
+            str: The iden of the Axon, or None if the Axon did not report one.
+
+        Raises:
+            s_exc.TimeOut: If the Axon is not ready within the timeout.
+        '''
+        if not self.axready.is_set():
+            try:
+                await s_common.wait_for(self.axready.wait(), timeout)
+            except asyncio.TimeoutError:
+                mesg = f'Timed out waiting {timeout} seconds for the Axon to be ready.'
+                raise s_exc.TimeOut(mesg=mesg, timeout=timeout) from None
+
+        if (cellinfo := self.axoninfo.get('cell')) is None:
+            return None
+
+        return cellinfo.get('iden')
+
+    async def getCellInfo(self):
+        '''
+        Return metadata specific for the Cortex.
+
+        Notes:
+            In addition to the base Cell information, the ``cell`` section
+            includes ``axon:ready``, which is True when the Axon is ready.
+
+        Returns:
+            Dict: A Dictionary of metadata.
+        '''
+        info = await super().getCellInfo()
+        info['cell']['axon:ready'] = self.axready.is_set()
+        return info
 
     def setFeedFunc(self, name, func):
         '''
@@ -4358,117 +6757,6 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         async for node in snap.addNodes(items):
             pass
-
-    async def _addSynSplice(self, snap, items):
-        s_common.deprecated('addFeedData(syn.splice, ...)')
-
-        for item in items:
-            func = self.splicers.get(item[0])
-
-            if func is None:
-                await snap.warn(f'no such splice: {item!r}')
-                continue
-
-            try:
-                await func(snap, item)
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
-            except Exception as e:
-                logger.exception('splice error')
-                await snap.warn(f'splice error: {e}')
-
-    async def _onFeedNodeAdd(self, snap, mesg):
-
-        ndef = mesg[1].get('ndef')
-
-        if ndef is None:
-            await snap.warn(f'Invalid Splice: {mesg!r}')
-            return
-
-        await snap.addNode(*ndef)
-
-    async def _onFeedNodeDel(self, snap, mesg):
-
-        ndef = mesg[1].get('ndef')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is None:
-            return
-
-        await node.delete()
-
-    async def _onFeedPropSet(self, snap, mesg):
-
-        ndef = mesg[1].get('ndef')
-        name = mesg[1].get('prop')
-        valu = mesg[1].get('valu')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is None:
-            return
-
-        await node.set(name, valu)
-
-    async def _onFeedPropDel(self, snap, mesg):
-
-        ndef = mesg[1].get('ndef')
-        name = mesg[1].get('prop')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is None:
-            return
-
-        await node.pop(name)
-
-    async def _onFeedTagAdd(self, snap, mesg):
-
-        ndef = mesg[1].get('ndef')
-        tag = mesg[1].get('tag')
-        valu = mesg[1].get('valu')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is None:
-            return
-
-        await node.addTag(tag, valu=valu)
-
-    async def _onFeedTagDel(self, snap, mesg):
-
-        ndef = mesg[1].get('ndef')
-        tag = mesg[1].get('tag')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is None:
-            return
-
-        await node.delTag(tag)
-
-    async def _onFeedTagPropSet(self, snap, mesg):
-
-        tag = mesg[1].get('tag')
-        prop = mesg[1].get('prop')
-        ndef = mesg[1].get('ndef')
-        valu = mesg[1].get('valu')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is not None:
-            await node.setTagProp(tag, prop, valu)
-
-    async def _onFeedTagPropDel(self, snap, mesg):
-
-        tag = mesg[1].get('tag')
-        prop = mesg[1].get('prop')
-        ndef = mesg[1].get('ndef')
-
-        node = await snap.getNodeByNdef(ndef)
-        if node is not None:
-            await node.delTagProp(tag, prop)
-
-    async def _addSynNodeEdits(self, snap, items):
-        s_common.deprecated('addFeedData(syn.nodeedits, ...)')
-        for item in items:
-            item = s_common.unjsonsafe_nodeedits(item)
-            await snap.saveNodeEdits(item, None)
 
     async def setUserLocked(self, iden, locked):
         retn = await s_cell.Cell.setUserLocked(self, iden, locked)
@@ -4510,7 +6798,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         view = self.views.get(viewiden)
         if view is None:
-            raise s_exc.NoSuchView(iden=viewiden)
+            raise s_exc.NoSuchView(mesg=f'No such view iden={viewiden}', iden=viewiden)
 
         user.confirm(('view', 'read'), gateiden=viewiden)
 
@@ -4528,13 +6816,37 @@ class Cortex(s_cell.Cell):  # type: ignore
         user = self.auth.user(useriden)
         if user is None:
             mesg = f'No user found with iden: {useriden}'
-            raise s_exc.NoSuchUser(mesg, iden=useriden)
+            raise s_exc.NoSuchUser(mesg=mesg, user=useriden)
 
         return user
 
     async def count(self, text, opts=None):
 
         opts = self._initStormOpts(opts)
+
+        if self.stormpool is not None and opts.get('mirror', True):
+            proxy = await self._getMirrorProxy(opts)
+
+            if proxy is not None:
+                proxname = proxy._ahainfo.get('name')
+                extra = self.getLogExtra(mirror=proxname, hash=s_storm.queryhash(text))
+                logger.info(f'Offloading Storm query to mirror {proxname}.', extra=extra)
+
+                mirropts = await self._getMirrorOpts(opts)
+
+                mirropts.setdefault('_loginfo', {})
+                mirropts['_loginfo']['pool:from'] = self.ahasvcname
+
+                try:
+                    return await proxy.count(text, opts=mirropts)
+
+                except s_exc.TimeOut:
+                    mesg = 'Timeout waiting for query mirror, running locally instead.'
+                    logger.warning(mesg)
+
+        if (nexsoffs := opts.get('nexsoffs')) is not None:
+            if not await self.waitNexsOffs(nexsoffs, timeout=opts.get('nexstimeout')):
+                raise s_exc.TimeOut(mesg=f'Timeout waiting for nexus offset {nexsoffs} in count()')
 
         view = self._viewFromOpts(opts)
 
@@ -4544,52 +6856,193 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         return i
 
+    async def _getMirrorOpts(self, opts):
+        assert 'nexsoffs' in opts
+        mirropts = s_msgpack.deepcopy(opts)
+        mirropts['mirror'] = False
+        mirropts['nexstimeout'] = self.stormpoolopts.get('timeout:sync')
+        return mirropts
+
+    async def _getMirrorProxy(self, opts):
+
+        if self.stormpool is None:  # pragma: no cover
+            return None
+
+        size = self.stormpool.size()
+        if size == 0:
+            logger.warning('Storm query mirror pool is empty, running query locally.')
+            return None
+
+        timeout = self.stormpoolopts.get('timeout:connection')
+
+        for _ in range(size):
+
+            try:
+                proxy = await self.stormpool.proxy(timeout=timeout)
+
+                proxyname = proxy._ahainfo.get('name')
+                if proxyname is not None and proxyname == self.ahasvcname:
+                    # we are part of the pool and were selected. Skip.
+                    continue
+
+            except TimeoutError:
+                logger.warning('Timeout waiting for pool mirror proxy.')
+                continue
+
+            try:
+
+                curoffs = opts.setdefault('nexsoffs', await self.getNexsIndx() - 1)
+                miroffs = await s_common.wait_for(proxy.getNexsIndx(), timeout) - 1
+                if (delta := curoffs - miroffs) <= MAX_NEXUS_DELTA:
+                    return proxy
+
+                mesg = f'Pool mirror [{proxyname}] is too far out of sync. Skipping.'
+                logger.warning(mesg, extra=self.getLogExtra(delta=delta, mirror=proxyname, mirror_offset=miroffs))
+
+            except s_exc.ShuttingDown:
+                mesg = f'Proxy for pool mirror [{proxyname}] is shutting down. Skipping.'
+                logger.warning(mesg, extra=self.getLogExtra(mirror=proxyname))
+
+            except s_exc.IsFini:
+                mesg = f'Proxy for pool mirror [{proxyname}] was shutdown. Skipping.'
+                logger.warning(mesg, extra=self.getLogExtra(mirror=proxyname))
+
+            except TimeoutError:
+                mesg = f'Timeout waiting for pool mirror [{proxyname}] Nexus offset.'
+                logger.warning(mesg, extra=self.getLogExtra(mirror=proxyname))
+
+        logger.warning('Pool members exhausted. Running query locally.', extra=self.getLogExtra())
+        return None
+
     async def storm(self, text, opts=None):
-        '''
-        '''
+
         opts = self._initStormOpts(opts)
+
+        if self.stormpool is not None and opts.get('mirror', True):
+            proxy = await self._getMirrorProxy(opts)
+
+            if proxy is not None:
+                proxname = proxy._ahainfo.get('name')
+                extra = self.getLogExtra(mirror=proxname, hash=s_storm.queryhash(text))
+                logger.info(f'Offloading Storm query to mirror {proxname}.', extra=extra)
+
+                mirropts = await self._getMirrorOpts(opts)
+
+                mirropts.setdefault('_loginfo', {})
+                mirropts['_loginfo']['pool:from'] = self.ahasvcname
+
+                try:
+                    async for mesg in proxy.storm(text, opts=mirropts):
+                        yield mesg
+                    return
+
+                except s_exc.TimeOut:
+                    mesg = 'Timeout waiting for query mirror, running locally instead.'
+                    logger.warning(mesg, extra=extra)
+
+        if (nexsoffs := opts.get('nexsoffs')) is not None:
+            if not await self.waitNexsOffs(nexsoffs, timeout=opts.get('nexstimeout')):
+                raise s_exc.TimeOut(mesg=f'Timeout waiting for nexus offset {nexsoffs} in storm().')
 
         view = self._viewFromOpts(opts)
         async for mesg in view.storm(text, opts=opts):
             yield mesg
 
     async def callStorm(self, text, opts=None):
+
         opts = self._initStormOpts(opts)
+
+        if self.stormpool is not None and opts.get('mirror', True):
+            proxy = await self._getMirrorProxy(opts)
+
+            if proxy is not None:
+                proxname = proxy._ahainfo.get('name')
+                extra = self.getLogExtra(mirror=proxname, hash=s_storm.queryhash(text))
+                logger.info(f'Offloading Storm query to mirror {proxname}.', extra=extra)
+
+                mirropts = await self._getMirrorOpts(opts)
+
+                mirropts.setdefault('_loginfo', {})
+                mirropts['_loginfo']['pool:from'] = self.ahasvcname
+
+                try:
+                    return await proxy.callStorm(text, opts=mirropts)
+                except s_exc.TimeOut:
+                    mesg = 'Timeout waiting for query mirror, running locally instead.'
+                    logger.warning(mesg, extra=extra)
+
+        if (nexsoffs := opts.get('nexsoffs')) is not None:
+            if not await self.waitNexsOffs(nexsoffs, timeout=opts.get('nexstimeout')):
+                raise s_exc.TimeOut(mesg=f'Timeout waiting for nexus offset {nexsoffs} in callStorm().')
+
         view = self._viewFromOpts(opts)
         return await view.callStorm(text, opts=opts)
 
     async def exportStorm(self, text, opts=None):
+
         opts = self._initStormOpts(opts)
+
+        if self.stormpool is not None and opts.get('mirror', True):
+            proxy = await self._getMirrorProxy(opts)
+
+            if proxy is not None:
+                proxname = proxy._ahainfo.get('name')
+                extra = self.getLogExtra(mirror=proxname, hash=s_storm.queryhash(text))
+                logger.info(f'Offloading Storm query to mirror {proxname}.', extra=extra)
+
+                mirropts = await self._getMirrorOpts(opts)
+
+                mirropts.setdefault('_loginfo', {})
+                mirropts['_loginfo']['pool:from'] = self.ahasvcname
+
+                try:
+                    async for mesg in proxy.exportStorm(text, opts=mirropts):
+                        yield mesg
+                    return
+
+                except s_exc.TimeOut:
+                    mesg = 'Timeout waiting for query mirror, running locally instead.'
+                    logger.warning(mesg, extra=extra)
+
+        if (nexsoffs := opts.get('nexsoffs')) is not None:
+            if not await self.waitNexsOffs(nexsoffs, timeout=opts.get('nexstimeout')):
+                raise s_exc.TimeOut(mesg=f'Timeout waiting for nexus offset {nexsoffs} in exportStorm().')
+
         user = self._userFromOpts(opts)
         view = self._viewFromOpts(opts)
 
-        await self.boss.promote('storm:export', user=user, info={'query': text})
+        taskinfo = {'query': text, 'view': view.iden}
+        taskiden = opts.get('task')
+        await self.boss.promote('storm:export', user=user, info=taskinfo, taskiden=taskiden)
 
-        spooldict = await s_spooled.Dict.anit()
-        async with await self.snap(user=user, view=view) as snap:
+        with s_scope.enter({'user': user}):
 
-            async for pode in snap.iterStormPodes(text, opts=opts):
-                await spooldict.set(pode[1]['iden'], pode)
-                await asyncio.sleep(0)
+            async with await s_spooled.Dict.anit(dirn=self.dirn, cell=self) as spooldict:
+                async with await self.snap(user=user, view=view) as snap:
 
-            for iden, pode in spooldict.items():
-                await asyncio.sleep(0)
+                    async for pode in snap.iterStormPodes(text, opts=opts):
+                        await spooldict.set(pode[1]['iden'], pode)
+                        await asyncio.sleep(0)
 
-                edges = []
-                async for verb, n2iden in snap.iterNodeEdgesN1(s_common.uhex(iden)):
-                    await asyncio.sleep(0)
+                    for iden, pode in spooldict.items():
+                        await asyncio.sleep(0)
 
-                    if not spooldict.has(n2iden):
-                        continue
+                        edges = []
+                        async for verb, n2iden in snap.iterNodeEdgesN1(s_common.uhex(iden)):
+                            await asyncio.sleep(0)
 
-                    edges.append((verb, n2iden))
+                            if not spooldict.has(n2iden):
+                                continue
 
-                if edges:
-                    pode[1]['edges'] = edges
+                            edges.append((verb, n2iden))
 
-                yield pode
+                        if edges:
+                            pode[1]['edges'] = edges
+
+                        yield pode
 
     async def exportStormToAxon(self, text, opts=None):
+        await self.getAxon()
         async with await self.axon.upload() as fd:
             async for pode in self.exportStorm(text, opts=opts):
                 await fd.write(s_msgpack.en(pode))
@@ -4602,10 +7055,15 @@ class Cortex(s_cell.Cell):  # type: ignore
         user = self._userFromOpts(opts)
         view = self._viewFromOpts(opts)
 
-        await self.boss.promote('feeddata', user=user, info={'name': 'syn.nodes', 'sha256': sha256})
+        taskiden = opts.get('task')
+        taskinfo = {'name': 'syn.nodes', 'sha256': sha256, 'view': view.iden}
+
+        await self.boss.promote('feeddata', user=user, info=taskinfo, taskiden=taskiden)
 
         # ensure that the user can make all node edits in the layer
         user.confirm(('node',), gateiden=view.layers[0].iden)
+
+        await self.getAxon()
 
         q = s_queue.Queue(maxsize=10000)
         feedexc = None
@@ -4653,26 +7111,14 @@ class Cortex(s_cell.Cell):  # type: ignore
         view = self._viewFromOpts(opts)
         return await view.nodes(text, opts=opts)
 
-    async def eval(self, text, opts=None):
-        '''
-        Evaluate a storm query and yield packed nodes.
-
-        NOTE: This API is deprecated as of 2.0.0 and will be removed in 3.0.0
-        '''
-        s_common.deprecated('eval')
-        opts = self._initStormOpts(opts)
-        view = self._viewFromOpts(opts)
-        async for node in view.eval(text, opts=opts):
-            yield node
-
     async def stormlist(self, text, opts=None):
         return [m async for m in self.storm(text, opts=opts)]
 
     async def _getStormEval(self, text):
         try:
             astvalu = copy.deepcopy(await s_parser.evalcache.aget(text))
-        except s_exc.FatalErr:
-            logger.exception(f'Fatal error while parsing [{text}]', extra={'synapse': {'text': text}})
+        except s_exc.FatalErr: # pragma: no cover
+            logger.exception(f'Fatal error while parsing [{text}]', extra=self.getLogExtra(text=text))
             await self.fini()
             raise
         astvalu.init(self)
@@ -4681,8 +7127,8 @@ class Cortex(s_cell.Cell):  # type: ignore
     async def _getStormQuery(self, args):
         try:
             query = copy.deepcopy(await s_parser.querycache.aget(args))
-        except s_exc.FatalErr:
-            logger.exception(f'Fatal error while parsing [{args}]', extra={'synapse': {'text': args[0]}})
+        except s_exc.FatalErr: # pragma: no cover
+            logger.exception(f'Fatal error while parsing [{args}]', extra=self.getLogExtra(text=args[0]))
             await self.fini()
             raise
         query.init(self)
@@ -4724,13 +7170,45 @@ class Cortex(s_cell.Cell):  # type: ignore
         await self.getStormQuery(text, mode=mode)
         return True
 
-    def _logStormQuery(self, text, user, mode):
+    async def isValidStorm(self, text, opts=None):
+        '''
+        Check if a Storm query is valid without raising an exception.
+
+        Args:
+            text (str): The text of the Storm query to check.
+            opts (dict): A Storm options dictionary.
+
+        Returns:
+            (bool, info): A tuple of (True, {}) if valid, or (False, err) if not.
+        '''
+        try:
+            await self.reqValidStorm(text, opts)
+            return (True, {})
+        except Exception as e:
+            return s_common.retnexc(e)
+
+    def _logStormQuery(self, text, user, info=None, via=None):
         '''
         Log a storm query.
+
+        Args:
+            text (str): The query text.
+            user: The User who ran the query.
+            info (dict): Fields to record alongside the query.
+            via (str): The name of the Storm command or library which dispatched the query.
         '''
         if self.stormlog:
-            stormlogger.log(self.stormloglvl, 'Executing storm query {%s} as [%s]', text, user.name,
-                            extra={'synapse': {'text': text, 'username': user.name, 'user': user.iden, 'mode': mode}})
+            if info is None:
+                info = {}
+            info['text'] = text
+            info['hash'] = s_storm.queryhash(text)
+
+            if via is None:
+                stormlogger.log(self.stormloglvl, 'Executing storm query {%s} as [%s]', text, user.name,
+                                extra=self.getLogExtra(**info))
+            else:
+                stormlogger.log(self.stormloglvl, 'Executing storm query via %s {%s} as [%s]', via, text, user.name,
+                                extra=self.getLogExtra(**info))
 
     async def getNodeByNdef(self, ndef, view=None):
         '''
@@ -4740,7 +7218,7 @@ class Cortex(s_cell.Cell):  # type: ignore
 
         form = self.model.forms.get(name)
         if form is None:
-            raise s_exc.NoSuchForm(name=name)
+            raise s_exc.NoSuchForm.init(name)
 
         norm, info = form.type.norm(valu)
 
@@ -4750,6 +7228,7 @@ class Cortex(s_cell.Cell):  # type: ignore
             return await snap.getNodeByBuid(buid)
 
     def getCoreInfo(self):
+        '''This API is deprecated.'''
         s_common.deprecated('Cortex.getCoreInfo')
         return {
             'version': synapse.version,
@@ -4772,10 +7251,26 @@ class Cortex(s_cell.Cell):  # type: ignore
             dict: A Dictionary of storm documentation information.
         '''
 
+        cmds = []
+
+        for name, cmd in self.stormcmds.items():
+            entry = {
+                'name': name,
+                'doc': cmd.getCmdBrief(),
+            }
+
+            if cmd.pkgname:
+                entry['package'] = cmd.pkgname
+
+            if cmd.svciden:
+                entry['svciden'] = cmd.svciden
+
+            cmds.append(entry)
+
         ret = {
             'libraries': s_stormtypes.registry.getLibDocs(),
             'types': s_stormtypes.registry.getTypeDocs(),
-            # 'cmds': ...  # TODO - support cmd docs
+            'commands': cmds,
             # 'packages': ...  # TODO - Support inline information for packages?
         }
         return ret
@@ -4809,13 +7304,13 @@ class Cortex(s_cell.Cell):  # type: ignore
         Args:
             name (str): The name of the feed record format.
             items (list): A list of items to ingest.
-            iden (str): The iden of a view to use.
+            viewiden (str): The iden of a view to use.
                 If a view is not specified, the default view is used.
         '''
 
         view = self.getView(viewiden)
         if view is None:
-            raise s_exc.NoSuchView(iden=viewiden)
+            raise s_exc.NoSuchView(mesg=f'No such view iden={viewiden}', iden=viewiden)
 
         async with await self.snap(view=view) as snap:
             snap.strict = False
@@ -4907,6 +7402,9 @@ class Cortex(s_cell.Cell):  # type: ignore
         if isinstance(ctor, (list, tuple)):
             ctor, conf = ctor
 
+        if not ctor.startswith(('synapse.tests', 'synapse.models')):
+            s_common.deprecated("'modules' Cortex config value", curv='2.206.0')
+
         modu = self._loadCoreModule(ctor, conf=conf)
         if modu is None:
             return
@@ -4931,23 +7429,22 @@ class Cortex(s_cell.Cell):  # type: ignore
 
     async def _initCoreMods(self):
 
-        with s_provenance.claim('init', meth='_initCoreMods'):
-            for ctor, modu in list(self.modules.items()):
+        for ctor, modu in list(self.modules.items()):
 
-                try:
-                    await s_coro.ornot(modu.initCoreModule)
-                except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                    raise
-                except Exception:
-                    logger.exception(f'module initCoreModule failed: {ctor}')
-                    self.modules.pop(ctor, None)
+            try:
+                await s_coro.ornot(modu.initCoreModule)
+            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
+                raise
+            except Exception:
+                logger.exception(f'module initCoreModule failed: {ctor}')
+                self.modules.pop(ctor, None)
 
     def _loadCoreModule(self, ctor, conf=None):
 
         if ctor in self.modules:
             raise s_exc.ModAlreadyLoaded(mesg=f'{ctor} already loaded')
         try:
-            modu = s_dyndeps.tryDynFunc(ctor, self, conf=conf)
+            modu = s_dyndeps.reqDynFunc(ctor, self, conf=conf)
             self.modules[ctor] = modu
             return modu
 
@@ -4955,21 +7452,14 @@ class Cortex(s_cell.Cell):  # type: ignore
             logger.exception('mod load fail: %s' % (ctor,))
             return None
 
-    async def stat(self):
-        stats = {
-            'iden': self.iden,
-            'layer': await self.getLayer().stat(),
-            'formcounts': await self.getFormCounts(),
-        }
-        return stats
-
-    async def getPropNorm(self, prop, valu):
+    async def getPropNorm(self, prop, valu, typeopts=None):
         '''
         Get the normalized property value based on the Cortex data model.
 
         Args:
             prop (str): The property to normalize.
             valu: The value to normalize.
+            typeopts: A Synapse type opts dictionary used to further normalize the value.
 
         Returns:
             (tuple): A two item tuple, containing the normed value and the info dictionary.
@@ -4982,16 +7472,22 @@ class Cortex(s_cell.Cell):  # type: ignore
         if pobj is None:
             raise s_exc.NoSuchProp(mesg=f'The property {prop} does not exist.',
                                    prop=prop)
-        norm, info = pobj.type.norm(valu)
+
+        tobj = pobj.type
+        if typeopts:
+            tobj = tobj.clone(typeopts)
+
+        norm, info = tobj.norm(valu)
         return norm, info
 
-    async def getTypeNorm(self, name, valu):
+    async def getTypeNorm(self, name, valu, typeopts=None):
         '''
         Get the normalized type value based on the Cortex data model.
 
         Args:
             name (str): The type to normalize.
             valu: The value to normalize.
+            typeopts: A Synapse type opts dictionary used to further normalize the value.
 
         Returns:
             (tuple): A two item tuple, containing the normed value and the info dictionary.
@@ -5004,6 +7500,9 @@ class Cortex(s_cell.Cell):  # type: ignore
         if tobj is None:
             raise s_exc.NoSuchType(mesg=f'The type {name} does not exist.',
                                    name=name)
+        if typeopts:
+            tobj = tobj.clone(typeopts)
+
         norm, info = tobj.norm(valu)
         return norm, info
 
@@ -5040,7 +7539,7 @@ class Cortex(s_cell.Cell):  # type: ignore
             The incunit if not None it must be larger in unit size than all the keys in all reqs elements.
             Non-recurring jobs may also have a req of 'now' which will cause the job to also execute immediately.
         '''
-        s_agenda.reqValidCdef(cdef)
+        s_schemas.reqValidCronDef(cdef)
 
         iden = cdef.get('iden')
         appt = self.agenda.appts.get(iden)
@@ -5069,10 +7568,12 @@ class Cortex(s_cell.Cell):  # type: ignore
 
             cdef['reqs'] = reqs
         except KeyError:
-            raise s_exc.BadConfValu('Unrecognized time unit')
+            raise s_exc.BadConfValu(mesg='Unrecognized time unit')
 
         if not cdef.get('iden'):
             cdef['iden'] = s_common.guid()
+
+        cdef['created'] = s_common.now()
 
         opts = {'user': cdef['creator'], 'view': cdef.get('view')}
 
@@ -5090,6 +7591,8 @@ class Cortex(s_cell.Cell):  # type: ignore
         if appt is not None:
             return appt.pack()
 
+        self.auth.reqNoAuthGate(iden)
+
         user = await self.auth.reqUser(cdef['creator'])
 
         cdef = await self.agenda.add(cdef)
@@ -5097,6 +7600,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         await self.auth.addAuthGate(iden, 'cronjob')
         await user.setAdmin(True, gateiden=iden, logged=False)
 
+        await self.feedBeholder('cron:add', cdef, gates=[iden])
         return cdef
 
     async def moveCronJob(self, useriden, croniden, viewiden):
@@ -5114,6 +7618,7 @@ class Cortex(s_cell.Cell):  # type: ignore
     @s_nexus.Pusher.onPush('cron:move')
     async def _onMoveCronJob(self, croniden, viewiden):
         await self.agenda.move(croniden, viewiden)
+        await self.feedBeholder('cron:move', {'iden': croniden, 'view': viewiden}, gates=[croniden])
         return croniden
 
     @s_nexus.Pusher.onPushAuto('cron:del')
@@ -5122,24 +7627,67 @@ class Cortex(s_cell.Cell):  # type: ignore
         Delete a cron job
 
         Args:
-            iden (bytes):  The iden of the cron job to be deleted
+            iden (str):  The iden of the cron job to be deleted
         '''
+        await self._killCronTask(iden)
         try:
             await self.agenda.delete(iden)
         except s_exc.NoSuchIden:
             return
 
+        await self.feedBeholder('cron:del', {'iden': iden}, gates=[iden])
         await self.auth.delAuthGate(iden)
 
     @s_nexus.Pusher.onPushAuto('cron:mod')
-    async def updateCronJob(self, iden, query):
+    async def updateCronJob(self, iden, query=None, reqs=None, incunit=None, incvals=None):
         '''
-        Change an existing cron job's query
+        Change an existing cron job's query or period
 
         Args:
-            iden (bytes):  The iden of the cron job to be changed
+            iden (str):  The iden of the cron job to be changed
+            query (str):  The new query for the cron job (optional)
+            reqs (dict):  The new period for the cron job (optional)
+            incunit (str):  The unit of time for the period (optional)
+            incvals (int/list):  The values for the period (optional)
         '''
-        await self.agenda.mod(iden, query)
+
+        if (all(param is None for param in (query, reqs, incunit, incvals))):
+            return None
+
+        if incunit is not None:
+            incunit = s_agenda.TimeUnit.fromString(incunit)
+
+        if reqs is not None:
+            if isinstance(reqs, Mapping):
+                reqs = self._convert_reqdict(reqs)
+                if incunit is not None and s_agenda.TimeUnit.NOW in reqs:
+                    mesg = "Recurring jobs may not be scheduled to run 'now'"
+                    raise s_exc.BadConfValu(mesg)
+            else:
+                nreqs = []
+                for req in reqs:
+                    nr = self._convert_reqdict(req)
+                    if incunit is not None and s_agenda.TimeUnit.NOW in nr:
+                        mesg = "Recurring jobs may not be scheduled to run 'now'"
+                        raise s_exc.BadConfValu(mesg)
+                    nreqs.append(nr)
+                reqs = nreqs
+
+        cdef = {}
+        if query is not None:
+            cdef['query'] = query
+
+        if reqs is not None or incunit is not None or incvals is not None:
+            cdef['reqs'] = reqs
+            cdef['incunit'] = incunit
+            cdef['incvals'] = incvals
+
+        cdef = await self.agenda.mod(iden, cdef=cdef)
+        if query is not None:
+            await self.feedBeholder('cron:edit:query', {'iden': iden, 'query': query}, gates=[iden])
+
+        if reqs is not None or incunit is not None or incvals is not None:
+            await self.feedBeholder('cron:edit:period', cdef, gates=[iden])
 
     @s_nexus.Pusher.onPushAuto('cron:enable')
     async def enableCronJob(self, iden):
@@ -5147,9 +7695,11 @@ class Cortex(s_cell.Cell):  # type: ignore
         Enable a cron job
 
         Args:
-            iden (bytes):  The iden of the cron job to be changed
+            iden (str):  The iden of the cron job to be changed
         '''
         await self.agenda.enable(iden)
+        await self.feedBeholder('cron:enable', {'iden': iden}, gates=[iden])
+        logger.info(f'Enabled cron job {iden}', extra=self.getLogExtra(iden=iden, status='MODIFY'))
 
     @s_nexus.Pusher.onPushAuto('cron:disable')
     async def disableCronJob(self, iden):
@@ -5157,9 +7707,31 @@ class Cortex(s_cell.Cell):  # type: ignore
         Enable a cron job
 
         Args:
-            iden (bytes):  The iden of the cron job to be changed
+            iden (str):  The iden of the cron job to be changed
         '''
         await self.agenda.disable(iden)
+        await self._killCronTask(iden)
+        await self.feedBeholder('cron:disable', {'iden': iden}, gates=[iden])
+        logger.info(f'Disabled cron job {iden}', extra=self.getLogExtra(iden=iden, status='MODIFY'))
+
+    async def killCronTask(self, iden):
+        if self.agenda.appts.get(iden) is None:
+            return False
+        return await self._push('cron:task:kill', iden)
+
+    @s_nexus.Pusher.onPush('cron:task:kill')
+    async def _killCronTask(self, iden):
+
+        appt = self.agenda.appts.get(iden)
+        if appt is None:
+            return False
+
+        task = appt.task
+        if task is None:
+            return False
+
+        self.schedCoro(task.kill())
+        return True
 
     async def listCronJobs(self):
         '''
@@ -5172,7 +7744,8 @@ class Cortex(s_cell.Cell):  # type: ignore
             info = cron.pack()
 
             user = self.auth.user(cron.creator)
-            info['username'] = user.name
+            if user is not None:
+                info['username'] = user.name
 
             crons.append(info)
 
@@ -5186,33 +7759,99 @@ class Cortex(s_cell.Cell):  # type: ignore
         appt = await self.agenda.get(iden)
         # TODO make this generic and check cdef
 
-        if name == 'name':
-            await appt.setName(str(valu))
-            return appt.pack()
+        if name == 'creator':
+            await self.auth.reqUser(valu)
+            appt.creator = valu
 
-        if name == 'doc':
-            await appt.setDoc(str(valu))
-            return appt.pack()
+        elif name == 'name':
+            appt.name = str(valu)
 
-        mesg = f'editCronJob name {name} is not supported for editing.'
-        raise s_exc.BadArg(mesg=mesg)
+        elif name == 'doc':
+            appt.doc = str(valu)
 
-    async def _enableMigrationMode(self):
+        elif name == 'pool':
+            valu = bool(valu)
+            if valu and appt.affinity:
+                raise s_exc.BadConfValu(mesg='Cron jobs may not have both affinity and pool set.')
+            appt.pool = valu
+
+        elif name == 'affinity':
+            if valu is not None:
+                valu = str(valu)
+                if appt.pool:
+                    raise s_exc.BadConfValu(mesg='Cron jobs may not have both affinity and pool set.')
+            appt.affinity = valu
+
+        else:
+            mesg = f'editCronJob name {name} is not supported for editing.'
+            raise s_exc.BadArg(mesg=mesg)
+
+        await appt.save()
+
+        pckd = appt.pack()
+        await self.feedBeholder(f'cron:edit:{name}', {'iden': iden, name: pckd.get(name)}, gates=[iden])
+        return pckd
+
+    @s_nexus.Pusher.onPushAuto('cron:edits')
+    async def addCronEdits(self, iden, edits):
         '''
-        Prevents cron jobs and triggers from running
+        Take a dictionary of edits and apply them to the appointment (cron job)
         '''
-        self.agenda.enabled = False
-        self.trigson = False
+        appt = await self.agenda.get(iden)
+        await appt.edits(edits)
 
-    async def _disableMigrationMode(self):
-        '''
-        Allows cron jobs and triggers to run
-        '''
-        if self.conf.get('cron:enable'):
-            self.agenda.enabled = True
+    @contextlib.asynccontextmanager
+    async def enterMigrationMode(self):
+        async with self._migration_lock:
+            self.migration = True
+            yield
+            self.migration = False
 
-        if self.conf.get('trigger:enable'):
-            self.trigson = True
+    async def fuseNodes(self, srcndef, dstndef, useriden):
+        '''
+        Fuse the src node into the dst node across every layer in the Cortex.
+
+        Node fusion writes to arbitrary layers rather than a single view's write layer, and
+        the edits it makes depend on the state it reads. The edits are computed here, before
+        any of them are applied, and are then handed to each layer with
+        Layer.storNodeEditsNoLift(). That keeps the edits themselves in the nexus log, so a
+        mirror applies exactly the edits which were computed here rather than recomputing them
+        from its own state.
+
+        A fuse of a heavily referenced node can need a very large number of edits, so each
+        layer's edits are applied in chunks of one nexus operation each rather than all at
+        once. A fuse is therefore not transactional, and an interruption can leave part of it
+        applied. See NodeFuser._iterNodeEdits() for the ordering which makes that recoverable.
+
+        The reads are not serialized against other writes, so a write to src which lands after
+        the edits are computed is not accounted for and is not detected. Running a fuse during
+        a maintenance window, as recommended in the Storm API docs, avoids this. Executing the
+        fuse as requested is this method's responsibility; a concurrent edit landing on src is
+        outside that scope.
+
+        Args:
+            srcndef (tuple): The (form, valu) of the node to fuse from. It will be deleted.
+            dstndef (tuple): The (form, valu) of the node to fuse into. It will be kept.
+            useriden (str): The iden of the user running the fuse.
+
+        Returns:
+            dict: The warnings to emit and the layers which failed.
+        '''
+        # tick is sampled once and carried in the nodeedit meta, so that the leader and every
+        # mirror record the same time in the layer node edit logs.
+        meta = {'time': s_common.now(), 'user': useriden}
+
+        # the fuser owns the spooled state the edits are accumulated in, so it stays open
+        # until they have all been applied
+        async with await s_nodefuse.NodeFuser.anit(self, useriden) as fuser:
+
+            await fuser.getLayerEdits(srcndef, dstndef)
+
+            await fuser.applyLayerEdits(meta)
+
+            # returned even with nothing to apply, since discovery may have produced
+            # warnings of its own which the caller still needs to emit
+            return fuser.getResult()
 
     async def iterFormRows(self, layriden, form, stortype=None, startvalu=None):
         '''
@@ -5229,7 +7868,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.getLayer(layriden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=layriden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {layriden}', iden=layriden)
 
         async for item in layr.iterFormRows(form, stortype=stortype, startvalu=startvalu):
             yield item
@@ -5250,7 +7889,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.getLayer(layriden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=layriden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {layriden}', iden=layriden)
 
         async for item in layr.iterPropRows(form, prop, stortype=stortype, startvalu=startvalu):
             yield item
@@ -5270,7 +7909,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.getLayer(layriden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=layriden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {layriden}', iden=layriden)
 
         async for item in layr.iterUnivRows(prop, stortype=stortype, startvalu=startvalu):
             yield item
@@ -5294,7 +7933,7 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.getLayer(layriden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=layriden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {layriden}', iden=layriden)
 
         async for item in layr.iterTagRows(tag, form=form, starttupl=starttupl):
             yield item
@@ -5316,10 +7955,909 @@ class Cortex(s_cell.Cell):  # type: ignore
         '''
         layr = self.getLayer(layriden)
         if layr is None:
-            raise s_exc.NoSuchLayer(iden=layriden)
+            raise s_exc.NoSuchLayer(mesg=f'No such layer {layriden}', iden=layriden)
 
         async for item in layr.iterTagPropRows(tag, prop, form=form, stortype=stortype, startvalu=startvalu):
             yield item
+
+    def _initVaults(self):
+        self.vaultsdb = self.slab.initdb('vaults')
+        # { idenb: s_msgpack.en(vault), ... }
+
+        self.vaultsbynamedb = self.slab.initdb('vaults:byname')
+        # { name.encode(): idenb, ... }
+
+        # TSI = type, scope, iden. This is used to deconflict uniqueness of
+        # scoped vaults without requiring a bunch of other indexes.
+        self.vaultsbyTSIdb = self.slab.initdb('vaults:byTSI')
+        # { TSI.encode(): idenb, ... }
+
+    def _getVaults(self):
+        '''
+        Slab helper function for getting all vaults.
+        '''
+        genr = self.slab.scanByFull(db=self.vaultsdb)
+        for idenb, byts in genr:
+            vault = s_msgpack.un(byts)
+            yield vault
+
+    def _getVaultByBidn(self, bidn):
+        '''
+        Slab helper function for getting a vault by iden (bytes).
+        '''
+        byts = self.slab.get(bidn, db=self.vaultsdb)
+        if byts is None:
+            return None
+
+        vault = s_msgpack.un(byts)
+
+        return vault
+
+    def _getVaultByTSI(self, vtype, scope, iden):
+        '''
+        Slab helper function for getting a vault by type,scope,iden.
+        '''
+        if scope == 'global':
+            tsi = f'{vtype}:global'
+        elif scope in ('user', 'role'):
+            tsi = f'{vtype}:{scope}:{iden}'
+        else:
+            raise s_exc.BadArg(mesg=f'Invalid scope: {scope}.')
+
+        bidn = self.slab.get(tsi.encode(), db=self.vaultsbyTSIdb)
+        if bidn is None:
+            return None
+
+        return self._getVaultByBidn(bidn)
+
+    def _reqVaultPerm(self, user, vault, level, ref=None):
+        if ref is None:
+            ref = vault.get('iden')
+
+        mesg = f'User requires {s_cell.permnames.get(level)} permission on vault: {ref}.'
+        self._reqEasyPerm(vault, user, level, mesg=mesg)
+
+    def _getVaultUser(self, user):
+        if not isinstance(user, str):
+            return user
+
+        retn = self.auth.user(user)
+        if retn is None:
+            raise s_exc.NoSuchUser(mesg=f'No user with iden {user}.', user=user)
+
+        return retn
+
+    def _vaultForUser(self, user, vault):
+        # secrets are only returned to users with edit permission
+        if vault is None or user is None or self._hasEasyPerm(vault, user, s_cell.PERM_EDIT):
+            return vault
+
+        vault = dict(vault)
+        vault.pop('secrets', None)
+        return vault
+
+    async def getVault(self, iden, user=None):
+        '''
+        Get a vault.
+
+        Args:
+            iden (str): Iden of the vault to get.
+            user (User|str|None): If set, require read permission and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.AuthDeny: `user` does not have read permission on the vault.
+            synapse.exc.NoSuchUser: `user` is an iden which does not exist.
+
+        Returns: vault or None
+        '''
+        user = self._getVaultUser(user)
+
+        if not s_common.isguid(iden):
+            return None
+
+        bidn = s_common.uhex(iden)
+        vault = self._getVaultByBidn(bidn)
+        if vault is None or user is None:
+            return vault
+
+        self._reqVaultPerm(user, vault, s_cell.PERM_READ)
+        return self._vaultForUser(user, vault)
+
+    async def getVaultByName(self, name, user=None):
+        '''
+        Get a vault by name.
+
+        Args:
+            name (str): Name of the vault to get.
+            user (User|str|None): If set, require read permission and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.AuthDeny: `user` does not have read permission on the vault.
+            synapse.exc.NoSuchUser: `user` is an iden which does not exist.
+
+        Returns: vault or None
+        '''
+        user = self._getVaultUser(user)
+
+        bidn = self.slab.get(name.encode(), db=self.vaultsbynamedb)
+        if bidn is None:
+            return None
+
+        vault = self._getVaultByBidn(bidn)
+        if vault is None or user is None:
+            return vault
+
+        self._reqVaultPerm(user, vault, s_cell.PERM_READ, ref=name)
+        return self._vaultForUser(user, vault)
+
+    async def getVaultByType(self, vtype, useriden=None, scope=None, user=None):
+        '''
+        Get a vault of type `vtype` and scope `scope` for user with `iden`.
+
+        This function allows the caller to retrieve a vault of the specified
+        `vtype` by searching for the first available vault that matches the
+        `vtype` and `scope` criteria. The search order for opening vaults is as
+        follows:
+            - If `scope` is specified, return the vault with `vtype` and `scope`.
+              Return None if such a vault doesn't exist.
+            - Check 'user' scope for a vault of `vtype`. Continue if non-existent.
+            - Check 'role' scope for a vault of `vtype`. Continue if non-existent.
+            - Check 'global' scope for a vault of `vtype`. Continue if non-existent.
+            - Return None
+
+        Args:
+            vtype (str): Type of the vault to open.
+            useriden (str|None): Iden of user trying to open the vault. Defaults to the iden of `user`.
+            scope (str|None): The vault scope to open.
+            user (User|str|None): If set, require read permission and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.BadArg: Invalid scope specified, or neither `useriden` nor `user` specified.
+            synapse.exc.AuthDeny: `user` does not have read permission on the vault.
+            synapse.exc.NoSuchUser: `user` is an iden which does not exist.
+
+        Returns: vault or None if matching vault could not be found.
+        '''
+        user = self._getVaultUser(user)
+
+        if useriden is None:
+            if user is None:
+                raise s_exc.BadArg(mesg='A useriden or user is required to get a vault by type.')
+
+            useriden = user.iden
+
+        if scope not in (None, 'user', 'role', 'global'):
+            raise s_exc.BadArg(mesg=f'Invalid scope: {scope}.')
+
+        def _getVault(_scope):
+            vault = None
+            if _scope == 'user':
+                vault = self._getVaultByTSI(vtype, _scope, useriden)
+
+            elif _scope == 'role':
+                user = self.auth.user(useriden)
+                if user is None:
+                    mesg = f'No user with iden {useriden}.'
+                    raise s_exc.NoSuchUser(mesg=mesg, user=useriden)
+
+                for role in user.getRoles():
+                    vault = self._getVaultByTSI(vtype, _scope, role.iden)
+                    if vault:
+                        if not self._hasEasyPerm(vault, user, s_cell.PERM_READ):
+                            vault = None
+                            continue
+
+                        break
+
+            elif _scope == 'global':
+                vault = self._getVaultByTSI(vtype, _scope, None)
+
+            return vault
+
+        vault = None
+
+        # If caller specified a scope, return that vault if it exists
+        if scope is not None:
+            vault = _getVault(scope)
+
+        else:
+            # Finally, try the user, role, and global vaults in order
+            for _scope in ('user', 'role', 'global'):
+                vault = _getVault(_scope)
+                if vault:
+                    break
+
+        if vault is None or user is None:
+            return vault
+
+        self._reqVaultPerm(user, vault, s_cell.PERM_READ)
+        return self._vaultForUser(user, vault)
+
+    async def reqVault(self, iden, user=None):
+        '''
+        Get a vault by iden.
+
+        Args:
+            iden (str): Iden of the vault to get.
+            user (User|None): If set, require read permission and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.NoSuchIden: Vault with `iden` not found.
+            synapse.exc.AuthDeny: `user` does not have read permission on the vault.
+
+        Returns: vault
+        '''
+        if not s_common.isguid(iden):
+            raise s_exc.BadArg(mesg=f'Iden is not a valid iden: {iden}.')
+
+        vault = await self.getVault(iden, user=user)
+        if vault is None:
+            raise s_exc.NoSuchIden(mesg=f'Vault not found for iden: {iden}.', iden=iden)
+
+        return vault
+
+    async def reqVaultByName(self, name, user=None):
+        '''
+        Get a vault by name.
+
+        Args:
+            name (str): Name of the vault to get.
+            user (User|None): If set, require read permission and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.NoSuchName: Vault with `name` not found.
+            synapse.exc.AuthDeny: `user` does not have read permission on the vault.
+
+        Returns: vault
+        '''
+        vault = await self.getVaultByName(name, user=user)
+        if vault is None:
+            raise s_exc.NoSuchName(mesg=f'Vault not found for name: {name}.')
+
+        return vault
+
+    async def reqVaultByType(self, vtype, iden, scope=None, user=None):
+        '''
+        Get a vault by type.
+
+        Args:
+            vtype (str): Type of the vault to get.
+            iden (str): Iden of the user or role for the vault type.
+            scope (str|None): Scope of the vault to get.
+            user (User|None): If set, require read permission and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.NoSuchName: Vault with `vtype`/`iden`/`scope` not found.
+            synapse.exc.AuthDeny: `user` does not have read permission on the vault.
+
+        Returns: vault
+        '''
+        vault = await self.getVaultByType(vtype, iden, scope, user=user)
+        if vault is None:
+            raise s_exc.NoSuchName(mesg=f'Vault not found for type: {vtype}.')
+
+        return vault
+
+    async def addVault(self, vdef, user=None):
+        '''
+        Create a new vault.
+
+        Args:
+            vdef (dict): The vault to add.
+            user (User|str|None): If set, a non-admin user may only add unscoped vaults or user vaults they own.
+
+        Raises:
+            synapse.exc.AuthDeny: `user` may not add a vault with the requested scope or owner.
+            synapse.exc.NoSuchUser: `user` is an iden which does not exist.
+            synapse.exc.SchemaViolation: `vdef` does not conform to the vault schema.
+            synapse.exc.DupName:
+                - Vault already exists for type/scope/owner.
+                - Vault already exists with specified name.
+            synapse.exc.BadArg:
+                - Invalid vault definition provided.
+                - Owner required for unscoped, user, and role vaults.
+                - Vault secrets is not msgpack safe.
+                - Vault configs is not msgpack safe.
+
+        Returns: iden of new vault
+        '''
+        user = self._getVaultUser(user)
+
+        if not isinstance(vdef, dict):
+            raise s_exc.BadArg(mesg='Invalid vault definition provided.')
+
+        if user is not None and not user.isAdmin():
+
+            scope = vdef.get('scope')
+            if scope in ('global', 'role'):
+                mesg = f'User {user.name} cannot create {scope} vaults.'
+                raise s_exc.AuthDeny(mesg=mesg, user=user.iden, username=user.name)
+
+            owner = vdef.get('owner')
+            if scope == 'user' and user.iden != owner:
+                mesg = f'User {user.name} cannot create vaults for user {owner}.'
+                raise s_exc.AuthDeny(mesg=mesg, user=user.iden, username=user.name)
+
+        # Set some standard properties on the vdef before validating
+        vdef['iden'] = s_common.guid()
+
+        if 'permissions' in vdef:
+            vdef.pop('permissions')
+
+        self._initEasyPerm(vdef, default=s_cell.PERM_DENY)
+
+        vault = s_schemas.reqValidVault(vdef)
+
+        scope = vault.get('scope')
+        vtype = vault.get('type')
+        owner = vault.get('owner')
+        name = vault.get('name')
+
+        if owner is None and scope != 'global':
+            raise s_exc.BadArg(mesg='Owner required for unscoped, user, and role vaults.')
+
+        # Make sure the type/scope/owner combination is unique. Not for unscoped vaults
+        if scope is not None and self._getVaultByTSI(vtype, scope, owner) is not None:
+            raise s_exc.DupName(mesg=f'Vault already exists for type {vtype}, scope {scope}, owner {owner}.')
+
+        # Make sure the requested name is unique
+        if await self.getVaultByName(name) is not None:
+            if scope is None:
+                mesg = f'A config already exists with the name {name}.'
+            else:
+                mesg = f'A {scope} config already exists with the name {name}.'
+            raise s_exc.DupName(mesg=mesg, name=name)
+
+        secrets = vault.get('secrets')
+        configs = vault.get('configs')
+
+        try:
+            s_msgpack.en(secrets)
+        except s_exc.NotMsgpackSafe as exc:
+            raise s_exc.BadArg(mesg='Vault secrets must be msgpack safe.') from None
+
+        try:
+            s_msgpack.en(configs)
+        except s_exc.NotMsgpackSafe as exc:
+            raise s_exc.BadArg(mesg='Vault configs must be msgpack safe.') from None
+
+        if scope == 'global':
+            # everyone gets read access
+            await self._setEasyPerm(vault, 'roles', self.auth.allrole.iden, s_cell.PERM_READ)
+
+        elif scope == 'user':
+            user = self.auth.user(owner)
+            if user is None:
+                raise s_exc.NoSuchUser(mesg=f'User with iden {owner} not found.')
+
+            # The user is the admin, everyone else no access
+            await self._setEasyPerm(vault, 'users', owner, s_cell.PERM_ADMIN)
+
+        elif scope == 'role':
+            role = self.auth.role(owner)
+            if role is None:
+                raise s_exc.NoSuchRole(mesg=f'Role with iden {owner} not found.')
+
+            # role members gets read access
+            await self._setEasyPerm(vault, 'roles', owner, s_cell.PERM_READ)
+
+        else:
+            # Unscoped vaults
+
+            # The creator gets admin, everyone else no access
+            await self._setEasyPerm(vault, 'users', owner, s_cell.PERM_ADMIN)
+
+        return await self._push('vault:add', vault)
+
+    @s_nexus.Pusher.onPush('vault:add')
+    async def _addVault(self, vault):
+        iden = vault.get('iden')
+        name = vault.get('name')
+        scope = vault.get('scope')
+
+        bidn = s_common.uhex(iden)
+
+        if scope is not None:
+            vtype = vault.get('type')
+            owner = vault.get('owner')
+
+            if scope == 'global':
+                tsi = f'{vtype}:global'
+            else:
+                tsi = f'{vtype}:{scope}:{owner}'
+
+            self.slab.put(tsi.encode(), bidn, db=self.vaultsbyTSIdb)
+
+        self.slab.put(name.encode(), bidn, db=self.vaultsbynamedb)
+        self.slab.put(bidn, s_msgpack.en(vault), db=self.vaultsdb)
+        return iden
+
+    async def setVaultSecrets(self, iden, key, valu):
+        '''
+        Set vault secret item.
+
+        This function sets the `key`:`valu` into the vault secrets.
+
+        Args:
+            iden (str): The iden of the vault to edit.
+            key (str): Vault secret key.
+            valu (str): Vault secret value. s_common.novalu to delete a key.
+
+        Raises:
+            synapse.exc.NoSuchIden: Vault with `iden` does not exist.
+            synapse.exc.NotMsgpackSafe: One of `key` or `valu` is not msgpack safe.
+
+        Returns: Updated vault.
+        '''
+        vault = await self.reqVault(iden)
+
+        secrets = vault.get('secrets')
+
+        delete = False
+
+        if valu is s_common.novalu:
+            if key not in secrets:
+                raise s_exc.BadArg(mesg=f'Key {key} not found in vault secrets.')
+
+            valu = None
+            delete = True
+
+        else:
+            try:
+                s_msgpack.en({key: valu})
+            except s_exc.NotMsgpackSafe as exc:
+                raise s_exc.NotMsgpackSafe(mesg='Vault secrets must be msgpack safe.') from None
+
+        return await self._push('vault:data:set', iden, 'secrets', key, valu, delete)
+
+    async def setVaultConfigs(self, iden, key, valu):
+        '''
+        Set vault config item.
+
+        This function sets the `key`:`valu` into the vault configs.
+
+        Args:
+            iden (str): The iden of the vault to edit.
+            key (str): Vault secret key.
+            valu (str): Vault secret value. s_common.novalu to delete a key.
+
+        Raises:
+            synapse.exc.NoSuchIden: Vault with `iden` does not exist.
+            synapse.exc.NotMsgpackSafe: One of `key` or `valu` is not msgpack safe.
+
+        Returns: Updated vault.
+        '''
+        vault = await self.reqVault(iden)
+
+        configs = vault.get('configs')
+
+        delete = False
+
+        if valu is s_common.novalu:
+            if key not in configs:
+                raise s_exc.BadArg(mesg=f'Key {key} not found in vault configs.')
+
+            valu = None
+            delete = True
+
+        else:
+            try:
+                s_msgpack.en({key: valu})
+            except s_exc.NotMsgpackSafe as exc:
+                raise s_exc.NotMsgpackSafe(mesg='Vault configs must be msgpack safe.') from None
+
+        return await self._push('vault:data:set', iden, 'configs', key, valu, delete)
+
+    @s_nexus.Pusher.onPush('vault:data:set')
+    async def _setVaultData(self, iden, obj, key, valu, delete):
+        vault = await self.reqVault(iden)
+        data = vault.get(obj)
+
+        bidn = s_common.uhex(iden)
+
+        if delete:
+            if key in data:
+                data.pop(key)
+        else:
+            data[key] = valu
+
+        self.slab.put(bidn, s_msgpack.en(vault), db=self.vaultsdb)
+        return data
+
+    async def replaceVaultConfigs(self, iden, valu):
+        '''
+        Replace the entire vault config.
+
+        Args:
+            iden (str): The iden of the vault to edit.
+            valu (str): New configs object to store on the vault.
+
+        Raises:
+            synapse.exc.BadArg: `valu` is not a dictionary.
+            synapse.exc.NoSuchIden: Vault with `iden` does not exist.
+            synapse.exc.NotMsgpackSafe: `valu` is not msgpack safe.
+
+        Returns: New configs.
+        '''
+        vault = await self.reqVault(iden)
+
+        if not isinstance(valu, dict):
+            raise s_exc.BadArg(mesg='valu must be a dictionary.', name='valu', valu=valu)
+
+        try:
+            s_msgpack.en(valu)
+        except s_exc.NotMsgpackSafe:
+            short = textwrap.shorten(repr(valu), width=64)
+            raise s_exc.NotMsgpackSafe(
+                mesg='Vault configs must be msgpack safe.',
+                name='valu',
+                valu=short) from None
+
+        return await self._push('vault:data:replace', iden, 'configs', valu)
+
+    async def replaceVaultSecrets(self, iden, valu):
+        '''
+        Replace the entire vault config.
+
+        Args:
+            iden (str): The iden of the vault to edit.
+            valu (str): New secrets object to store on the vault.
+
+        Raises:
+            synapse.exc.BadArg: `valu` is not a dictionary.
+            synapse.exc.NoSuchIden: Vault with `iden` does not exist.
+            synapse.exc.NotMsgpackSafe: `valu` is not msgpack safe.
+
+        Returns: New secrets.
+        '''
+        vault = await self.reqVault(iden)
+
+        if not isinstance(valu, dict):
+            raise s_exc.BadArg(mesg='valu must be a dictionary.', name='valu', valu=valu)
+
+        try:
+            s_msgpack.en(valu)
+        except s_exc.NotMsgpackSafe:
+            short = textwrap.shorten(repr(valu), width=64)
+            raise s_exc.NotMsgpackSafe(
+                mesg='Vault secrets must be msgpack safe.',
+                name='valu',
+                valu=short) from None
+
+        return await self._push('vault:data:replace', iden, 'secrets', valu)
+
+    @s_nexus.Pusher.onPush('vault:data:replace')
+    async def _replaceVaultData(self, iden, obj, valu):
+        vault = await self.reqVault(iden)
+        bidn = s_common.uhex(iden)
+
+        vault[obj] = valu
+
+        self.slab.put(bidn, s_msgpack.en(vault), db=self.vaultsdb)
+        return valu
+
+    async def getVaults(self, user=None):
+        '''
+        Get all vaults.
+
+        Args:
+            user (User|str|None): If set, only return vaults the user can read and hide secrets without edit permission.
+
+        Raises:
+            synapse.exc.NoSuchUser: `user` is an iden which does not exist.
+
+        Returns: list of vault definition dictionaries.
+        '''
+        user = self._getVaultUser(user)
+
+        retn = []
+
+        for vault in self._getVaults():
+
+            await asyncio.sleep(0)
+
+            if user is not None:
+
+                if not self._hasEasyPerm(vault, user, s_cell.PERM_READ):
+                    continue
+
+                vault = self._vaultForUser(user, vault)
+
+            retn.append(vault)
+
+        return retn
+
+    async def setVaultPerm(self, viden, iden, level, user=None):
+        '''
+        Set vault permissions.
+
+        Args:
+            viden (str): The iden of the vault to edit.
+            iden (str): Iden of the user/role to add permissions for.
+            level (int): Easy perms level.
+            user (User|None): If set, require admin permission on the vault.
+
+        Raises:
+            synapse.exc.NoSuchIden: Vault with `iden` does not exist.
+            synapse.exc.AuthDeny: `user` does not have admin permission on the vault.
+
+        Returns: Updated vault.
+        '''
+        vault = await self.reqVault(viden)
+
+        if user is not None:
+            self._reqVaultPerm(user, vault, s_cell.PERM_ADMIN)
+
+        scope = 'users'
+        ident = self.auth.user(iden)
+        if ident is None:
+            scope = 'roles'
+            ident = self.auth.role(iden)
+            if ident is None:
+                raise s_exc.NoSuchIden(mesg=f'Iden {iden} is not a valid user or role.', iden=iden)
+
+        await self._setEasyPerm(vault, scope, ident.iden, level)
+        permissions = vault.get('permissions')
+        vault = await self._push(('vault:set'), viden, 'permissions', permissions)
+        return self._vaultForUser(user, vault)
+
+    async def renameVault(self, iden, name):
+        '''
+        Rename a vault.
+
+        Args:
+            iden (str): Iden of the vault to rename.
+            name (str): New vault name.
+
+        Raises:
+            synapse.exc.NoSuchIden: Vault with `iden` does not exist.
+            synapse.exc.DupName: Vault with `name` already exists.
+
+        Returns: Updated vault.
+        '''
+        if await self.getVaultByName(name) is not None:
+            raise s_exc.DupName(mesg=f'Vault with name {name} already exists.', name=name)
+
+        return await self._push(('vault:set'), iden, 'name', name)
+
+    async def modVault(self, vdef, user=None):
+        '''
+        Atomically replace a vault with the given vdef (configs, secrets, name,
+        permissions). The vault type, scope, and owner are immutable. If the
+        permissions are unchanged, the stored permissions are kept.
+
+        Args:
+            vdef (dict): The full vault definition.
+            user (User|str|None): If set, require edit permission on the vault, or admin
+                permission if the permissions are changed.
+
+        Raises:
+            synapse.exc.AuthDeny: `user` does not have the required permission on the vault.
+            synapse.exc.NoSuchUser: `user`, or a new or changed user in `permissions`, does not exist.
+            synapse.exc.NoSuchRole: A new or changed role in `permissions` does not exist.
+            synapse.exc.NoSuchIden: The vault does not exist.
+            synapse.exc.SchemaViolation: `vdef` does not conform to the vault schema.
+            synapse.exc.BadArg: `vdef` changes the type, scope, or owner, or is not msgpack safe.
+            synapse.exc.DupName: Vault with the new name already exists.
+
+        Returns: the updated vault.
+        '''
+        user = self._getVaultUser(user)
+
+        vdef = s_schemas.reqValidVault(vdef)
+
+        iden = vdef['iden']
+        cur = await self.reqVault(iden)
+
+        if user is not None:
+
+            level = s_cell.PERM_EDIT
+            if vdef.get('permissions') != cur.get('permissions'):
+                level = s_cell.PERM_ADMIN
+
+            self._reqVaultPerm(user, cur, level)
+
+        for field in ('type', 'scope', 'owner'):
+            if vdef.get(field) != cur.get(field):
+                raise s_exc.BadArg(mesg=f'Cannot change vault {field} on update.')
+
+        await self._reqVaultPermIdens(vdef, cur)
+
+        try:
+            s_msgpack.en(vdef)
+        except s_exc.NotMsgpackSafe:
+            raise s_exc.BadArg(mesg='Vault definition must be msgpack safe.') from None
+
+        name = vdef['name']
+        if name != cur['name'] and await self.getVaultByName(name) is not None:
+            raise s_exc.DupName(mesg=f'Vault with name {name} already exists.', name=name)
+
+        # omit unchanged permissions so a concurrent permission change is kept
+        if vdef['permissions'] == cur['permissions']:
+            vdef = {k: v for k, v in vdef.items() if k != 'permissions'}
+
+        vault = await self._push('vault:mod', vdef)
+        return self._vaultForUser(user, vault)
+
+    async def _reqVaultPermIdens(self, vdef, cur):
+        # only new or changed entries are checked so deleted idens may remain
+        newperms = vdef['permissions']
+        curperms = cur['permissions']
+
+        for scope, reqfunc in (('users', self.auth.reqUser), ('roles', self.auth.reqRole)):
+            curlevels = curperms.get(scope, {})
+            for iden, level in newperms[scope].items():
+                if curlevels.get(iden) != level:
+                    await reqfunc(iden)
+
+    @s_nexus.Pusher.onPush('vault:mod')
+    async def _modVault(self, vdef):
+        iden = vdef['iden']
+        bidn = s_common.uhex(iden)
+
+        cur = self._getVaultByBidn(bidn)
+        if cur is None:
+            return None
+
+        if 'permissions' not in vdef:
+            vdef = s_schemas.reqValidVault(dict(vdef, permissions=cur['permissions']))
+
+        oldname = cur['name']
+        newname = vdef['name']
+        if newname != oldname:
+            self.slab.delete(oldname.encode(), db=self.vaultsbynamedb)
+            self.slab.put(newname.encode(), bidn, db=self.vaultsbynamedb)
+
+        self.slab.put(bidn, s_msgpack.en(vdef), db=self.vaultsdb)
+        return vdef
+
+    @s_nexus.Pusher.onPush('vault:set')
+    async def _setVault(self, iden, key, valu):
+        if key not in ('name', 'permissions'):  # pragma: no cover
+            raise s_exc.BadArg(mesg='Only vault names and permissions can be changed.')
+
+        vault = await self.reqVault(iden)
+        oldv = vault.get(key)
+        vault[key] = valu
+
+        s_schemas.reqValidVault(vault)
+
+        bidn = s_common.uhex(iden)
+
+        if key == 'name':
+            self.slab.delete(oldv.encode(), db=self.vaultsbynamedb)
+            self.slab.put(valu.encode(), bidn, db=self.vaultsbynamedb)
+
+        self.slab.put(bidn, s_msgpack.en(vault), db=self.vaultsdb)
+        return vault
+
+    async def delVault(self, iden, user=None):
+        '''
+        Delete a vault.
+
+        Args:
+            iden (str): Iden of the vault to delete.
+            user (User|str|None): If set, require admin permission on the vault.
+
+        Raises:
+            synapse.exc.AuthDeny: `user` does not have admin permission on the vault.
+            synapse.exc.NoSuchUser: `user` is an iden which does not exist.
+
+        Returns: None
+        '''
+        user = self._getVaultUser(user)
+
+        if user is not None:
+
+            vault = await self.getVault(iden)
+            if vault is None:
+                return
+
+            self._reqVaultPerm(user, vault, s_cell.PERM_ADMIN)
+
+        return await self._push('vault:del', iden)
+
+    @s_nexus.Pusher.onPush('vault:del')
+    async def _delVault(self, iden):
+        vault = await self.getVault(iden)
+        if vault is None:
+            return
+
+        bidn = s_common.uhex(iden)
+
+        name = vault.get('name')
+        vtype = vault.get('type')
+        scope = vault.get('scope')
+
+        tsi = None
+        if scope == 'global':
+            tsi = f'{vtype}:global'
+        elif scope in ('user', 'role'):
+            owner = vault.get('owner')
+            tsi = f'{vtype}:{scope}:{owner}'
+
+        if tsi is not None:
+            self.slab.delete(tsi.encode(), db=self.vaultsbyTSIdb)
+
+        self.slab.delete(name.encode(), db=self.vaultsbynamedb)
+        self.slab.delete(bidn, db=self.vaultsdb)
+
+    def _propAllowedReason(self, user, perms, gateiden=None, default=None):
+        '''
+        Similar to allowed, but always prefer the default value specified by the caller.
+        Default values are still pulled from permdefs if there is a match there; but still prefer caller default.
+        This results in a ternary response that can be used to know if a rule had a positive/negative or no match.
+        The matching reason metadata is also returned.
+        '''
+        if default is None:
+            permdef = self.getPermDef(perms)
+            if permdef:
+                default = permdef.get('default', default)
+
+        return user.getAllowedReason(perms, gateiden=gateiden, default=default)
+
+    def confirmPropSet(self, user, prop, layriden):
+        meta0 = self._propAllowedReason(user, prop.setperms[0], gateiden=layriden)
+
+        if meta0.isadmin:
+            return
+
+        allowed0 = meta0.value
+
+        meta1 = self._propAllowedReason(user, prop.setperms[1], gateiden=layriden)
+        allowed1 = meta1.value
+
+        if allowed0:
+            if allowed1:
+                return
+            elif allowed1 is False:
+                # This is a allow-with-precedence case.
+                # Inspect meta to determine if the rule a0 is more specific than rule a1
+                if len(meta0.rule) >= len(meta1.rule):
+                    return
+                user.raisePermDeny(prop.setperms[0], gateiden=layriden)
+            return
+
+        if allowed1:
+            if allowed0 is None:
+                return
+            # allowed0 here is False. This is a deny-with-precedence case.
+            # Inspect meta to determine if the rule a1 is more specific than rule a0
+            if len(meta1.rule) > len(meta0.rule):
+                return
+
+        user.raisePermDeny(prop.setperms[0], gateiden=layriden)
+
+    def confirmPropDel(self, user, prop, layriden):
+        meta0 = self._propAllowedReason(user, prop.delperms[0], gateiden=layriden)
+
+        if meta0.isadmin:
+            return
+
+        allowed0 = meta0.value
+        meta1 = self._propAllowedReason(user, prop.delperms[1], gateiden=layriden)
+        allowed1 = meta1.value
+
+        if allowed0:
+            if allowed1:
+                return
+            elif allowed1 is False:
+                # This is a allow-with-precedence case.
+                # Inspect meta to determine if the rule a0 is more specific than rule a1
+                if len(meta0.rule) >= len(meta1.rule):
+                    return
+                user.raisePermDeny(prop.delperms[0], gateiden=layriden)
+            return
+
+        if allowed1:
+            if allowed0 is None:
+                return
+            # allowed0 here is False. This is a deny-with-precedence case.
+            # Inspect meta to determine if the rule a1 is more specific than rule a0
+            if len(meta1.rule) > len(meta0.rule):
+                return
+
+        user.raisePermDeny(prop.delperms[0], gateiden=layriden)
 
 @contextlib.asynccontextmanager
 async def getTempCortex(mods=None):
@@ -5337,8 +8875,11 @@ async def getTempCortex(mods=None):
         Proxy to the cortex.
     '''
     with s_common.getTempDir() as dirn:
-
-        async with await Cortex.anit(dirn) as core:
+        logger.debug(f'Creating temporary cortex as {dirn}')
+        conf = {
+            'health:sysctl:checks': False,
+        }
+        async with await Cortex.anit(dirn, conf=conf) as core:
             if mods:
                 for mod in mods:
                     await core.loadCoreModule(mod)

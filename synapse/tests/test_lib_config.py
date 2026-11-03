@@ -1,19 +1,22 @@
 import copy
 import regex
+import pathlib
 import argparse
 
 import yaml
 
 import synapse.exc as s_exc
+import synapse.data as s_data
+import synapse.common as s_common
 
 import synapse.lib.cell as s_cell
-
+import synapse.lib.json as s_json
 import synapse.lib.config as s_config
 
 import synapse.tests.utils as s_test
 
 class SchemaCell(s_cell.Cell):
-    confbase = {
+    confdefs = {
         'apikey': {
             'description': 'fancy apikey',
             'type': 'string',
@@ -28,7 +31,7 @@ class SchemaCell(s_cell.Cell):
         await s_cell.Cell.__anit__(self, dirn, conf, readonly, *args, **kwargs)
         # This captures a design pattern that reduces boilerplate
         # code used by Cell implementators.
-        self.conf.reqConfValu('apikey')
+        self.conf.req('apikey')
 
 
 class ConfTest(s_test.SynTest):
@@ -42,14 +45,14 @@ class ConfTest(s_test.SynTest):
         # We can make an argparser that has config options populated in it
         # We explicitly skip boolean options without a default value so we
         # done end up in a ambiguous toggle case down the road.
-        mesg = 'Boolean type is missing default information. ' \
-               'Will not form argparse for [key:bool:nodefval]'
         pars = argparse.ArgumentParser('synapse.tests.test_lib_config.basics')
         pars.add_argument('--beep', type=str, help='beep option', default='beep.sys')
-        with self.getLoggerStream('synapse.lib.config', mesg) as stream:
+        with self.getLoggerStream('synapse.lib.config') as stream:
             for optname, optinfo in conf.getArgParseArgs():
                 pars.add_argument(optname, **optinfo)
-            self.true(stream.wait(3))
+            await stream.expect('Boolean type is missing default information.', timeout=3)
+            await stream.expect('Will not form argparse for [key:bool:nodefval]', timeout=3)
+
         hmsg = pars.format_help()
 
         # Undo pretty-printing
@@ -93,7 +96,9 @@ class ConfTest(s_test.SynTest):
         # We can re-inject the opts back into the config object.
         # The s_common.novalu data is skipped, as are opts which
         # were not set by the schema data.
+        self.eq(vars(conf._opts_data), {})
         conf.setConfFromOpts(opts)
+        self.true(conf._opts_data is opts)
         self.eq(conf.asDict(), {
             'key:bool:defvaltrue': False,
             'key:number': 1234.5678,
@@ -157,10 +162,10 @@ class ConfTest(s_test.SynTest):
         })
 
         # We can ensure that certain vars are loaded
-        self.eq('Funky string time!', conf.reqConfValu('key:string'))
+        self.eq('Funky string time!', conf.req('key:string'))
         # And throw if they are not, or if the requested key isn't even schema valid
-        self.raises(s_exc.NeedConfValu, conf.reqConfValu, 'key:bool:nodefval')
-        self.raises(s_exc.BadArg, conf.reqConfValu, 'key:newp')
+        self.raises(s_exc.NeedConfValu, conf.req, 'key:bool:nodefval')
+        self.raises(s_exc.BadArg, conf.req, 'key:newp')
 
         # Since we're an Mutable mapping, we have some dict methods available to us
         self.len(8, conf)  # __len__
@@ -186,10 +191,22 @@ class ConfTest(s_test.SynTest):
         self.isin('<synapse.lib.config.Config at 0x', valu)
         self.isin('conf={', valu)
 
-        # We can set invalid items and ensure the config is no longer valid.
-        conf['key:array'] = 'Totally not an array.'
-        self.raises(s_exc.BadConfValu, conf.reqConfValid)
-        del conf['key:array']
+        # All items are validated when they are set.
+        conf.pop('key:array')
+        with self.raises(s_exc.BadArg):
+            conf['key:newp:newp:newp'] = 'newp'
+        with self.raises(s_exc.BadConfValu) as cm:
+            conf['key:array'] = 'Totally not an array.'
+        with self.raises(s_exc.BadConfValu):
+            conf.update({'key:array': 'Totally not an array.'})
+        with self.raises(s_exc.BadConfValu):
+            conf.setdefault('key:array', 'Totally not an array.')
+
+        # Including envar sets
+        with self.raises(s_exc.BadConfValu):
+            with self.setTstEnvars(KEY_ARRAY=None,
+                                   ):
+                conf.setConfFromEnvs()
 
         # We can do prefix-bassed collection of envar data.
         conf2 = s_config.Config(s_test.test_schema, envar_prefixes=('beeper',))
@@ -202,12 +219,49 @@ class ConfTest(s_test.SynTest):
             'key:array': ['firetruck', 'spaceship']
         })
 
+        # setConfFromFile apis
+        conf3 = s_config.Config(s_test.test_schema)
+        with self.getTestDir() as dirn:
+            # Set data
+            s_common.yamlsave({'key:array': ['foo', 'bar'],
+                               'key:integer': 1234}, dirn, '1.yaml')
+            fp = s_common.genpath(dirn, '1.yaml')
+            conf3.setConfFromFile(fp)
+            self.eq(conf3.asDict(), {'key:array': ['foo', 'bar'],
+                                     'key:integer': 1234})
+            # key:integer is already set
+            s_common.yamlsave({'key:integer': 5678}, dirn, '2.yaml')
+            fp = s_common.genpath(dirn, '2.yaml')
+            conf3.setConfFromFile(fp)
+            self.eq(conf3.get('key:integer'), 1234)
+
+            # Force the load
+            s_common.yamlsave({'key:integer': 5678, 'key:string': 'haha'},
+                              dirn, '3.yaml')
+            fp = s_common.genpath(dirn, '3.yaml')
+            with self.getLoggerStream('synapse.lib.config') as stream:
+                conf3.setConfFromFile(fp, force=True)
+
+            buf = stream.getvalue()
+            self.isin('Set configuration override for [key:integer]', buf)
+            self.notin('Set configuration override for [key:string]', buf)
+            self.eq(conf3.get('key:integer'), 5678)
+            self.eq(conf3.get('key:string'), 'haha')
+
     async def test_config_fromcell(self):
 
         # We can make a conf from a cell ctor directly
         conf = s_config.Config.getConfFromCell(SchemaCell)
         self.isin('apikey', conf.json_schema.get('properties'))
         self.isin('apihost', conf.json_schema.get('properties'))
+
+        # Bad data is bad
+        with self.raises(s_exc.BadArg) as cm:
+            s_config.Config.getConfFromCell(SchemaCell, {'test:newp': 'haha'})
+
+        with self.raises(s_exc.BadConfValu) as cm:
+            s_config.Config.getConfFromCell(SchemaCell, {'apikey': 1234})
+        self.eq(cm.exception.get('name'), 'apikey')
 
         # Assuming we populate that conf with some data
         # we can then use it to make a cell!
@@ -217,22 +271,23 @@ class ConfTest(s_test.SynTest):
         with self.getTestDir() as dirn:
 
             async with await SchemaCell.anit(dirn, conf=conf) as cell:
-                self.eq(cell.conf.asDict(),
-                        {'apikey': 'deadb33f',
-                         'apihost': 'https://httpbin.org/'})
+                cnfo = cell.conf.asDict()
+                self.eq(cnfo.get('apikey'), 'deadb33f')
+                self.eq(cnfo.get('apihost'), 'https://httpbin.org/')
 
             # We can still make a cell with a dictionary being passed in directly.
             # The dictionary value is converted into the conf value.
             async with await SchemaCell.anit(dirn, conf={'apikey': 'deadb33f'}) as cell:
-                self.eq(cell.conf.asDict(),
-                        {'apikey': 'deadb33f',
-                         'apihost': 'https://httpbin.org/'})
+                cnfo = cell.conf.asDict()
+                self.eq(cnfo.get('apikey'), 'deadb33f')
+                self.eq(cnfo.get('apihost'), 'https://httpbin.org/')
 
             with self.raises(s_exc.NeedConfValu) as cm:
                 # Trying to make a cell with a missing key it wants fails
                 async with await SchemaCell.anit(dirn, conf={}) as cell:
                     pass
-            self.eq(cm.exception.get('key'), 'apikey')
+
+            self.eq(cm.exception.get('name'), 'apikey')
 
     def test_hideconf(self):
         hide_schema = {
@@ -324,3 +379,46 @@ class ConfTest(s_test.SynTest):
         item = validator({'key:number': 123})
         self.eq(item['key:number'], 123)
         self.notin('key:string', item)
+
+        item = validator({'key:multi': 123})
+        self.eq(item['key:multi'], 123)
+
+        item = validator({'key:multi': '123'})
+        self.eq(item['key:multi'], '123')
+
+    async def test_config_ref_handler(self):
+
+        filename = pathlib.Path(s_data.path(
+            'jsonschemas',
+            'raw.githubusercontent.com',
+            'oasis-open',
+            'cti-stix2-json-schemas',
+            'stix2.1',
+            'schemas',
+            'common',
+            'core.json'
+        ))
+
+        self.true(filename.exists())
+
+        with filename.open() as fp:
+            schema = s_json.load(fp)
+
+        self.eq(schema, s_config.localSchemaRefHandler(
+            "http://raw.githubusercontent.com/oasis-open/cti-stix2-json-schemas/stix2.1/schemas/common/core.json"
+        ))
+
+        # test the handler
+        with self.raises(s_exc.NoSuchFile):
+            s_config.localSchemaRefHandler(
+                'https://loop.vertex.link/foo/bar/baz/newp.json'
+            )
+
+        with self.raises(s_exc.BadUrl):
+            s_config.localSchemaRefHandler('http://[/newp')
+
+        with self.raises(s_exc.NoSuchFile):
+            s_config.localSchemaRefHandler('http://foo.com/newp.json')
+
+        with self.raises(s_exc.BadArg):
+            s_config.localSchemaRefHandler('http://raw.githubusercontent.com/../../attack-flow/attack-flow-schema-2.0.0.json')

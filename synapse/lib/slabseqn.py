@@ -87,6 +87,34 @@ class SlabSeqn:
 
         return indx
 
+    def addWithPackRetn(self, item, indx=None):
+        '''
+        Add a single item to the sequence, returning the offset and packed item.
+        '''
+        packitem = s_msgpack.en(item)
+        if indx is not None:
+            if indx >= self.indx:
+                self.slab.put(s_common.int64en(indx), packitem, append=True, db=self.db)
+                self.indx = indx + 1
+                self.size += 1
+                self._wake_waiters()
+                return indx, packitem
+
+            oldv = self.slab.replace(s_common.int64en(indx), packitem, db=self.db)
+            if oldv is None:
+                self.size += 1
+            return indx, packitem
+
+        indx = self.indx
+        self.slab.put(s_common.int64en(indx), packitem, append=True, db=self.db)
+
+        self.indx += 1
+        self.size += 1
+
+        self._wake_waiters()
+
+        return indx, packitem
+
     def first(self):
 
         for lkey, lval in self.slab.scanByFull(db=self.db):
@@ -108,7 +136,7 @@ class SlabSeqn:
     def stat(self):
         return self.slab.stat(db=self.db)
 
-    def save(self, items):
+    async def save(self, items):
         '''
         Save a series of items to a sequence.
 
@@ -123,6 +151,7 @@ class SlabSeqn:
 
         size = 0
         tick = s_common.now()
+        abstick = s_common.mononow()
 
         for item in items:
 
@@ -135,8 +164,8 @@ class SlabSeqn:
 
             rows.append((lkey, byts))
 
-        retn = self.slab.putmulti(rows, append=True, db=self.db)
-        took = s_common.now() - tick
+        retn = await self.slab.putmulti(rows, append=True, db=self.db)
+        took = s_common.mononow() - abstick
 
         assert retn, "Not adding the largest indices"
 
@@ -168,7 +197,7 @@ class SlabSeqn:
 
         return s_common.int64un(byts) + 1
 
-    def iter(self, offs):
+    def iter(self, offs, reverse=False):
         '''
         Iterate over items in a sequence from a given offset.
 
@@ -179,10 +208,16 @@ class SlabSeqn:
             (indx, valu): The index and valu of the item.
         '''
         startkey = s_common.int64en(offs)
-        for lkey, lval in self.slab.scanByRange(startkey, db=self.db):
-            offs = s_common.int64un(lkey)
-            valu = s_msgpack.un(lval)
-            yield offs, valu
+        if reverse:
+            for lkey, lval in self.slab.scanByRangeBack(startkey, db=self.db):
+                offs = s_common.int64un(lkey)
+                valu = s_msgpack.un(lval)
+                yield offs, valu
+        else:
+            for lkey, lval in self.slab.scanByRange(startkey, db=self.db):
+                offs = s_common.int64un(lkey)
+                valu = s_msgpack.un(lval)
+                yield offs, valu
 
     async def aiter(self, offs, wait=False, timeout=None):
         '''
@@ -197,13 +232,20 @@ class SlabSeqn:
             (indx, valu): The index and valu of the item.
         '''
         startkey = s_common.int64en(offs)
+        scanoffs = None
         for lkey, lval in self.slab.scanByRange(startkey, db=self.db):
-            offs = s_common.int64un(lkey)
+            scanoffs = s_common.int64un(lkey)
             valu = s_msgpack.un(lval)
-            yield offs, valu
+            yield scanoffs, valu
 
         # no awaiting between here and evnt.timewait()
         if wait:
+
+            if scanoffs is None:
+                offs -= 1
+            else:
+                offs = scanoffs
+
             evnt = s_coro.Event()
             try:
                 self.addevents.append(evnt)

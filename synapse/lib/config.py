@@ -1,15 +1,17 @@
 import os
 import copy
+import urllib
 import logging
 import argparse
 import collections.abc as c_abc
 
-import yaml
 import fastjsonschema
 
 import synapse.exc as s_exc
+import synapse.data as s_data
 import synapse.common as s_common
 
+import synapse.lib.json as s_json
 import synapse.lib.hashitem as s_hashitem
 
 from fastjsonschema.exceptions import JsonSchemaValueException
@@ -20,6 +22,37 @@ re_iden = '^[0-9a-f]{32}$'
 
 # Cache of validator functions
 _JsValidators = {}  # type: ignore
+
+def localSchemaRefHandler(uri):
+    '''
+    This function parses the given URI to get the path component and then tries
+    to resolve the referenced schema from the 'jsonschemas' directory of
+    synapse.data.
+    '''
+    try:
+        parts = urllib.parse.urlparse(uri)
+    except ValueError:
+        raise s_exc.BadUrl(mesg=f'Malformed URI: {uri}.') from None
+
+    filename = s_data.path('jsonschemas', parts.hostname, *parts.path.split('/'))
+
+    # Check for path traversal. Unlikely, but still check
+    if not filename.startswith(s_data.path('jsonschemas', parts.hostname)):
+        raise s_exc.BadArg(mesg=f'Path traversal in schema URL: {uri}.')
+
+    if not os.path.exists(filename) or not os.path.isfile(filename):
+        raise s_exc.NoSuchFile(mesg=f'Local JSON schema not found for {uri}.')
+
+    with open(filename, 'r') as fp:
+        return s_json.load(fp)
+
+# This handlers dictionary is used by the jsonschema validator to attempt to
+# resolve schema '$ref' values locally from disk and will raise an exception
+# if the schema isn't found locally
+local_ref_handlers = {
+    'http': localSchemaRefHandler,
+    'https': localSchemaRefHandler,
+}
 
 def getJsSchema(confbase, confdefs):
     '''
@@ -49,7 +82,7 @@ def getJsSchema(confbase, confdefs):
     props.update(confbase)
     return schema
 
-def getJsValidator(schema, use_default=True):
+def getJsValidator(schema, use_default=True, handlers=local_ref_handlers):
     '''
     Get a fastjsonschema callable.
 
@@ -63,14 +96,17 @@ def getJsValidator(schema, use_default=True):
     if schema.get('$schema') is None:
         schema['$schema'] = 'http://json-schema.org/draft-07/schema#'
 
+    if handlers is None:
+        handlers = {}
+
     # It is faster to hash and cache the functions here than it is to
     # generate new functions each time we have the same schema.
-    key = s_hashitem.hashitem((schema, use_default))
+    key = s_hashitem.hashitem((schema, {k: v.__name__ for k, v in handlers.items()}, use_default))
     func = _JsValidators.get(key)
     if func:
         return func
 
-    func = fastjsonschema.compile(schema, use_default=use_default)
+    func = fastjsonschema.compile(schema, handlers=handlers, use_default=use_default)
 
     def wrap(*args, **kwargs):
         try:
@@ -136,11 +172,27 @@ class Config(c_abc.MutableMapping):
             conf = {}
         if envar_prefixes is None:
             envar_prefixes = ('', )
-        self.conf = conf
+        self.conf = {}
         self._argparse_conf_names = {}
         self._argparse_conf_parsed_names = {}
         self.envar_prefixes = envar_prefixes
+        self._opts_data = argparse.Namespace()
         self.validator = getJsValidator(self.json_schema)
+        self._prop_schemas = {}
+        self._prop_validators = {}
+        for k, v in self.json_schema.get('properties').items():
+            prop_schema = {
+                '$schema': 'http://json-schema.org/draft-07/schema#',
+            }
+            prop_schema.update(v)
+            self._prop_schemas[k] = prop_schema
+            self._prop_validators[k] = getJsValidator(prop_schema)
+        # Copy the data in so that it is validated.
+        for k, v in conf.items():
+            self[k] = v
+        # Ensure we're able to parse opts data for our schema -
+        # this populates the opts mapping data.
+        _ = self.getArgParseArgs()
 
     @classmethod
     def getConfFromCell(cls, cell, conf=None, envar_prefixes=None):
@@ -189,7 +241,7 @@ class Config(c_abc.MutableMapping):
                     logger.debug(f'Boolean type is missing default information. Will not form argparse for [{name}]')
                     continue
                 default = bool(default)
-                akwargs['type'] = yaml.safe_load
+                akwargs['type'] = s_common.yamlloads
                 akwargs['choices'] = [True, False]
                 akwargs['help'] = akwargs['help'] + f' This option defaults to {default}.'
 
@@ -208,7 +260,7 @@ class Config(c_abc.MutableMapping):
             _ = self.getArgParseArgs()
         return {k: v for k, v in self._argparse_conf_parsed_names.items()}
 
-    def setConfFromOpts(self, opts):
+    def setConfFromOpts(self, opts=None):
         '''
         Set the opts for a conf object from a namespace object.
 
@@ -219,6 +271,8 @@ class Config(c_abc.MutableMapping):
         Returns:
             None: Returns None.
         '''
+        if opts is None:
+            opts = self._opts_data
         opts_data = vars(opts)
         for k, v in opts_data.items():
             if v is None:
@@ -227,17 +281,32 @@ class Config(c_abc.MutableMapping):
             if nname is None:
                 continue
             self.setdefault(nname, v)
+        self._opts_data = opts
 
-    def setConfFromFile(self, path):
+    def setConfFromFile(self, path, force=False):
         '''
         Set the opts for a conf object from YAML file path.
+
+        Args:
+            path (str): Path to the yaml load. If it exists, it must represent a dictionary.
+            force (bool): Force the update instead of using setdefault() behavior.
+
+        Returns:
+            None
         '''
         item = s_common.yamlload(path)
         if item is None:
             return
 
         for name, valu in item.items():
-            self.setdefault(name, valu)
+            if force:
+                oldv = self.get(name, s_common.novalu)
+                self[name] = valu
+                if oldv is s_common.novalu:
+                    continue
+                logger.info(f'Set configuration override for [{name}] from [{path}]')
+            else:
+                self.setdefault(name, valu)
 
     # Envar support methods
     def setConfFromEnvs(self):
@@ -271,7 +340,7 @@ class Config(c_abc.MutableMapping):
             for name, envar in name2envar.items():
                 envv = os.getenv(envar)
                 if envv is not None:
-                    envv = yaml.safe_load(envv)
+                    envv = s_common.yamlloads(envv)
 
                     curv = self.get(name, s_common.novalu)
                     if curv is not s_common.novalu:
@@ -323,10 +392,16 @@ class Config(c_abc.MutableMapping):
         else:
             return
 
-    def reqConfValu(self, key):
+    def reqConfValu(self, key):  # pragma: no cover
         '''
-        Get a configuration value.  If that value is not present in the schema
-        or is not set, then raise an exception.
+        Deprecated. Use ``req(key)`` API instead.
+        '''
+        s_common.deprecated('Config.reqConfValu(), use req() instead.')
+        return self.req(key)
+
+    def req(self, key):
+        '''
+        Get a configuration value. If that value is not present in the schema or is not set, then raise an exception.
 
         Args:
             key (str): The key to require.
@@ -334,17 +409,39 @@ class Config(c_abc.MutableMapping):
         Returns:
             The requested value.
         '''
-        # Ensure that the key is in self.json_schema
         if key not in self.json_schema.get('properties', {}):
-            raise s_exc.BadArg(mesg='Required key is not present in the configuration schema.',
-                               key=key)
+            raise s_exc.BadArg(mesg=f'The {key} configuration option is not present in the configuration schema.',
+                               name=key)
 
-        # Ensure that the key is present in self.conf
-        if key not in self.conf:
-            raise s_exc.NeedConfValu(mesg='Required key is not present in configuration data.',
-                                     key=key)
+        valu = self.conf.get(key, s_common.novalu)
+        if valu is not s_common.novalu:
+            return valu
 
-        return self.conf.get(key)
+        raise s_exc.NeedConfValu(mesg=f'The {key} configuration option is required.', name=key)
+
+    def reqKeyValid(self, key, value):
+        '''
+        Test if a key is valid for the provided schema it is associated with.
+
+        Args:
+            key (str): Key to check.
+            value: Value to check.
+
+        Raises:
+            BadArg: If the key has no associated schema.
+            BadConfValu: If the data is not schema valid.
+
+        Returns:
+            None when valid.
+        '''
+        validator = self._prop_validators.get(key)
+        if validator is None:
+            raise s_exc.BadArg(mesg=f'Key {key} is not a valid config', )
+        try:
+            validator(value)
+        except s_exc.SchemaViolation as e:
+            raise s_exc.BadConfValu(mesg=f'Invalid config for {key}, {e.get("mesg")}', name=key, value=value) from None
+        return
 
     def asDict(self):
         '''
@@ -373,11 +470,7 @@ class Config(c_abc.MutableMapping):
         return self.conf.__delitem__(key)
 
     def __setitem__(self, key, value):
-        # This explicitly doesn't do any type validation.
-        # The type validation is done on-demand, in order to
-        # allow a user to incrementally construct the config
-        # from different sources before turning around and
-        # doing a validation pass which may fail.
+        self.reqKeyValid(key, value)
         return self.conf.__setitem__(key, value)
 
     def __getitem__(self, item):

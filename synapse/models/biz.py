@@ -17,23 +17,33 @@ class BizModule(s_module.CoreModule):
                 ('biz:stake', ('guid', {}), {
                     'doc': 'A stake or partial ownership in a company.',
                 }),
+                ('biz:listing', ('guid', {}), {
+                    'doc': 'A product or service being listed for sale at a given price by a specific seller.',
+                }),
                 ('biz:bundle', ('guid', {}), {
-                    'doc': 'Instances of a specific product offered for a price.',
+                    'doc': 'A bundle allows construction of products which bundle instances of other products.',
                 }),
                 ('biz:product', ('guid', {}), {
                     'doc': 'A product which is available for purchase.',
                 }),
+                ('biz:service', ('guid', {}), {
+                    'doc': 'A service which is performed by a specific organization.',
+                }),
+                ('biz:service:type:taxonomy', ('taxonomy', {}), {
+                    'doc': 'A taxonomy of service offering types.',
+                    'interfaces': ('meta:taxonomy',),
+                }),
                 ('biz:dealstatus', ('taxonomy', {}), {
                     'doc': 'A deal/rfp status taxonomy.',
-                    'interfaces': ('taxonomy',),
+                    'interfaces': ('meta:taxonomy',),
                 }),
                 ('biz:dealtype', ('taxonomy', {}), {
                     'doc': 'A deal type taxonomy.',
-                    'interfaces': ('taxonomy',),
+                    'interfaces': ('meta:taxonomy',),
                 }),
                 ('biz:prodtype', ('taxonomy', {}), {
                     'doc': 'A product type taxonomy.',
-                    'interfaces': ('taxonomy',),
+                    'interfaces': ('meta:taxonomy',),
                 }),
             ),
             'forms': (
@@ -79,6 +89,10 @@ class BizModule(s_module.CoreModule):
                     ('requirements', ('array', {'type': 'ou:goal', 'uniq': True, 'sorted': True}), {}),
                 )),
                 ('biz:deal', {}, (
+                    ('id', ('str', {'strip': True}), {
+                        'doc': 'An identifier for the deal.',
+                    }),
+
                     ('title', ('str', {}), {
                         'doc': 'A title for the deal.',
                     }),
@@ -103,25 +117,31 @@ class BizModule(s_module.CoreModule):
                         'doc': 'The primary contact information for the buyer.',
                     }),
                     ('buyer:org', ('ou:org', {}), {
-                        'doc': 'The buyer org.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :buyer.',
                     }),
                     ('buyer:orgname', ('ou:name', {}), {
-                        'doc': 'The reported ou:name of the buyer org.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :buyer.',
                     }),
                     ('buyer:orgfqdn', ('inet:fqdn', {}), {
-                        'doc': 'The reported inet:fqdn of the buyer org.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :buyer.',
                     }),
                     ('seller', ('ps:contact', {}), {
                         'doc': 'The primary contact information for the seller.',
                     }),
                     ('seller:org', ('ou:org', {}), {
-                        'doc': 'The seller org.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :seller.',
                     }),
                     ('seller:orgname', ('ou:name', {}), {
-                        'doc': 'The reported ou:name of the seller org.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :seller.',
                     }),
                     ('seller:orgfqdn', ('inet:fqdn', {}), {
-                        'doc': 'The reported inet:fqdn of the seller org.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use :seller.',
                     }),
                     ('currency', ('econ:currency', {}), {
                         'doc': 'The currency of econ:price values associated with the deal.',
@@ -141,14 +161,10 @@ class BizModule(s_module.CoreModule):
                     ('purchase', ('econ:purchase', {}), {
                         'doc': 'Records a purchase resulting from the deal.',
                     }),
-                    # TODO
-                    # -(deal:comms)>
-                    # -(buyer:contacts)>
-                    # -(seller:contacts)>
                 )),
                 ('biz:bundle', {}, (
                     ('count', ('int', {}), {
-                        'doc': 'The number of instances of the product included in the bundle.',
+                        'doc': 'The number of instances of the product or service included in the bundle.',
                     }),
                     ('price', ('econ:price', {}), {
                         'doc': 'The price of the bundle.',
@@ -156,12 +172,63 @@ class BizModule(s_module.CoreModule):
                     ('product', ('biz:product', {}), {
                         'doc': 'The product included in the bundle.',
                     }),
+                    ('service', ('biz:service', {}), {
+                        'doc': 'The service included in the bundle.',
+                    }),
                     ('deal', ('biz:deal', {}), {
-                        'doc': 'The deal which includes this bundle.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use econ:receipt:item for instances of bundles being sold.',
                     }),
                     ('purchase', ('econ:purchase', {}), {
-                        'doc': 'The purchase which includes this bundle.',
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use econ:receipt:item for instances of bundles being sold.',
                     }),
+                )),
+                ('biz:listing', {}, (
+
+                    ('seller', ('ps:contact', {}), {
+                        'doc': 'The contact information for the seller.'}),
+
+                    ('product', ('biz:product', {}), {
+                        'doc': 'The product being offered.'}),
+
+                    ('service', ('biz:service', {}), {
+                        'doc': 'The service being offered.'}),
+
+                    ('current', ('bool', {}), {
+                        'doc': 'Set to true if the offer is still current.'}),
+
+                    ('time', ('time', {}), {
+                        'doc': 'The first known offering of this product/service by the organization for the asking price.'}),
+
+                    ('expires', ('time', {}), {
+                        'doc': 'Set if the offer has a known expiration date.'}),
+
+                    ('price', ('econ:price', {}), {
+                        'doc': 'The asking price of the product or service.'}),
+
+                    ('currency', ('econ:currency', {}), {
+                        'doc': 'The currency of the asking price.'}),
+
+                    ('count:total', ('int', {'min': 0}), {
+                        'doc': 'The number of instances for sale.'}),
+
+                    ('count:remaining', ('int', {'min': 0}), {
+                        'doc': 'The current remaining number of instances for sale.'}),
+                )),
+                ('biz:service', {}, (
+                    ('provider', ('ps:contact', {}), {
+                        'doc': 'The contact info of the entity which performs the service.'}),
+                    ('name', ('str', {'lower': True, 'onespace': True}), {
+                        'doc': 'The name of the service being performed.'}),
+                    ('summary', ('str', {}), {
+                        'disp': {'hint': 'text'},
+                        'doc': 'A brief summary of the service.'}),
+                    ('type', ('biz:service:type:taxonomy', {}), {
+                        'doc': 'A taxonomy of service types.'}),
+                    ('launched', ('time', {}), {
+                        'doc': 'The time when the operator first made the service available.'}),
+                    # TODO: billing types (fixed, hourly, subscription, etc)
                 )),
                 ('biz:product', {}, (
                     ('name', ('str', {}), {
@@ -176,20 +243,29 @@ class BizModule(s_module.CoreModule):
                         'doc': 'A brief summary of the product.',
                         'disp': {'hint': 'text'},
                     }),
+                    ('maker', ('ps:contact', {}), {
+                        'doc': 'A contact for the maker of the product.',
+                    }),
                     ('madeby:org', ('ou:org', {}), {
-                        'doc': 'The product manufacturer.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use biz:product:maker.',
                     }),
                     ('madeby:orgname', ('ou:name', {}), {
-                        'doc': 'The reported ou:name of the product manufacturer.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use biz:product:maker.',
                     }),
                     ('madeby:orgfqdn', ('inet:fqdn', {}), {
-                        'doc': 'The reported inet:fqdn of the product manufacturer.'
+                        'deprecated': True,
+                        'doc': 'Deprecated. Please use biz:product:maker.',
                     }),
                     ('price:retail', ('econ:price', {}), {
                         'doc': 'The MSRP price of the product.',
                     }),
                     ('price:bottom', ('econ:price', {}), {
                         'doc': 'The minimum offered or observed price of the product.',
+                    }),
+                    ('price:currency', ('econ:currency', {}), {
+                        'doc': 'The currency of the retail and bottom price properties.',
                     }),
                     ('bundles', ('array', {'type': 'biz:bundle', 'uniq': True, 'sorted': True}), {
                         'doc': 'An array of bundles included with the product.',

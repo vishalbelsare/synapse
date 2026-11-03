@@ -1,3 +1,5 @@
+from unittest import mock
+
 import synapse.exc as s_exc
 import synapse.tests.utils as s_test
 
@@ -27,13 +29,16 @@ xml0 = '''
 </data>
 '''.strip()
 
+def mockexc(text):
+    raise Exception('newp')
+
 class XmlTest(s_test.SynTest):
 
     async def test_stormlib_xml(self):
 
         async with self.getTestCore() as core:
             valu = await core.callStorm('''
-                $retn = $lib.list()
+                $retn = ()
                 $root = $lib.xml.parse($xmltext)
                 for $elem in $root {
                     $retn.append((
@@ -51,7 +56,7 @@ class XmlTest(s_test.SynTest):
             ))
 
             valu = await core.callStorm('''
-                $retn = $lib.list()
+                $retn = ()
                 $root = $lib.xml.parse($xmltext)
                 for $elem in $root.find(country) {
                     $retn.append((
@@ -69,7 +74,7 @@ class XmlTest(s_test.SynTest):
             ))
 
             valu = await core.callStorm('''
-                $retn = $lib.list()
+                $retn = ()
                 $root = $lib.xml.parse($xmltext)
                 for $elem in $root.find(rank) {
                     $retn.append($elem.text)
@@ -79,7 +84,7 @@ class XmlTest(s_test.SynTest):
             self.eq(valu, ('1', '4', '68'))
 
             valu = await core.callStorm('''
-                $retn = $lib.list()
+                $retn = ()
                 $root = $lib.xml.parse($xmltext)
                 for $elem in $root.find(rank, nested=$lib.false) {
                     $retn.append($elem.text)
@@ -89,7 +94,7 @@ class XmlTest(s_test.SynTest):
             self.eq(valu, ())
 
             valu = await core.callStorm('''
-                $retn = $lib.list()
+                $retn = ()
                 $root = $lib.xml.parse($xmltext)
                 for $elem in $root.find(rank, nested=$lib.false) {
                     $retn.append($elem.text)
@@ -101,3 +106,7 @@ class XmlTest(s_test.SynTest):
             with self.raises(s_exc.BadArg):
                 opts = {'vars': {'bytes': b'asdf'}}
                 await core.callStorm('$lib.xml.parse($bytes)', opts=opts)
+
+            with mock.patch('xml.etree.ElementTree.fromstring', mockexc):
+                with self.raises(Exception):
+                    await core.callStorm('$lib.xml.parse("")', opts=opts)

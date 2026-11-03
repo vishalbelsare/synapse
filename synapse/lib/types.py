@@ -1,4 +1,6 @@
+import sys
 import asyncio
+import decimal
 import logging
 import binascii
 import collections
@@ -9,6 +11,7 @@ import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.lib.chop as s_chop
+import synapse.lib.json as s_json
 import synapse.lib.node as s_node
 import synapse.lib.time as s_time
 import synapse.lib.cache as s_cache
@@ -16,6 +19,7 @@ import synapse.lib.layer as s_layer
 import synapse.lib.config as s_config
 import synapse.lib.msgpack as s_msgpack
 import synapse.lib.grammar as s_grammar
+import synapse.lib.stormtypes as s_stormtypes
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,8 @@ class Type:
     # a fast-access way to determine if the type is an array
     # ( due to hot-loop needs in the storm runtime )
     isarray = False
+
+    ismutable = False
 
     def __init__(self, modl, name, info, opts):
         '''
@@ -45,7 +51,7 @@ class Type:
         self.form = None  # this will reference a Form() if the type is a form
         self.subof = None  # This references the name that a type was extended from.
 
-        self.info.setdefault('bases', ())
+        self.info.setdefault('bases', ('base',))
 
         self.opts = dict(self._opt_defs)
         self.opts.update(opts)
@@ -75,6 +81,14 @@ class Type:
         self.deprecated = bool(self.info.get('deprecated', False))
 
         self.postTypeInit()
+
+        normopts = dict(self.opts)
+        for optn, valu in normopts.items():
+            if isinstance(valu, float):
+                normopts[optn] = str(valu)
+
+        ctor = '.'.join([self.__class__.__module__, self.__class__.__qualname__])
+        self.typehash = sys.intern(s_common.guid((ctor, s_common.flatten(normopts))))
 
     def _storLiftSafe(self, cmpr, valu):
         try:
@@ -207,9 +221,12 @@ class Type:
             raise s_exc.NoSuchCmpr(cmpr=name, name=self.name)
 
         norm1 = self.norm(val1)[0]
-        norm2 = self.norm(val2)[0]
 
-        return ctor(norm2)(norm1)
+        if name != '~=':
+            # Don't norm regex patterns
+            val2 = self.norm(val2)[0]
+
+        return ctor(val2)(norm1)
 
     def _ctorCmprEq(self, text):
         norm, info = self.norm(text)
@@ -235,7 +252,7 @@ class Type:
         return cmpr
 
     def _ctorCmprRe(self, text):
-        regx = regex.compile(text)
+        regx = regex.compile(text, flags=regex.I)
 
         def cmpr(valu):
             vtxt = self.repr(valu)
@@ -354,6 +371,24 @@ class Type:
         topt.update(opts)
         return self.__class__(self.modl, self.name, self.info, topt)
 
+    async def tostorm(self, valu):
+        '''
+        Allows type-specific modifications to values to make them safe for use in the runtime.
+
+        Args:
+            valu (any): The valu to update.
+        '''
+        if self.ismutable:
+            return s_msgpack.deepcopy(valu, use_list=True)
+        return valu
+
+    def __eq__(self, othr):
+        if self.name != othr.name:
+            return False
+        if self.opts != othr.opts:
+            return False
+        return True
+
 class Bool(Type):
 
     stortype = s_layer.STOR_TYPE_U8
@@ -362,6 +397,8 @@ class Bool(Type):
         self.setNormFunc(str, self._normPyStr)
         self.setNormFunc(int, self._normPyInt)
         self.setNormFunc(bool, self._normPyInt)
+        self.setNormFunc(decimal.Decimal, self._normPyInt)
+        self.setNormFunc(s_stormtypes.Number, self._normNumber)
 
     def _normPyStr(self, valu):
 
@@ -382,12 +419,16 @@ class Bool(Type):
     def _normPyInt(self, valu):
         return int(bool(valu)), {}
 
+    def _normNumber(self, valu):
+        return int(bool(valu.valu)), {}
+
     def repr(self, valu):
-        return repr(bool(valu))
+        return repr(bool(valu)).lower()
 
 class Array(Type):
 
     isarray = True
+    ismutable = True
 
     def postTypeInit(self):
 
@@ -492,12 +533,23 @@ class Comp(Type):
 
         self.tcache = FieldHelper(self.modl, self.name, fields)
 
+        # TODO: Remove this whole loop in 3xx
+        for fname, ftypename in fields:
+            if isinstance(ftypename, (list, tuple)):
+                ftypename = ftypename[0]
+
+            if (ftype := self.modl.type(ftypename)) is None:
+                continue
+
+            if ftype.ismutable:
+                self.ismutable = True
+
     def _normPyTuple(self, valu):
 
         fields = self.opts.get('fields')
         if len(fields) != len(valu):
-            raise s_exc.BadTypeValu(name=self.name, valu=valu,
-                                    mesg='invalid number of fields given for norming')
+            raise s_exc.BadTypeValu(name=self.name, fields=fields, numitems=len(valu),
+                                    mesg=f'invalid number of fields given for norming: {s_common.trimText(repr(valu))}')
 
         subs = {}
         adds = []
@@ -566,12 +618,11 @@ class FieldHelper(collections.defaultdict):
             if not basetype:
                 raise s_exc.BadTypeDef(valu=val, mesg='type is not present in datamodel')
             _type = basetype.clone(opts)
-        if _type.deprecated:
-            mesg = f'The type {self.tname} field {key} uses a deprecated ' \
-                   f'type {_type.name} which will removed in 3.0.0'
-            logger.warning(mesg)
         self.setdefault(key, _type)
         return _type
+
+    def __repr__(self): # pragma: no cover
+        return f'{self.__class__.__name__}({self.tname}, {self.fields})'
 
 class Guid(Type):
 
@@ -598,6 +649,9 @@ class Guid(Type):
         )
 
     def _normPyList(self, valu):
+        if not valu:
+            mesg = 'Guid list values cannot be empty.'
+            raise s_exc.BadTypeValu(name=self.name, valu=valu, mesg=mesg)
         return s_common.guid(valu), {}
 
     def _normPyStr(self, valu):
@@ -619,17 +673,40 @@ class Hex(Type):
 
     _opt_defs = (
         ('size', 0),  # type: ignore
+        ('zeropad', 0),
     )
 
     def postTypeInit(self):
         self._size = self.opts.get('size')
+        self._zeropad = self.opts.get('zeropad')
+
+        # This is for backward compat with v2.142.x where zeropad was a bool
+        # TODO: Remove this compat check in 3xx
+        if isinstance(self._zeropad, bool):
+            if self._zeropad:
+                self._zeropad = self._size
+            else:
+                self._zeropad = 0
+
         if self._size < 0:
             # zero means no width check
             raise s_exc.BadConfValu(name='size', valu=self._size,
-                                    mesg='Size must be > 0')
+                                    mesg='Size must be >= 0')
         if self._size % 2 != 0:
             raise s_exc.BadConfValu(name='size', valu=self._size,
                                     mesg='Size must be a multiple of 2')
+
+        if self._zeropad < 0:
+            raise s_exc.BadConfValu(name='zeropad', valu=self._zeropad,
+                                    mesg='Zeropad must be >= 0')
+        if self._zeropad % 2 != 0:
+            raise s_exc.BadConfValu(name='zeropad', valu=self._zeropad,
+                                    mesg='Zeropad must be a multiple of 2')
+
+        if self._size:
+            self._zeropad = min(self._zeropad, self._size)
+
+        self.setNormFunc(int, self._normPyInt)
         self.setNormFunc(str, self._normPyStr)
         self.setNormFunc(bytes, self._normPyBytes)
         self.storlifts.update({
@@ -637,13 +714,16 @@ class Hex(Type):
             '^=': self._storLiftPref,
         })
 
+    def _preNormHex(self, text):
+        text = text.strip().lower()
+        if text.startswith('0x'):
+            text = text[2:]
+        return text.replace(' ', '').replace(':', '')
+
     def _storLiftEq(self, cmpr, valu):
 
-        if type(valu) == str:
-            valu = valu.strip().lower()
-            if valu.startswith('0x'):
-                valu = valu[2:]
-
+        if isinstance(valu, str):
+            valu = self._preNormHex(valu)
             if valu.endswith('*'):
                 return (
                     ('^=', valu[:-1], self.stortype),
@@ -652,19 +732,62 @@ class Hex(Type):
         return self._storLiftNorm(cmpr, valu)
 
     def _storLiftPref(self, cmpr, valu):
-        valu = valu.strip().lower()
-        if valu.startswith('0x'):
-            valu = valu[2:]
+        if not isinstance(valu, str):
+            vtyp = type(valu).__name__
+            mesg = f'Hex prefix lift values must be str, not {vtyp}.'
+            raise s_exc.BadTypeValu(mesg=mesg, type=vtyp, name=self.name)
 
+        valu = self._preNormHex(valu)
         return (
             ('^=', valu, self.stortype),
         )
 
+    def _normPyInt(self, valu):
+        extra = 7
+        if valu < 0:
+            # Negative values need a little more space to store the sign
+            extra = 8
+
+        bytelen = max((valu.bit_length() + extra) // 8, self._zeropad // 2)
+
+        try:
+            byts = valu.to_bytes(bytelen, 'big', signed=(valu < 0))
+            hexval = s_common.ehex(byts)
+
+        except OverflowError as e: # pragma: no cover
+            mesg = f'Invalid width for {valu}.'
+            raise s_exc.BadTypeValu(mesg=mesg, name=self.name)
+
+        if self._size and len(hexval) != self._size:
+            raise s_exc.BadTypeValu(valu=valu, reqwidth=self._size, name=self.name,
+                                    mesg='Invalid width.')
+
+        return hexval, {}
+
     def _normPyStr(self, valu):
-        valu = s_chop.hexstr(valu)
+        valu = self._preNormHex(valu)
+
+        if len(valu) % 2 != 0:
+            valu = f'0{valu}'
+
+        if not valu:
+            raise s_exc.BadTypeValu(valu=valu, name=self.name,
+                                    mesg='No string left after stripping.')
+
+        if self._zeropad and len(valu) < self._zeropad:
+            padlen = self._zeropad - len(valu)
+            valu = ('0' * padlen) + valu
+
+        try:
+            # checks for valid hex width and does character
+            # checking in C without using regex
+            s_common.uhex(valu)
+        except (binascii.Error, ValueError) as e:
+            raise s_exc.BadTypeValu(valu=valu, name='hex', mesg=str(e)) from None
+
         if self._size and len(valu) != self._size:
             raise s_exc.BadTypeValu(valu=valu, reqwidth=self._size, name=self.name,
-                                    mesg='invalid width')
+                                    mesg='Invalid width.')
         return valu, {}
 
     def _normPyBytes(self, valu):
@@ -688,6 +811,11 @@ class HugeNum(Type):
 
     stortype = s_layer.STOR_TYPE_HUGENUM
 
+    _opt_defs = (
+        ('units', None),   # type: ignore
+        ('modulo', None),  # type: ignore
+    )
+
     def __init__(self, modl, name, info, opts):
 
         Type.__init__(self, modl, name, info, opts)
@@ -705,15 +833,66 @@ class HugeNum(Type):
             'range=': self._storLiftRange,
         })
 
-    def norm(self, valu):
+        self.modulo = None
+
+        self.units = {}
+        units = self.opts.get('units')
+        if units is not None:
+            for name, mult in units.items():
+                self.units[name] = s_common.hugenum(mult)
+
+        modulo = self.opts.get('modulo')
+        if modulo is not None:
+            self.modulo = s_common.hugenum(modulo)
+
+    def _normHugeText(self, rawtext):
+
+        text = rawtext.lower().strip()
+        text = text.replace(',', '').replace(' ', '')
 
         try:
-            huge = s_common.hugenum(valu)
-        except Exception as e:
-            raise s_exc.BadTypeValu(name=self.name, valu=valu,
-                                    mesg=str(e)) from None
+            valu, off = s_grammar.chop_float(text, 0)
+        except Exception:
+            mesg = f'Value does not start with a number: "{rawtext}"'
+            raise s_exc.BadTypeValu(mesg=mesg)
 
         huge = s_common.hugenum(valu)
+
+        unit, off = s_grammar.nom(text, off, s_grammar.unitset)
+        if unit:
+            mult = self.units.get(unit)
+            if mult is None:
+                mesg = f'Unknown units for value: "{rawtext}"'
+                raise s_exc.BadTypeValu(mesg=mesg)
+            huge = s_common.hugemul(huge, mult)
+
+        return huge
+
+    def norm(self, valu):
+
+        if valu is None:
+            mesg = 'Hugenum type may not be null.'
+            raise s_exc.BadTypeValu(mesg=mesg)
+
+        try:
+
+            if isinstance(valu, str):
+                huge = self._normHugeText(valu)
+            else:
+                huge = s_common.hugenum(valu)
+
+            # behave modulo like int/float
+            if self.modulo is not None:
+                _, huge = s_common.hugemod(huge, self.modulo)
+                if huge < 0:
+                    huge = s_common.hugeadd(huge, self.modulo)
+
+                huge = s_common.hugeround(huge)
+
+        except decimal.DecimalException as e:
+            mesg = f'Invalid hugenum: {e}'
+            raise s_exc.BadTypeValu(name=self.name, valu=valu, mesg=mesg) from None
+
         if huge > hugemax:
             mesg = f'Value ({valu}) is too large for hugenum.'
             raise s_exc.BadTypeValu(mesg=mesg)
@@ -784,6 +963,9 @@ class IntBase(Type):
             'range=': self._storLiftRange,
         })
 
+        self.setNormFunc(decimal.Decimal, self._normPyDecimal)
+        self.setNormFunc(s_stormtypes.Number, self._normNumber)
+
     def _storLiftRange(self, cmpr, valu):
         minv, minfo = self.norm(valu[0])
         maxv, maxfo = self.norm(valu[1])
@@ -817,11 +999,18 @@ class IntBase(Type):
             return valu < norm
         return cmpr
 
+    def _normPyDecimal(self, valu):
+        return self._normPyInt(int(valu))
+
+    def _normNumber(self, valu):
+        return self._normPyInt(int(valu.valu))
+
 class Int(IntBase):
 
     _opt_defs = (
         ('size', 8),  # type: ignore # Set the storage size of the integer type in bytes.
         ('signed', True),
+        ('enums:strict', True),
 
         # Note: currently unused
         ('fmt', '%d'),  # Set to an integer compatible format string to control repr.
@@ -845,6 +1034,8 @@ class Int(IntBase):
         self.enumnorm = {}
         self.enumrepr = {}
 
+        self.enumstrict = self.opts.get('enums:strict')
+
         enums = self.opts.get('enums')
         if enums is not None:
             self.enumrepr.update(dict(enums))
@@ -860,32 +1051,29 @@ class Int(IntBase):
                 raise s_exc.BadTypeDef(mesg=mesg,
                                        name=self.name)
 
-        minval = self.opts.get('min')
-        maxval = self.opts.get('max')
+        if not self.signed:
+            minmin = 0
+            maxmax = 2 ** (self.size * 8) - 1
+        else:
+            minmin = -2 ** ((self.size * 8) - 1)
+            maxmax = 2 ** ((self.size * 8) - 1) - 1
 
-        minmin = -2 ** ((self.size * 8) - 1)
-        if minval is None:
+        if (minval := self.opts.get('min')) is None:
             minval = minmin
 
-        maxmax = 2 ** ((self.size * 8) - 1) - 1
-        if maxval is None:
+        if (maxval := self.opts.get('max')) is None:
             maxval = maxmax
 
         if minval < minmin or maxval > maxmax or maxval < minval:
             raise s_exc.BadTypeDef(self.opts, name=self.name)
 
-        if not self.signed:
-            self._indx_offset = 0
-            self.minval = 0
-            self.maxval = min(2 * maxval, maxval)
-        else:
-            self._indx_offset = maxmax + 1
-            self.minval = max(minmin, minval)
-            self.maxval = min(maxmax, maxval)
+        self.minval = minval
+        self.maxval = maxval
 
         self.setNormFunc(str, self._normPyStr)
         self.setNormFunc(int, self._normPyInt)
         self.setNormFunc(bool, self._normPyBool)
+        self.setNormFunc(float, self._normPyFloat)
 
     def merge(self, oldv, newv):
 
@@ -924,11 +1112,14 @@ class Int(IntBase):
             mesg = f'value is above max={self.maxval}'
             raise s_exc.BadTypeValu(valu=repr(valu), name=self.name, mesg=mesg)
 
-        if self.enumrepr and valu not in self.enumrepr:
+        if self.enumrepr and self.enumstrict and valu not in self.enumrepr:
             mesg = 'Value is not a valid enum value.'
             raise s_exc.BadTypeValu(valu=valu, name=self.name, mesg=mesg)
 
         return valu, {}
+
+    def _normPyFloat(self, valu):
+        return self._normPyInt(int(valu))
 
     def repr(self, norm):
 
@@ -1021,6 +1212,8 @@ class Float(Type):
         self.setNormFunc(str, self._normPyStr)
         self.setNormFunc(int, self._normPyInt)
         self.setNormFunc(float, self._normPyFloat)
+        self.setNormFunc(decimal.Decimal, self._normPyInt)
+        self.setNormFunc(s_stormtypes.Number, self._normNumber)
 
     def _normPyStr(self, valu):
 
@@ -1035,7 +1228,11 @@ class Float(Type):
         valu = float(valu)
         return self._normPyFloat(valu)
 
+    def _normNumber(self, valu):
+        return self._normPyFloat(float(valu.valu))
+
     def _normPyFloat(self, valu):
+
         if self.minval is not None and not self.mincmp(valu, self.minval):
             mesg = f'value is below min={self.minval}'
             raise s_exc.BadTypeValu(valu=valu, name=self.name, mesg=mesg)
@@ -1072,6 +1269,8 @@ class Ival(Type):
         self.setNormFunc(str, self._normPyStr)
         self.setNormFunc(list, self._normPyIter)
         self.setNormFunc(tuple, self._normPyIter)
+        self.setNormFunc(decimal.Decimal, self._normPyInt)
+        self.setNormFunc(s_stormtypes.Number, self._normNumber)
         self.storlifts.update({
             '@=': self._storLiftAt,
         })
@@ -1129,6 +1328,11 @@ class Ival(Type):
 
     def _normPyInt(self, valu):
         minv, _ = self.timetype._normPyInt(valu)
+        maxv, info = self.timetype._normPyInt(minv + 1)
+        return (minv, maxv), info
+
+    def _normNumber(self, valu):
+        minv, _ = self.timetype._normPyInt(valu.valu)
         maxv, info = self.timetype._normPyInt(minv + 1)
         return (minv, maxv), info
 
@@ -1266,11 +1470,36 @@ class Loc(Type):
 
 class Ndef(Type):
 
-    stortype = s_layer.STOR_TYPE_MSGP
+    stortype = s_layer.STOR_TYPE_NDEF
 
     def postTypeInit(self):
         self.setNormFunc(list, self._normPyTuple)
         self.setNormFunc(tuple, self._normPyTuple)
+
+        self.formfilter = None
+
+        self.forms = self.opts.get('forms')
+        self.ifaces = self.opts.get('interfaces')
+
+        if self.forms or self.ifaces:
+            if self.forms is not None:
+                forms = set(self.forms)
+
+            if self.ifaces is not None:
+                ifaces = set(self.ifaces)
+
+            def filtfunc(form):
+                if self.forms is not None and form.name in forms:
+                    return False
+
+                if self.ifaces is not None:
+                    for iface in form.ifaces.keys():
+                        if iface in ifaces:
+                            return False
+
+                return True
+
+            self.formfilter = filtfunc
 
     def _normStormNode(self, valu):
         return self._normPyTuple(valu.ndef)
@@ -1283,7 +1512,17 @@ class Ndef(Type):
 
         form = self.modl.form(formname)
         if form is None:
-            raise s_exc.NoSuchForm(name=self.name, form=formname)
+            raise s_exc.NoSuchForm.init(formname)
+
+        if self.formfilter is not None and self.formfilter(form):
+            mesg = f'Ndef of form {formname} is not allowed as a value for {self.name} with form filter'
+            if self.forms is not None:
+                mesg += f' forms={self.forms}'
+
+            if self.ifaces is not None:
+                mesg += f' interfaces={self.ifaces}'
+
+            raise s_exc.BadTypeValu(valu=formname, name=self.name, mesg=mesg, forms=self.forms, interfaces=self.ifaces)
 
         formnorm, forminfo = form.type.norm(formvalu)
         norm = (form.name, formnorm)
@@ -1297,7 +1536,7 @@ class Ndef(Type):
         formname, formvalu = norm
         form = self.modl.form(formname)
         if form is None:
-            raise s_exc.NoSuchForm(name=self.name, form=formname)
+            raise s_exc.NoSuchForm.init(formname)
 
         repv = form.type.repr(formvalu)
         return (formname, repv)
@@ -1310,6 +1549,8 @@ class Edge(Type):
         return self.fieldoffs.get(name)
 
     def postTypeInit(self):
+
+        self.deprecated = True
 
         self.fieldoffs = {'n1': 0, 'n2': 1}
 
@@ -1377,7 +1618,7 @@ class TimeEdge(Edge):
     def _normPyTuple(self, valu):
 
         if len(valu) != 3:
-            mesg = 'timeedge requires (ndef, ndef, time)'
+            mesg = f'timeedge requires (ndef, ndef, time), got {valu}'
             raise s_exc.BadTypeValu(mesg=mesg, name=self.name, valu=valu)
 
         n1, n2, tick = valu
@@ -1402,6 +1643,8 @@ class TimeEdge(Edge):
 
 class Data(Type):
 
+    ismutable = True
+
     stortype = s_layer.STOR_TYPE_MSGP
 
     def postTypeInit(self):
@@ -1412,16 +1655,17 @@ class Data(Type):
 
     def norm(self, valu):
         try:
-            s_common.reqjsonsafe(valu)
+            s_json.reqjsonsafe(valu)
             if self.validator is not None:
                 self.validator(valu)
         except (s_exc.MustBeJsonSafe, s_exc.SchemaViolation) as e:
-            raise s_exc.BadTypeValu(name=self.name, valu=valu, mesg=str(e)) from None
+            raise s_exc.BadTypeValu(name=self.name, mesg=f'{e}: {s_common.trimText(repr(valu))}') from None
         byts = s_msgpack.en(valu)
         return s_msgpack.un(byts), {}
 
 class NodeProp(Type):
 
+    ismutable = True
     stortype = s_layer.STOR_TYPE_MSGP
 
     def postTypeInit(self):
@@ -1434,10 +1678,11 @@ class NodeProp(Type):
         return self._normPyTuple(valu)
 
     def _normPyTuple(self, valu):
-        try:
-            propname, propvalu = valu
-        except Exception as e:
-            raise s_exc.BadTypeValu(name=self.name, valu=valu, mesg=str(e)) from None
+        if len(valu) != 2:
+            mesg = f'Must be a 2-tuple: {s_common.trimText(repr(valu))}'
+            raise s_exc.BadTypeValu(name=self.name, numitems=len(valu), mesg=mesg) from None
+
+        propname, propvalu = valu
 
         prop = self.modl.prop(propname)
         if prop is None:
@@ -1476,8 +1721,8 @@ class Range(Type):
 
     def _normPyTuple(self, valu):
         if len(valu) != 2:
-            raise s_exc.BadTypeValu(valu=valu, name=self.name,
-                                    mesg=f'Must be a 2-tuple of type {self.subtype.name}')
+            mesg = f'Must be a 2-tuple of type {self.subtype.name}: {s_common.trimText(repr(valu))}'
+            raise s_exc.BadTypeValu(numitems=len(valu), name=self.name, mesg=mesg)
 
         minv = self.subtype.norm(valu[0])[0]
         maxv = self.subtype.norm(valu[1])[0]
@@ -1515,6 +1760,9 @@ class Str(Type):
         self.setNormFunc(str, self._normPyStr)
         self.setNormFunc(int, self._normPyInt)
         self.setNormFunc(bool, self._normPyBool)
+        self.setNormFunc(float, self._normPyFloat)
+        self.setNormFunc(decimal.Decimal, self._normPyInt)
+        self.setNormFunc(s_stormtypes.Number, self._normNumber)
 
         self.storlifts.update({
             '=': self._storLiftEq,
@@ -1580,6 +1828,13 @@ class Str(Type):
     def _normPyInt(self, valu):
         return self._normPyStr(str(valu))
 
+    def _normNumber(self, valu):
+        return self._normPyStr(str(valu.valu))
+
+    def _normPyFloat(self, valu):
+        deci = s_common.hugectx.create_decimal(str(valu))
+        return self._normPyStr(format(deci, 'f'))
+
     def _normPyStr(self, valu):
 
         info = {}
@@ -1644,8 +1899,19 @@ class Taxonomy(Str):
         self.setNormFunc(tuple, self._normPyList)
         self.taxon = self.modl.type('taxon')
 
+    def _ctorCmprPref(self, valu):
+        norm = self._normForLift(valu)
+
+        def cmpr(valu):
+            return valu.startswith(norm)
+
+        return cmpr
+
     def _normForLift(self, valu):
-        return self.norm(valu)[0]
+        norm = self.norm(valu)[0]
+        if isinstance(valu, str) and not valu.strip().endswith('.'):
+            return norm.rstrip('.')
+        return norm
 
     def _normPyList(self, valu):
 
@@ -1663,6 +1929,9 @@ class Taxonomy(Str):
 
     def _normPyStr(self, text):
         return self._normPyList(text.strip().strip('.').split('.'))
+
+    def repr(self, norm):
+        return norm.rstrip('.')
 
 class Tag(Str):
 
@@ -1689,7 +1958,13 @@ class Tag(Str):
             mesg = f'Tag does not match tagre: [{s_grammar.tagre.pattern}]'
             raise s_exc.BadTypeValu(valu=norm, name=self.name, mesg=mesg)
 
-        return norm, {'subs': subs}
+        core = self.modl.core
+        if core is not None:
+            (ok, mesg) = core.isTagValid(norm)
+            if not ok:
+                raise s_exc.BadTypeValu(valu=norm, name=self.name, mesg=mesg)
+
+        return norm, {'subs': subs, 'toks': toks}
 
     def _normPyStr(self, text):
         toks = text.strip('#').split('.')
@@ -1710,6 +1985,102 @@ class TagPart(Str):
             mesg = 'Each tag part must be non-zero length.'
             raise s_exc.BadTypeValu(mesg=mesg)
 
+        return valu, {}
+
+speed_dist = {
+    'mm': 1,
+    'millimeters': 1,
+    'k': 1000000,
+    'km': 1000000,
+    'kilometers': 1000000,
+    'nmi': 1852000,
+    'in': 25.4,
+    'inches': 25.4,
+    'ft': 304.8,
+    'feet': 304.8,
+    'mi': 1609344,
+    'miles': 1609344,
+}
+
+speed_dura = {
+    's': 1,
+    'sec': 1,
+    'min': 60,
+    'minute': 60,
+    'h': 3600,
+    'hr': 3600,
+    'hour': 3600,
+}
+
+class Velocity(IntBase):
+    oflight = 299792458000
+    stortype = s_layer.STOR_TYPE_I64
+
+    _opt_defs = (
+        ('relative', False),
+    )
+
+    def postTypeInit(self):
+        self.setNormFunc(str, self._normPyStr)
+        self.setNormFunc(int, self._normPyInt)
+
+    def _normPyStr(self, valu):
+
+        valu = valu.lower().strip()
+        if not valu:
+            mesg = 'Empty string is not a valid velocity.'
+            raise s_exc.BadTypeValu(mesg=mesg)
+
+        nums, offs = s_grammar.nom(valu, 0, cset='-0123456789.')
+        if not nums:
+            nums = '1'
+
+        base = float(nums)
+        if base < 0 and not self.opts.get('relative'):
+            mesg = 'Non-relative velocities may not be negative.'
+            raise s_exc.BadTypeValu(mesg=mesg)
+
+        unit = valu[offs:].strip()
+        if not unit:
+            return int(base), {}
+
+        if unit.find('/') != -1:
+            dist, dura = unit.split('/', 1)
+            distmod = speed_dist.get(dist)
+            if distmod is None:
+                mesg = f'Unrecognized distance type: {dist}.'
+                raise s_exc.BadTypeValu(mesg=mesg)
+
+            duramod = speed_dura.get(dura)
+            if duramod is None:
+                mesg = f'Unrecognized duration type: {dura}.'
+                raise s_exc.BadTypeValu(mesg=mesg)
+
+            norm = int((base * distmod) / duramod)
+            return norm, {}
+
+        if unit == 'mph':
+            norm = int((base * 1609344) / 3600)
+            return norm, {}
+
+        if unit == 'kph':
+            norm = int((base * 1000000) / 3600)
+            return norm, {}
+
+        if unit in ('knots', 'kts'):
+            norm = int((base * 1852000) / 3600)
+            return norm, {}
+
+        if unit == 'c':
+            return int(base * self.oflight), {}
+
+        mesg = f'Unknown velocity unit: {unit}.'
+        raise s_exc.BadTypeValu(mesg=mesg)
+
+    def _normPyInt(self, valu):
+        if valu < 0 and not self.opts.get('relative'):
+            mesg = 'Non-relative velocities may not be negative.'
+            raise s_exc.BadTypeValu(mesg=mesg)
         return valu, {}
 
 class Duration(IntBase):
@@ -1807,6 +2178,8 @@ class Time(IntBase):
 
         if self.ismin:
             self.stortype = s_layer.STOR_TYPE_MINTIME
+        elif self.ismax:
+            self.stortype = s_layer.STOR_TYPE_MAXTIME
 
     def _liftByIval(self, cmpr, valu):
 
@@ -1866,12 +2239,12 @@ class Time(IntBase):
 
             return self._normPyInt(delt + bgn)
 
-        valu = s_time.parse(valu, base=base)
+        valu = s_time.parse(valu, base=base, chop=True)
         return self._normPyInt(valu)
 
     def _normPyInt(self, valu):
         if valu > self.maxsize and valu != self.futsize:
-            mesg = f'Time exceeds max size [{self.maxsize}] allowed for a non-future marker.'
+            mesg = f'Time exceeds max size [{self.maxsize}] allowed for a non-future marker, got {valu}'
             raise s_exc.BadTypeValu(mesg=mesg, valu=valu, name=self.name)
         return valu, {}
 
@@ -1898,7 +2271,8 @@ class Time(IntBase):
 
             lowr = valu.strip().lower()
             if not lowr:
-                raise s_exc.BadTypeValu(name=self.name, valu=valu)
+                mesg = f'Invalid time provided, got [{valu}]'
+                raise s_exc.BadTypeValu(mesg=mesg, name=self.name, valu=valu)
 
             if lowr == 'now':
                 return s_common.now()
@@ -1932,7 +2306,7 @@ class Time(IntBase):
         try:
             _tick = self._getLiftValu(val0)
         except ValueError:
-            mesg = 'Unable to process the value for val0 in _getLiftValu.'
+            mesg = f'Unable to process the value for val0 in _getLiftValu, got {val0}'
             raise s_exc.BadTypeValu(name=self.name, valu=val0,
                                     mesg=mesg) from None
 
@@ -1965,10 +2339,12 @@ class Time(IntBase):
         '''
 
         if not isinstance(vals, (list, tuple)):
-            raise s_exc.BadCmprValu(valu=vals, cmpr='range=')
+            mesg = f'Must be a 2-tuple: {s_common.trimText(repr(vals))}'
+            raise s_exc.BadCmprValu(itemtype=type(vals), cmpr='range=', mesg=mesg)
 
         if len(vals) != 2:
-            raise s_exc.BadCmprValu(valu=vals, cmpr='range=')
+            mesg = f'Must be a 2-tuple: {s_common.trimText(repr(vals))}'
+            raise s_exc.BadCmprValu(itemtype=type(vals), cmpr='range=', mesg=mesg)
 
         tick, tock = self.getTickTock(vals)
 
@@ -2002,8 +2378,9 @@ class Time(IntBase):
             strip = text.strip()
             if strip.endswith('*'):
                 tick, tock = s_time.wildrange(strip[:-1])
+                last = tock - 1
                 def cmpr(valu):
-                    return valu <= tock
+                    return valu <= last
                 return cmpr
 
         return IntBase._ctorCmprLe(self, text)
@@ -2033,7 +2410,7 @@ class Time(IntBase):
                 if cmpr == '=':
                     tick, tock = s_time.wildrange(text[:-1])
                     return (
-                        ('range=', (tick, tock), self.stortype),
+                        ('range=', (tick, tock - 1), self.stortype),
                     )
 
                 if cmpr == '<':
@@ -2045,7 +2422,7 @@ class Time(IntBase):
                 if cmpr == '<=':
                     tick, tock = s_time.wildrange(text[:-1])
                     return (
-                        ('<=', tock, self.stortype),
+                        ('<=', tock - 1, self.stortype),
                     )
 
         return IntBase._storLiftNorm(self, cmpr, valu)

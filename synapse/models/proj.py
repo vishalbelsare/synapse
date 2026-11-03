@@ -1,15 +1,4 @@
-import synapse.common as s_common
-
 import synapse.lib.module as s_module
-
-prioenums = (
-    (0, 'none'),
-    (10, 'lowest'),
-    (20, 'low'),
-    (30, 'medium'),
-    (40, 'high'),
-    (50, 'highest'),
-)
 
 statusenums = (
     (0, 'new'),
@@ -27,10 +16,9 @@ class ProjectModule(s_module.CoreModule):
 
     async def initCoreModule(self):
         self.model.form('proj:project').onAdd(self._onAddProj)
-        self.model.form('proj:project').onDel(self._onDelProj)
 
     async def _onAddProj(self, node):
-        # ref counts on authgates?
+        # TODO: remove all storm:project authgates in 3.x migration
         gateiden = node.ndef[1]
 
         await self.core.auth.addAuthGate(node.ndef[1], 'storm:project')
@@ -40,29 +28,97 @@ class ProjectModule(s_module.CoreModule):
         rule = (True, ('project', 'admin'))
         await node.snap.user.addRule(rule, gateiden=gateiden)
 
-    async def _onDelProj(self, node):
-        gateiden = node.ndef[1]
-        await self.core.auth.delAuthGate(gateiden)
-
     def getModelDefs(self):
         return (
 
             ('proj', {
 
+                'interfaces': (
+                    ('proj:task', {
+
+                        'doc': 'A common interface for tasks.',
+
+                        'template': {
+                            'task': 'task'},
+
+                        'props': (
+
+                            ('id', ('str', {'strip': True}), {
+                                'doc': 'The ID of the {task}.'}),
+
+                            ('project', ('proj:project', {}), {
+                                'doc': 'The project containing the {task}.'}),
+
+                            ('status', ('int', {}), {
+                                # TODO: make runtime setable int enum typeopts
+                                'doc': 'The status of the {task}.'}),
+
+                            ('priority', ('meta:priority', {}), {
+                                'doc': 'The priority of the {task}.'}),
+
+                            ('created', ('time', {}), {
+                                'doc': 'The time the {task} was created.'}),
+
+                            ('updated', ('time', {}), {
+                                'doc': 'The time the {task} was last updated.'}),
+
+                            ('due', ('time', {}), {
+                                'doc': 'The time the {task} must be complete.'}),
+
+                            ('completed', ('time', {}), {
+                                'doc': 'The time the {task} was completed.'}),
+
+                            ('creator', ('syn:user', {}), {
+                                'doc': 'The user which created the {task}.'}),
+
+                            ('assignee', ('syn:user', {}), {
+                                'doc': 'The user assigned to complete the {task}.'}),
+
+                            ('ext:creator', ('ps:contact', {}), {
+                                'doc': 'The contact information of the creator from an external system.'}),
+
+                            ('ext:assignee', ('ps:contact', {}), {
+                                'doc': 'The contact information of the assignee from an external system.'}),
+                        ),
+                    }),
+                ),
                 'types': (
-                    ('proj:epic', ('guid', {}), {}),
-                    ('proj:ticket', ('guid', {}), {}),
-                    ('proj:sprint', ('guid', {}), {}),
-                    ('proj:comment', ('guid', {}), {}),
-                    ('proj:project', ('guid', {}), {}),
-                    ('proj:attachment', ('guid', {}), {}),
+                    ('proj:epic', ('guid', {}), {
+                        'doc': 'A collection of tickets related to a topic.'}),
+
+                    ('proj:ticket', ('guid', {}), {
+                        'interfaces': ('proj:task',),
+                        'template': {
+                            'task': 'ticket'},
+                        'doc': 'A ticket in a ticketing system.'}),
+
+                    ('proj:project:type:taxonomy', ('taxonomy', {}), {
+                        'doc': 'A type taxonomy for projects.'}),
+
+                    ('proj:sprint', ('guid', {}), {
+                        'doc': 'A timeboxed period to complete a set amount of work.',
+                    }),
+                    ('proj:comment', ('guid', {}), {
+                        'doc': 'A user comment on a ticket.',
+                    }),
+                    ('proj:project', ('guid', {}), {
+                        'doc': 'A project in a ticketing system.',
+                    }),
+                    ('proj:attachment', ('guid', {}), {
+                        'doc': 'A file attachment added to a ticket or comment.',
+                    }),
                 ),
 
                 'forms': (
 
+                    ('proj:project:type:taxonomy', {}, {}),
                     ('proj:project', {}, (
+
                         ('name', ('str', {'lower': True, 'onespace': True}), {
                             'doc': 'The project name.'}),
+
+                        ('type', ('proj:project:type:taxonomy', {}), {
+                            'doc': 'The project type.'}),
 
                         ('desc', ('str', {}), {
                             'disp': {'hint': 'text'},
@@ -73,9 +129,13 @@ class ProjectModule(s_module.CoreModule):
 
                         ('created', ('time', {}), {
                             'doc': 'The time the project was created.'}),
+
+                        ('platform', ('inet:service:platform', {}), {
+                            'doc': 'The platform where the project is hosted.'}),
                     )),
 
                     ('proj:sprint', {}, (
+
                         ('name', ('str', {'lower': True, 'onespace': True}), {
                             'doc': 'The name of the sprint.'}),
 
@@ -102,49 +162,77 @@ class ProjectModule(s_module.CoreModule):
                     # ('proj:backlog', {}, (
 
                     ('proj:comment', {}, (
-                        ('creator', ('syn:user', {}), {}),
-                        ('created', ('time', {}), {}),
-                        ('updated', ('time', {}), {}),
-                        ('ticket', ('proj:ticket', {}), {}),
-                        ('text', ('str', {}), {}),
+
+                        ('creator', ('syn:user', {}), {
+                            'doc': 'The synapse user who added the comment.'}),
+
+                        ('created', ('time', {}), {
+                            'doc': 'The time the comment was added.'}),
+
+                        ('ext:creator', ('ps:contact', {}), {
+                            'doc': 'The contact information of the creator from an external system.'}),
+
+                        ('updated', ('time', {'ismax': True}), {
+                            'doc': 'The last time the comment was updated.'}),
+
+                        ('ticket', ('proj:ticket', {}), {
+                            'doc': 'The ticket the comment was added to.'}),
+
+                        ('text', ('str', {}), {
+                            'doc': 'The text of the comment.'}),
                         # -(refs)> thing comment is about
                     )),
 
                     ('proj:epic', {}, (
-                        ('name', ('str', {'onespace': True}), {}),
-                        ('project', ('proj:project', {}), {}),
-                        ('creator', ('syn:user', {}), {}),
-                        ('created', ('time', {}), {}),
-                        ('updated', ('time', {'max': True}), {}),
+
+                        ('name', ('str', {'onespace': True}), {
+                            'doc': 'The name of the epic.'}),
+
+                        ('project', ('proj:project', {}), {
+                            'doc': 'The project containing the epic.'}),
+
+                        ('creator', ('syn:user', {}), {
+                            'doc': 'The synapse user who created the epic.'}),
+
+                        ('created', ('time', {}), {
+                            'doc': 'The time the epic was created.'}),
+
+                        ('updated', ('time', {'ismax': True}), {
+                            'doc': 'The last time the epic was updated.'}),
                     )),
 
                     ('proj:attachment', {}, (
-                        ('name', ('file:base', {}), {}),
-                        ('file', ('file:bytes', {}), {}),
-                        ('creator', ('syn:user', {}), {}),
-                        ('created', ('time', {}), {}),
-                        ('ticket', ('proj:ticket', {}), {}),
-                        ('comment', ('proj:comment', {}), {}),
+
+                        ('name', ('file:base', {}), {
+                            'doc': 'The name of the file that was attached.'}),
+
+                        ('file', ('file:bytes', {}), {
+                            'doc': 'The file that was attached.'}),
+
+                        ('creator', ('syn:user', {}), {
+                            'doc': 'The synapse user who added the attachment.'}),
+
+                        ('created', ('time', {}), {
+                            'doc': 'The time the attachment was added.'}),
+
+                        ('ticket', ('proj:ticket', {}), {
+                            'doc': 'The ticket the attachment was added to.'}),
+
+                        ('comment', ('proj:comment', {}), {
+                            'doc': 'The comment the attachment was added to.'}),
                     )),
 
                     ('proj:ticket', {}, (
 
-                        ('project', ('proj:project', {}), {}),
-
                         ('ext:id', ('str', {'strip': True}), {
-                            'doc': 'A ticket ID from an external system.'}),
+                            'deprecated': True,
+                            'doc': 'Deprecated. Please use :id.'}),
 
                         ('ext:url', ('inet:url', {}), {
                             'doc': 'A URL to the ticket in an external system.'}),
 
                         ('epic', ('proj:epic', {}), {
                             'doc': 'The epic that includes the ticket.'}),
-
-                        ('created', ('time', {}), {
-                            'doc': 'The time the ticket was created.'}),
-
-                        ('updated', ('time', {'max': True}), {
-                            'doc': 'The last time the ticket was updated.'}),
 
                         ('name', ('str', {'onespace': True}), {
                             'doc': 'The name of the ticket.'}),
@@ -161,17 +249,9 @@ class ProjectModule(s_module.CoreModule):
                         ('sprint', ('proj:sprint', {}), {
                             'doc': 'The sprint that contains the ticket.'}),
 
-                        ('priority', ('int', {'enums': prioenums}), {
-                            'doc': 'The priority of the ticket.'}),
-
                         ('type', ('str', {'lower': True, 'strip': True}), {
-                            'doc': 'The type of ticket. (eg story / bug)'}),
-
-                        ('creator', ('syn:user', {}), {
-                            'doc': 'The synapse user who created the ticket.'}),
-
-                        ('assignee', ('syn:user', {}), {
-                            'doc': 'The synapse user who the ticket is assigned to.'}),
+                            'doc': 'The type of ticket.',
+                            'ex': 'bug'}),
                     )),
                 ),
             }),

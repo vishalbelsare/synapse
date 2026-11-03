@@ -1,3 +1,4 @@
+import synapse.exc as s_exc
 import synapse.tests.utils as s_t_utils
 
 class LangModuleTest(s_t_utils.SynTest):
@@ -22,17 +23,27 @@ class LangModuleTest(s_t_utils.SynTest):
             self.eq('Greetings', nodes[0].get('desc'))
             self.len(1, await core.nodes('lang:translation -> it:prod:softver'))
 
+            self.none(await core.callStorm('return($lib.gen.langByCode(neeeeewp, try=$lib.true))'))
+            with self.raises(s_exc.BadTypeValu):
+                await core.callStorm('return($lib.gen.langByCode(neeeeewp))')
+
+            nodes = await core.nodes('[ lang:phrase="For   The  People" ]')
+            self.len(1, nodes)
+            self.eq('for the people', nodes[0].repr())
+
     async def test_forms_idiom(self):
         async with self.getTestCore() as core:
-            formname = 'lang:idiom'
             valu = 'arbitrary text 123'
 
-            input_props = {'url': 'https://vertex.link/', 'desc:en': 'Some English Desc'}
+            props = {'url': 'https://vertex.link/', 'desc:en': 'Some English Desc'}
             expected_props = {'url': 'https://vertex.link/', 'desc:en': 'Some English Desc'}
-            expected_ndef = (formname, valu)
+            expected_ndef = ('lang:idiom', valu)
 
-            async with await core.snap() as snap:
-                node = await snap.addNode(formname, valu, props=input_props)
+            opts = {'vars': {'valu': valu, 'p': props}}
+            q = '[(lang:idiom=$valu :desc:en=$p."desc:en" :url=$p.url)]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
+            node = nodes[0]
 
             self.eq(node.ndef, expected_ndef)
             for prop, valu in expected_props.items():
@@ -40,15 +51,17 @@ class LangModuleTest(s_t_utils.SynTest):
 
     async def test_forms_trans(self):
         async with self.getTestCore() as core:
-            formname = 'lang:trans'
             valu = 'arbitrary text 123'
 
-            input_props = {'text:en': 'Some English Text', 'desc:en': 'Some English Desc'}
+            props = {'text:en': 'Some English Text', 'desc:en': 'Some English Desc'}
             expected_props = {'text:en': 'Some English Text', 'desc:en': 'Some English Desc'}
-            expected_ndef = (formname, valu)
+            expected_ndef = ('lang:trans', valu)
 
-            async with await core.snap() as snap:
-                node = await snap.addNode(formname, valu, props=input_props)
+            opts = {'vars': {'valu': valu, 'p': props}}
+            q = '[(lang:trans=$valu :desc:en=$p."desc:en" :text:en=$p."text:en")]'
+            nodes = await core.nodes(q, opts=opts)
+            self.len(1, nodes)
+            node = nodes[0]
 
             self.eq(node.ndef, expected_ndef)
             for prop, valu in expected_props.items():

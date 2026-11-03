@@ -9,6 +9,8 @@ import synapse.exc as s_exc
 
 import synapse.lib.base as s_base
 import synapse.lib.coro as s_coro
+import synapse.lib.scope as s_scope
+import synapse.lib.spawner as s_spawner
 
 import synapse.tests.utils as s_t_utils
 
@@ -44,6 +46,14 @@ class Hehe(s_base.Base):
         if self.foo == -1:
             raise s_exc.BadArg(mesg='boom')
 
+class Haha(s_base.Base, s_spawner.SpawnerMixin):
+
+    async def __anit__(self):
+        await s_base.Base.__anit__(self)
+
+    async def fini(self):
+        await s_base.Base.fini(self)
+
 class BaseTest(s_t_utils.SynTest):
 
     async def test_base_basics(self):
@@ -59,6 +69,21 @@ class BaseTest(s_t_utils.SynTest):
         event = await base.fire('woot', x=3, y=5, ret=[])
         self.eq(event[1]['ret'], 8)
 
+        base00 = await s_base.Base.anit()
+        base01 = await s_base.Base.anit()
+        data = {}
+        async def onfini():
+            data['woot'] = True
+
+        await base00.fini()
+        base00.onfini(onfini)
+        await asyncio.sleep(0)
+        self.true(data.get('woot'))
+
+        base00.onfini(base01)
+        await asyncio.sleep(0)
+        self.true(base01.isfini)
+
     async def test_base_anit(self):
 
         afoo = await Hehe.anit(20)
@@ -69,6 +94,11 @@ class BaseTest(s_t_utils.SynTest):
         with self.raises(s_exc.BadArg) as cm:
             await Hehe.anit(-1)
         self.eq(cm.exception.get('mesg'), 'boom')
+
+        if __debug__:
+            with self.raises(AssertionError) as cm:
+                Hehe()
+            self.eq(str(cm.exception), 'Objects from Base must be constructed solely via "anit"')
 
     async def test_coro_fini(self):
 
@@ -101,6 +131,36 @@ class BaseTest(s_t_utils.SynTest):
             yield state
             state = "after2"
 
+        @contextlib.contextmanager
+        def ctxtest_throw():
+            nonlocal state
+            state = "throw00"
+            raise ValueError(state)
+            yield state
+
+        @contextlib.contextmanager
+        def ctxtest_throw_atexit():
+            nonlocal state
+            state = "throw01_exit"
+            yield state
+            state = "throw01_exiting"
+            raise ValueError(state)
+
+        @contextlib.asynccontextmanager
+        async def actxtest_throw():
+            nonlocal state
+            state = "athrow00"
+            raise ValueError(state)
+            yield state
+
+        @contextlib.asynccontextmanager
+        async def actxtest_throw_atexit():
+            nonlocal state
+            state = "athrow01_exit"
+            yield state
+            state = "athrow01_exiting"
+            raise ValueError(state)
+
         async with await s_base.Base.anit() as base:
             await base.enter_context(ctxtest())
             self.eq("before", state)
@@ -112,6 +172,32 @@ class BaseTest(s_t_utils.SynTest):
             self.eq("before2", state)
 
         self.eq("after2", state)
+
+        with self.raises(ValueError) as cm:
+            async with await s_base.Base.anit() as base:
+                await base.enter_context(ctxtest_throw())
+        self.eq("throw00", state)
+        self.eq(cm.exception.args, ('throw00',))
+
+        with self.raises(ValueError) as cm:
+            async with await s_base.Base.anit() as base:
+                await base.enter_context(actxtest_throw())
+        self.eq("athrow00", state)
+        self.eq(cm.exception.args, ('athrow00',))
+
+        with self.getLoggerStream('synapse.lib.base') as stream:
+            async with await s_base.Base.anit() as base:
+                await base.enter_context(ctxtest_throw_atexit())
+                self.eq("throw01_exit", state)
+            await stream.expect('context exit failed')
+        self.eq("throw01_exiting", state)
+
+        with self.getLoggerStream('synapse.lib.base') as stream:
+            async with await s_base.Base.anit() as base:
+                await base.enter_context(actxtest_throw_atexit())
+                self.eq("athrow01_exit", state)
+            await stream.expect('context aexit failed')
+        self.eq("athrow01_exiting", state)
 
     async def test_base_link(self):
 
@@ -200,6 +286,7 @@ class BaseTest(s_t_utils.SynTest):
         self.eq(data['count'], 1)
 
     async def test_base_waiter(self):
+
         base0 = await s_base.Base.anit()
 
         wait0 = base0.waiter(3, 'foo:bar')
@@ -222,6 +309,10 @@ class BaseTest(s_t_utils.SynTest):
         await base0.fire('haha')
         evts = await wait2.wait(1)
         self.len(2, evts)
+
+        with self.raises(s_exc.TimeOut):
+            async with base0.waiter(1, 'newp', 'nuuh', timeout=0.01):
+                pass
 
     async def test_baseref(self):
 
@@ -260,29 +351,35 @@ class BaseTest(s_t_utils.SynTest):
             await asyncio.sleep(0.1)
             await base.fini()
 
-        loop.create_task(callfini())
+        task = loop.create_task(callfini())
         # actually wait...
         self.true(await base.waitfini(timeout=0.3))
         self.true(base.isfini)
+        self.none(await task)
 
         # bounce off the isfini block
         self.true(await base.waitfini(timeout=0.3))
 
     async def test_base_refcount(self):
         base = await s_base.Base.anit()
+        self.true(base._wouldfini())
 
         self.eq(base.incref(), 2)
+        self.false(base._wouldfini())
 
         self.eq(await base.fini(), 1)
         self.false(base.isfini)
+        self.true(base._wouldfini())
 
         self.eq(await base.fini(), 0)
         self.true(base.isfini)
+        self.false(base._wouldfini())
 
     async def test_baseref_gen(self):
 
         async with await s_base.BaseRef.anit() as refs:
-            await self.asyncraises(s_exc.NoSuchCtor, refs.gen('woot'))
+            with self.raises(s_exc.NoSuchCtor):
+                await refs.gen('woot')
 
         async def ctor(name):
             return await s_base.Base.anit()
@@ -357,7 +454,7 @@ class BaseTest(s_t_utils.SynTest):
         proc = ctx.Process(target=block_processing, args=(evt1,))
         proc.start()
 
-        self.true(evt1.wait(timeout=10))
+        self.true(evt1.wait(timeout=30))
         os.kill(proc.pid, signal.SIGTERM)
         proc.join(timeout=10)
         self.eq(proc.exitcode, 137)
@@ -375,7 +472,7 @@ class BaseTest(s_t_utils.SynTest):
         proc = ctx.Process(target=block_processing, args=(evt1,))
         proc.start()
 
-        self.true(evt1.wait(timeout=10))
+        self.true(evt1.wait(timeout=30))
         os.kill(proc.pid, signal.SIGINT)
 
         proc.join(timeout=10)
@@ -462,7 +559,7 @@ class BaseTest(s_t_utils.SynTest):
         async def badgenr():
             yield 'foo'
             await asyncio.sleep(0)
-            raise s_exc.SynErr('rando')
+            raise s_exc.SynErr(mesg='rando')
 
         async def slowgenr():
             yield 'foo'
@@ -480,10 +577,133 @@ class BaseTest(s_t_utils.SynTest):
 
         items = [item async for item in s_base.schedGenr(goodgenr())]
         self.eq(items, ['foo', 'bar'])
-        await self.agenraises(s_exc.SynErr, s_base.schedGenr(badgenr()))
+        with self.raises(s_exc.SynErr):
+            await s_t_utils.alist(s_base.schedGenr(badgenr()))
 
         async with await s_base.Base.anit() as base:
             task = base.schedCoro(slowtask())
             self.true(await s_coro.event_wait(event, 3.0))
 
-        await self.asyncraises(asyncio.CancelledError, task)
+        with self.raises(asyncio.CancelledError):
+            await task
+
+    async def test_lib_base_scope(self):
+
+        # Simple test with a single scope stack.
+
+        data = {}
+
+        async def func1(key):
+            valu = s_scope.get(key, defval=None)
+            data[key] = valu
+            # Get / set in our scope works fine
+            s_scope.set('hehe', 'newp')
+            self.eq(s_scope.get('hehe'), 'newp')
+
+        async with await s_base.Base.anit() as base:
+            vals = {'foo': 'bar'}
+            with s_scope.enter(vals=vals):  # Ensure we have a known value in the scope
+                task = base.schedCoro(func1('foo'))
+                await task
+
+        # The scoped data was accessible in the task
+        self.eq(data.get('foo'), 'bar')
+
+        # The scope data set in the task is not present outside of it.
+        self.none(s_scope.get('hehe'))
+
+        # Nested scopes across multiple tasks
+        data = {}
+
+        async def func2(key):
+            valu = s_scope.get(key, defval=None)
+            data[key] = valu
+            # Get / set in our scope works fine
+            s_scope.set('hehe', 'newp')
+            self.eq(s_scope.get('hehe'), 'newp')
+
+        async def func3(bobj, key, valu):
+            s_scope.set(key, valu)
+            task = bobj.schedCoro(func2(key))
+            await task
+            self.none(s_scope.get('hehe'))
+
+        async with await s_base.Base.anit() as base:
+            vals = {'foo': 'bar'}
+            with s_scope.enter(vals=vals):  # Ensure we have a known value in the scope
+                task = base.schedCoro(func3(base, 'beep', 'boop'))
+                await task
+
+        # The scoped data was accessible in the task
+        self.eq(data.get('beep'), 'boop')
+
+        # The scope data set in the task is not present outside of it.
+        self.none(s_scope.get('hehe'))
+
+    async def test_base_sched_fini(self):
+
+        ran = []
+
+        async def acoro():
+            ran.append(True)
+
+        base = await s_base.Base.anit()
+        await base.fini()
+
+        # schedCoro raises IsFini and closes the coroutine without scheduling it
+        coro = acoro()
+        with self.raises(s_exc.IsFini):
+            base.schedCoro(coro)
+
+        self.eq(ran, [])
+
+        # schedCoroSafe silently discards when the base is already fini'd
+        coro2 = acoro()
+        self.nn(coro2.cr_frame)
+        base.schedCoroSafe(coro2)
+
+        # Wait until schedCoroSafe has scheduled coro2 via safecall and close()'d it.
+        async with asyncio.timeout(12):
+            while True:
+                # cr_frame is cleared when a coroutine is closed or finished.
+                if coro2.cr_frame is None:
+                    break
+                await asyncio.sleep(0.1)
+
+        self.eq(ran, [])
+
+    async def test_base_spawner_fini(self):
+
+        # Test proxy fini, base should fini
+        base = await s_base.Base.anit()
+        spawner = Haha.spawner(base=base)
+        proxy = await spawner()
+
+        self.false(proxy.isfini)
+        self.false(base.isfini)
+
+        await proxy.fini()
+        self.true(proxy.isfini)
+        self.true(base.isfini)
+
+        # Test base fini, proxy should fini
+        base = await s_base.Base.anit()
+        spawner = Haha.spawner(base=base)
+        proxy = await spawner()
+
+        self.false(proxy.isfini)
+        self.false(base.isfini)
+
+        await base.fini()
+        self.true(base.isfini)
+        self.true(proxy.isfini)
+
+    async def test_base_spawner_none(self):
+
+        spawner = Haha.spawner()
+        proxy = await spawner()
+
+        self.false(proxy.isfini)
+
+        await proxy.fini()
+        self.true(proxy.isfini)

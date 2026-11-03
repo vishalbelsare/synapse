@@ -1,9 +1,7 @@
 import synapse.exc as s_exc
-import synapse.common as s_common
 
-import synapse.lib.coro as s_coro
-import synapse.lib.storm as s_storm
 import synapse.lib.stormtypes as s_stormtypes
+import synapse.lib.processpool as s_processpool
 
 import xml.etree.ElementTree as xml_et
 
@@ -22,8 +20,8 @@ class XmlElement(s_stormtypes.Prim):
          'type': {'type': 'function', '_funcname': 'find',
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The name of the XML tag.'},
-                      {'name': 'nested', 'type': 'bool', 'default': True,
-                        'desc': 'Set to $lib.false to only find direct children.'},
+                      {'name': 'nested', 'type': 'boolean', 'default': True,
+                       'desc': 'Set to ``(false)`` to only find direct children.'},
                   ),
                   'returns': {'type': 'generator', 'desc': 'A generator which yields xml:elements.'}}},
 
@@ -32,7 +30,7 @@ class XmlElement(s_stormtypes.Prim):
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The name of the child XML element tag.'},
                   ),
-                  'returns': {'type': 'xml:element', 'desc': 'The child XML element or $lib.null'}}},
+                  'returns': {'type': 'xml:element', 'desc': 'The child XML element or ``(null)``.'}}},
     )
 
     def __init__(self, runt, elem):
@@ -51,6 +49,7 @@ class XmlElement(s_stormtypes.Prim):
         for elem in self.elem:
             yield XmlElement(self.runt, elem)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def find(self, name, nested=True):
         name = await s_stormtypes.tostr(name)
         nested = await s_stormtypes.tobool(nested)
@@ -62,6 +61,7 @@ class XmlElement(s_stormtypes.Prim):
             for elem in self.elem.findall(name):
                 yield XmlElement(self.runt, elem)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def get(self, name):
         name = await s_stormtypes.tostr(name)
         elem = self.elem.find(name)
@@ -89,11 +89,11 @@ class LibXml(s_stormtypes.Lib):
             'parse': self.parse,
         }
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def parse(self, valu):
         valu = await s_stormtypes.tostr(valu)
         try:
-            todo = (xml_et.fromstring, (valu,), {})
-            root = await s_coro.spawn(todo)
+            root = await s_processpool.semafork(xml_et.fromstring, valu)
             return XmlElement(self.runt, root)
         except xml_et.ParseError as e:
             raise s_exc.BadArg(mesg=f'Invalid XML text: {str(e)}')

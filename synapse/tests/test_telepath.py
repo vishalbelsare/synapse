@@ -1,30 +1,31 @@
 import os
 import ssl
-import json
+import sys
 import socket
 import asyncio
 import logging
-import threading
+import multiprocessing
 
 from unittest import mock
 
-logger = logging.getLogger(__name__)
+import cryptography.hazmat.primitives.hashes as c_hashes
 
 import synapse.exc as s_exc
-import synapse.glob as s_glob
 import synapse.common as s_common
 import synapse.daemon as s_daemon
 import synapse.telepath as s_telepath
 
 import synapse.lib.cell as s_cell
 import synapse.lib.coro as s_coro
+import synapse.lib.link as s_link
+import synapse.lib.const as s_const
 import synapse.lib.share as s_share
 import synapse.lib.certdir as s_certdir
-import synapse.lib.httpapi as s_httpapi
 import synapse.lib.version as s_version
 
 import synapse.tests.utils as s_t_utils
-from synapse.tests.utils import alist
+
+logger = logging.getLogger(__name__)
 
 class Boom:
     pass
@@ -52,6 +53,9 @@ class Beep:
     def beep(self):
         return f'{self.path}: beep'
 
+    def genbeep(self):
+        yield self.beep()
+
 class Foo:
 
     def __init__(self):
@@ -66,6 +70,10 @@ class Foo:
 
     def echo(self, x):
         return x
+
+    def echosize(self, array: list[bytes]):
+        total = sum([len(bytz) for bytz in array])
+        return total
 
     def speed(self):
         return
@@ -102,7 +110,7 @@ class Foo:
 
     def raze(self):
         # test that SynErr makes it through
-        raise s_exc.NoSuchMeth(name='haha')
+        raise s_exc.SynErr(mesg='hehe', key='valu')
 
     async def corovalu(self, x, y):
         return x * 2 + y
@@ -132,6 +140,9 @@ class TeleApi:
     def getFooBar(self, x, y):
         return x - y
 
+    def genGetFooBar(self, x, y):
+        yield self.getFooBar(x, y)
+
     async def customshare(self):
         return await CustomShare.anit(self.link, 42)
 
@@ -154,6 +165,11 @@ class TeleAware(s_telepath.Aware):
 
         return self._initBeep(path[0])
 
+    async def getTeleFeats(self):
+        return {
+            'aware': 1,
+        }
+
 class TeleAuth(s_telepath.Aware):
 
     def getTeleApi(self, link, mesg, path):
@@ -173,15 +189,39 @@ class TeleAuth(s_telepath.Aware):
     def getFooBar(self, x, y):
         return x + y
 
-class ConsulV1Handler(s_httpapi.Handler):
-    '''Fake Hashicorp Consul /v1/catalog/service/:service: handler'''
-    async def get(self, servicename):
-        data = self.cell.consul_data
-        if servicename != data[0].get('ServiceName'):
-            self.set_header('Content-Type', 'application/json')
-            return self.write(json.dumps([]))
-        self.set_header('Content-Type', 'application/json')
-        return self.write(json.dumps(data))
+def run_telepath_sync_genr_break(url: str,
+                      evt1: multiprocessing.Event,
+                      evt2: multiprocessing.Event,):
+    '''
+    This is a Process target.
+    '''
+    with s_telepath.openurl(url) as prox:
+        form = 'test:int'
+
+        q = '[' + ' '.join([f'{form}={i}' for i in range(10)]) + ' ]'
+
+        # This puts a link into the link pool
+        emesg = 12
+        msgs = list(prox.storm(q, opts={'show': ('node', 'nodeedits')}))
+        assert len(msgs) == emesg, f'Got {len(msgs)} messages, expected {emesg}'
+
+        # Get the link from the pool, add the fini callback and put it back
+        # This involves reaching into the proxy internals to do so.
+        link = prox.links.popleft()
+        link.onfini(evt1.set)
+        prox.links.append(link)
+
+        # Break from the generator right away, causing a
+        # GeneratorExit in the GenrHelp object __iter__ method.
+        mesg = None
+        for mesg in prox.storm(q):
+            break
+        # Ensure the query did yield an object
+        assert mesg is not None, 'mesg was not recieved!'
+        assert link.isfini is True, 'link.fini was not set to true'
+
+        evt2.set()
+        sys.exit(137)
 
 class TeleTest(s_t_utils.SynTest):
 
@@ -205,7 +245,8 @@ class TeleTest(s_t_utils.SynTest):
 
             dmon.share('foo', foo)
 
-            await self.asyncraises(s_exc.BadUrl, s_telepath.openurl('noscheme/foo'))
+            with self.raises(s_exc.BadUrl):
+                await s_telepath.openurl('noscheme/foo')
 
             with self.raises(s_exc.BadArg):
                 await s_telepath.openurl(10)
@@ -239,11 +280,13 @@ class TeleTest(s_t_utils.SynTest):
             # Add an additional prox.fini handler.
             prox.onfini(evt.set)
 
-            # check a standard return value
-            self.eq(30, await prox.bar(10, 20))
+            with mock.patch('synapse.lib.link.MAXWRITE', 2):
 
-            # check a coroutine return value
-            self.eq(25, await prox.corovalu(10, 5))
+                # check a standard return value
+                self.eq(30, await prox.bar(10, 20))
+
+                # check a coroutine return value
+                self.eq(25, await prox.corovalu(10, 5))
 
             # check a generator return channel
             genr = await prox.genr()
@@ -252,27 +295,61 @@ class TeleTest(s_t_utils.SynTest):
 
             # check generator explodes channel
             genr = await prox.genrboom()
-            await self.asyncraises(s_exc.SynErr, genr.list())
+            with self.raises(s_exc.SynErr):
+                await genr.list()
 
             # check an async generator return channel
             genr = prox.corogenr(3)
             self.true(isinstance(genr, s_telepath.GenrIter))
-            self.eq((0, 1, 2), await alist(genr))
+            self.eq((0, 1, 2), await s_t_utils.alist(genr))
 
             # check async generator explodes channel
             genr = prox.agenrboom()
-            await self.asyncraises(s_exc.SynErr, genr.list())
+            with self.raises(s_exc.SynErr):
+                await genr.list()
 
-            await self.asyncraises(s_exc.NoSuchMeth, prox.raze())
+            with self.raises(s_exc.SynErr) as cm:
+                await prox.raze()
+            self.eq(cm.exception.get('mesg'), 'hehe')
+            self.eq(cm.exception.get('key'), 'valu')
 
-            await self.asyncraises(s_exc.NoSuchMeth, prox.fake())
+            with self.raises(s_exc.NoSuchMeth) as cm:
+                await prox.fake()
+            self.eq(cm.exception.get('mesg'), 'Foo has no method: fake.')
+            self.eq(cm.exception.get('name'), 'fake')
 
-            await self.asyncraises(s_exc.SynErr, prox.boom())
+            with self.raises(s_exc.NoSuchMeth) as cm:
+                await prox._fake()
+            self.eq(cm.exception.get('mesg'), 'Foo has no method: _fake.')
+            self.eq(cm.exception.get('name'), '_fake')
+
+            with self.raises(s_exc.NotMsgpackSafe) as cm:
+                await prox.boom()
+            self.isin("can not serialize 'Boom' object", cm.exception.get('mesg'))
 
         # Fini'ing a daemon fini's proxies connected to it.
         self.true(await s_coro.event_wait(evt, 2))
         self.true(prox.isfini)
-        await self.asyncraises(s_exc.IsFini, prox.bar((10, 20)))
+        with self.raises(s_exc.IsFini):
+            await prox.bar((10, 20))
+
+    async def test_telepath_openinfo_cell(self):
+        with self.getTestDir() as dirn:
+            async with self.getTestCore(dirn=dirn) as core:
+
+                layr00 = core.getView().layers[0]
+
+                async with await s_telepath.openurl(f'cell://root@{dirn}:*', name=f'*/layer/{layr00.iden}') as layer:
+                    self.eq(layr00.iden, await layer.getIden())
+
+    async def test_telepath_openinfo_unix(self):
+        with self.getTestDir() as dirn:
+            async with self.getTestCore(dirn=dirn) as core:
+
+                layr00 = core.getView().layers[0]
+
+                async with await s_telepath.openurl(f'unix://root@{dirn}/sock:*', name=f'*/layer/{layr00.iden}') as layer:
+                    self.eq(layr00.iden, await layer.getIden())
 
     async def test_telepath_sync_genr(self):
 
@@ -288,43 +365,20 @@ class TeleTest(s_t_utils.SynTest):
             async with await s_telepath.openurl('tcp://127.0.0.1/foo', port=dmon.addr[1]) as prox:
                 self.eq((10, 20, 30), await s_coro.executor(sync))
 
-    def test_telepath_sync_genr_break(self):
+    async def test_telepath_sync_genr_break(self):
+        async with self.getTestCore() as core:
+            url = core.getLocalUrl()
 
-        try:
-            acm = self.getTestCoreAndProxy()
-            core, proxy = s_glob.sync(acm.__aenter__())
+            ctx = multiprocessing.get_context('spawn')
+            evt1 = ctx.Event()
+            evt2 = ctx.Event()
+            proc = ctx.Process(target=run_telepath_sync_genr_break, args=(url, evt1, evt2))
+            proc.start()
 
-            form = 'test:int'
-
-            q = '[' + ' '.join([f'{form}={i}' for i in range(10)]) + ' ]'
-
-            # This puts a link into the link pool
-            podes = list(proxy.eval(q))
-            self.len(10, podes)
-
-            evt = threading.Event()
-
-            # Get the link from the pool, add the fini callback and put it back
-            link = s_glob.sync(proxy.getPoolLink())
-            link.onfini(evt.set)
-            s_glob.sync(proxy._putPoolLink(link))
-
-            q = f'{form} | sleep 0.1'
-
-            # Break from the generator right away, causing a
-            # GeneratorExit in the GenrHelp object __iter__ method.
-            pode = None
-            for pode in proxy.eval(q):
-                break
-            # Ensure the query did yield an object
-            self.nn(pode)
-
-            # Ensure the link we have a reference too was torn down
-            self.true(evt.wait(4))
-            self.true(link.isfini)
-
-        finally:
-            s_glob.sync(acm.__aexit__(None, None, None))
+            self.true(await s_coro.executor(evt1.wait, timeout=30))
+            self.true(await s_coro.executor(evt2.wait, timeout=30))
+            proc.join(timeout=30)
+            self.eq(proc.exitcode, 137)
 
     async def test_telepath_no_sess(self):
 
@@ -335,7 +389,8 @@ class TeleTest(s_t_utils.SynTest):
 
             dmon.share('foo', foo)
 
-            await self.asyncraises(s_exc.BadUrl, s_telepath.openurl('noscheme/foo'))
+            with self.raises(s_exc.BadUrl):
+                await s_telepath.openurl('noscheme/foo')
 
             async with await s_telepath.openurl('tcp://127.0.0.1/foo', port=dmon.addr[1]) as prox:
 
@@ -352,22 +407,29 @@ class TeleTest(s_t_utils.SynTest):
 
                 # check a generator return channel
                 genr = await prox.genr()
-                self.eq((10, 20, 30), await alist(genr))
+                self.eq((10, 20, 30), await s_t_utils.alist(genr))
 
                 # check an async generator return channel
                 genr = prox.corogenr(3)
-                self.eq((0, 1, 2), await alist(genr))
+                self.eq((0, 1, 2), await s_t_utils.alist(genr))
 
-                await self.asyncraises(s_exc.NoSuchMeth, prox.raze())
+                with self.raises(s_exc.SynErr):
+                    await prox.raze()
 
-                await self.asyncraises(s_exc.NoSuchMeth, prox.fake())
+                with self.raises(s_exc.NoSuchMeth):
+                    await prox.fake()
 
-                await self.asyncraises(s_exc.SynErr, prox.boom())
+                with self.raises(s_exc.NoSuchMeth):
+                    await prox._fake()
+
+                with self.raises(s_exc.SynErr):
+                    await prox.boom()
 
             # Fini'ing a daemon fini's proxies connected to it.
             self.true(await s_coro.event_wait(evt, 2))
             self.true(prox.isfini)
-            await self.asyncraises(s_exc.IsFini, prox.bar((10, 20)))
+            with self.raises(s_exc.IsFini):
+                await prox.bar((10, 20))
 
     async def test_telepath_tls_bad_cert(self):
         self.thisHostMustNot(platform='darwin')
@@ -385,8 +447,8 @@ class TeleTest(s_t_utils.SynTest):
             dmon.share('foo', foo)
 
             # host cert is *NOT* signed by a CA that client recognizes
-            await self.asyncraises(ssl.SSLCertVerificationError,
-                                   s_telepath.openurl(f'ssl://{hostname}/foo', port=addr[1]))
+            with self.raises(ssl.SSLCertVerificationError):
+                await s_telepath.openurl(f'ssl://{hostname}/foo', port=addr[1])
 
     async def test_telepath_tls_certhash(self):
 
@@ -407,7 +469,7 @@ class TeleTest(s_t_utils.SynTest):
                 hostkey, hostcert = certdir.genHostCert(hostname, signas='loopy')
                 self.none(certdir.getHostCertHash('newp.newp.newp'))
 
-                certhash = hostcert.digest('sha256').decode().lower().replace(':', '')
+                certhash = s_common.ehex(hostcert.fingerprint(c_hashes.SHA256()))
 
                 host, port = await dmon.listen(f'ssl://{hostname}:0')
                 dmon.share('foo', foo)
@@ -424,7 +486,146 @@ class TeleTest(s_t_utils.SynTest):
 
                 # still not, but we specify a certhash for the exact server certificate
                 async with await s_telepath.openurl(f'ssl://{hostname}/foo', port=port, certhash=certhash) as foo:
+
+                    foo.link.set('certhash', 'deadb33f')
+                    # Ensure that the certhash for the pool link creation matches ( and fails here! )
+                    with self.raises(s_exc.LinkBadCert):
+                        await foo.echo('woot')
+
+                    # With the correct certhash on link.info it works as expected.
+                    foo.link.set('certhash', certhash)
                     self.eq('woot', await foo.echo('woot'))
+
+    async def test_telepath_tls_certhash_shared_ctx(self):
+        # One SSLContext is shared across a proxy pool's links ( see
+        # Proxy._initPoolLink ), so the certhash check must read the peer cert
+        # from each connection's own ssl object. Prove that holds under many
+        # concurrent handshakes to different-cert servers over one SSLContext.
+
+        self.thisHostMustNot(platform='darwin')
+
+        hostname = socket.gethostname()
+
+        with self.getTestDir() as dirn:
+
+            patha = (s_common.gendir(dirn, 'certsa'),)
+            pathb = (s_common.gendir(dirn, 'certsb'),)
+
+            certdira = s_certdir.CertDir(path=patha)
+            certdirb = s_certdir.CertDir(path=pathb)
+
+            certdira.genCaCert('loopya')
+            certdirb.genCaCert('loopyb')
+
+            _, hostcerta = certdira.genHostCert(hostname, signas='loopya')
+            _, hostcertb = certdirb.genHostCert(hostname, signas='loopyb')
+
+            hasha = s_common.ehex(hostcerta.fingerprint(c_hashes.SHA256()))
+            hashb = s_common.ehex(hostcertb.fingerprint(c_hashes.SHA256()))
+
+            # two servers on the same host with distinct certs / certhashes
+            self.ne(hasha, hashb)
+
+            async with await s_daemon.Daemon.anit(certdir=certdira) as dmona:
+                async with await s_daemon.Daemon.anit(certdir=certdirb) as dmonb:
+
+                    _, porta = await dmona.listen(f'ssl://{hostname}:0')
+                    _, portb = await dmonb.listen(f'ssl://{hostname}:0')
+
+                    # a single SSLContext shared across every connection, exactly
+                    # as a telepath proxy link pool reuses self.link['ssl'].
+                    sslctx = ssl.create_default_context()
+                    sslctx.check_hostname = False
+                    sslctx.verify_mode = ssl.CERT_NONE
+
+                    async def openlink(port, certhash):
+                        info = {'certhash': certhash, 'hostname': hostname}
+                        return await s_link.connect(hostname, port, ssl=sslctx, linkinfo=info)
+
+                    # interleave many concurrent handshakes to BOTH servers over
+                    # the one shared context; each link must pin its own peer cert.
+                    coros = []
+                    for _ in range(20):
+                        coros.append(openlink(porta, hasha))
+                        coros.append(openlink(portb, hashb))
+
+                    links = await asyncio.gather(*coros)
+                    self.len(40, links)
+                    for link in links:
+                        self.false(link.isfini)
+                        await link.fini()
+
+                    # a mismatched pin still fails, even while sharing the context
+                    # concurrently ( no cross-connection cert leakage ).
+                    errs = await asyncio.gather(
+                        openlink(porta, hashb),
+                        openlink(portb, hasha),
+                        return_exceptions=True,
+                    )
+                    for err in errs:
+                        self.isinstance(err, s_exc.LinkBadCert)
+
+    async def test_telepath_tls_certhash_pool_concurrent(self):
+        # The same invariant, but driven through the SSLContext that openinfo()
+        # actually builds for a certhash URL and reuses for every pool link.
+
+        self.thisHostMustNot(platform='darwin')
+
+        foo = Foo()
+        hostname = socket.gethostname()
+
+        with self.getTestDir() as dirn:
+
+            patha = (s_common.gendir(dirn, 'certsa'),)
+            pathb = (s_common.gendir(dirn, 'certsb'),)
+
+            certdira = s_certdir.CertDir(path=patha)
+            certdirb = s_certdir.CertDir(path=pathb)
+
+            certdira.genCaCert('loopya')
+            certdirb.genCaCert('loopyb')
+
+            _, hostcerta = certdira.genHostCert(hostname, signas='loopya')
+            _, hostcertb = certdirb.genHostCert(hostname, signas='loopyb')
+
+            hasha = s_common.ehex(hostcerta.fingerprint(c_hashes.SHA256()))
+            hashb = s_common.ehex(hostcertb.fingerprint(c_hashes.SHA256()))
+
+            self.ne(hasha, hashb)
+
+            async with await s_daemon.Daemon.anit(certdir=certdira) as dmona:
+                async with await s_daemon.Daemon.anit(certdir=certdirb) as dmonb:
+
+                    _, porta = await dmona.listen(f'ssl://{hostname}:0')
+                    _, portb = await dmonb.listen(f'ssl://{hostname}:0')
+
+                    dmona.share('foo', foo)
+
+                    url = f'ssl://{hostname}/foo'
+                    async with await s_telepath.openurl(url, port=porta, certhash=hasha) as prox:
+
+                        # the context openinfo() built, which every pool link reuses
+                        sslctx = prox.link.get('ssl')
+
+                        async def openlink(port, certhash):
+                            info = {'certhash': certhash, 'hostname': hostname}
+                            return await s_link.connect(hostname, port, ssl=sslctx, linkinfo=info)
+
+                        # pool links to server A race handshakes to server B over the
+                        # one context. each must validate against its own peer cert.
+                        coros = []
+                        for _ in range(20):
+                            coros.append(prox._initPoolLink())
+                            coros.append(openlink(portb, hashb))
+
+                        links = await asyncio.gather(*coros)
+                        self.len(40, links)
+                        for link in links:
+                            self.false(link.isfini)
+                            await link.fini()
+
+                        # the proxy is still usable over a fresh pool link
+                        self.eq('woot', await prox.echo('woot'))
 
     async def test_telepath_ssl_client_cert(self):
 
@@ -439,12 +640,12 @@ class TeleTest(s_t_utils.SynTest):
             dmon.share('foo', foo)
 
             with self.raises(s_exc.LinkShutDown):
-                await s_telepath.openurl(f'ssl://localhost/foo', port=port, certdir=dmon.certdir)
+                await s_telepath.openurl('ssl://localhost/foo', port=port, certdir=dmon.certdir)
 
-            async with await s_telepath.openurl(f'ssl://localhost/foo?certname=visi', port=port, certdir=dmon.certdir) as proxy:
+            async with await s_telepath.openurl('ssl://localhost/foo?certname=visi', port=port, certdir=dmon.certdir) as proxy:
                 self.eq(20, await proxy.bar(15, 5))
 
-            async with await s_telepath.openurl(f'ssl://visi@localhost/foo', port=port, certdir=dmon.certdir) as proxy:
+            async with await s_telepath.openurl('ssl://visi@localhost/foo', port=port, certdir=dmon.certdir) as proxy:
                 self.eq(20, await proxy.bar(15, 5))
 
     async def test_telepath_tls(self):
@@ -485,17 +686,17 @@ class TeleTest(s_t_utils.SynTest):
             dmon.certdir.genHostCert('nolisten')
 
             dmon.share('foo', foo)
-            addr = await dmon.listen(f'ssl://127.0.0.1:0?hostname=hehe,haha')
+            addr = await dmon.listen('ssl://127.0.0.1:0?hostname=hehe,haha')
 
-            async with await s_telepath.openurl(f'ssl://127.0.0.1/foo?hostname=hehe', port=addr[1]) as prox:
+            async with await s_telepath.openurl('ssl://127.0.0.1/foo?hostname=hehe', port=addr[1]) as prox:
                 self.eq(30, await prox.bar(10, 20))
 
-            async with await s_telepath.openurl(f'ssl://127.0.0.1/foo?hostname=haha', port=addr[1]) as prox:
+            async with await s_telepath.openurl('ssl://127.0.0.1/foo?hostname=haha', port=addr[1]) as prox:
                 self.eq(30, await prox.bar(10, 20))
 
             # Default does not match expected hostname
             with self.raises(s_exc.BadCertHost) as cm:
-                url = f'ssl://127.0.0.1/foo?hostname=nolisten'
+                url = 'ssl://127.0.0.1/foo?hostname=nolisten'
                 async with await s_telepath.openurl(url, port=addr[1]) as prox:
                     pass
             mesg = cm.exception.get('mesg')
@@ -530,7 +731,8 @@ class TeleTest(s_t_utils.SynTest):
                 self.eq([0, 1, 2], [x async for x in genr])
 
                 aitr = prox.corogenr('fred').__aiter__()
-                await self.asyncraises(s_exc.SynErr, aitr.__anext__())
+                with self.raises(s_exc.SynErr):
+                    await aitr.__anext__()
 
                 aitr = prox.corogenr(3).__aiter__()
                 await aitr.__anext__()
@@ -544,7 +746,9 @@ class TeleTest(s_t_utils.SynTest):
 
                 task = dmon.schedCoro(longwaiter())
 
-            await self.asyncraises(s_exc.LinkShutDown, aitr.__anext__())
+            with self.raises(s_exc.LinkShutDown):
+                await aitr.__anext__()
+
             start_event.set()
 
             # Test that a coroutine about to await on an async proxy method doesn't become "stuck" by awaiting on a
@@ -553,7 +757,8 @@ class TeleTest(s_t_utils.SynTest):
             # Give the longwaiter a chance to run
             await asyncio.sleep(.1)
 
-            await self.asyncraises(s_exc.IsFini, asyncio.wait_for(task, timeout=2))
+            with self.raises(s_exc.IsFini):
+                await asyncio.wait_for(task, timeout=2)
 
     async def test_telepath_asyncgenr_early_term(self):
 
@@ -581,6 +786,50 @@ class TeleTest(s_t_utils.SynTest):
                                 await list(dmon.links)[0].fini()
 
                 self.eq(retn, [0, 1, 2])
+
+    async def test_telepath_genriter_aclose(self):
+
+        foo = Foo()
+
+        async with self.getTestDmon() as dmon:
+
+            dmon.share('foo', foo)
+
+            async with await s_telepath.openurl('tcp://127.0.0.1/foo', port=dmon.addr[1]) as prox:
+
+                # aclose() after full iteration must not raise
+                genr = prox.corogenr(3)
+                self.true(isinstance(genr, s_telepath.GenrIter))
+                self.eq([0, 1, 2], [x async for x in genr])
+                await genr.aclose()
+
+                # aclose() with no iteration at all must be a safe no-op
+                genr = prox.corogenr(3)
+                await genr.aclose()
+
+                # aclose() after partial iteration must tear down the remote
+                # generator (rather than raising AttributeError, as it would
+                # for the un-fixed GenrIter)
+                genr = prox.sleepg(t=60)
+                aitr = genr.__aiter__()
+                self.eq(('init', {}), await aitr.__anext__())
+
+                await genr.aclose()
+
+                self.true(await asyncio.wait_for(foo.sleepg_evt.wait(), timeout=6))
+
+    async def test_telepath_genriter_none_result(self):
+
+        # If proxy.task() resolves to a plain None result for a genr call
+        # (e.g. a stale/mismatched 'genr' methinfo flag causing the peer to
+        # reply via t2:fini instead of opening a genr channel), the async
+        # generator must end iteration cleanly rather than raise.
+        class NoneTaskProxy:
+            async def task(self, todo, name=None):
+                return None
+
+        genr = s_telepath.GenrIter(NoneTaskProxy(), ('meth', (), {}), None)
+        self.eq([], await genr.list())
 
     async def test_telepath_blocking(self):
         ''' Make sure that async methods on the same proxy don't block each other '''
@@ -634,7 +883,15 @@ class TeleTest(s_t_utils.SynTest):
                 self.len(1, snfo)
                 self.eq(snfo[0].get('items'), {None: 'synapse.tests.test_telepath.TeleApi'})
 
+                self.true(proxy._hasTeleFeat('aware'))
+                self.false(proxy._hasTeleFeat('aware', vers=2))
+                self.false(proxy._hasTeleFeat('newp'))
+
+                self.true(proxy._hasTeleMeth('getFooBar'))
+                self.false(proxy._hasTeleMeth('getBarBaz'))
+
                 self.eq(10, await proxy.getFooBar(20, 10))
+                self.eq([10], [m async for m in await proxy.genGetFooBar(20, 10)])
 
                 # check a custom share works
                 obj = await proxy.customshare()
@@ -671,12 +928,19 @@ class TeleTest(s_t_utils.SynTest):
                          key: 'synapse.tests.test_telepath.CustomShare'})
 
                 # and we can still use the first obj we made
-                ret = await alist(obj.custgenr(3))
+                ret = await s_t_utils.alist(obj.custgenr(3))
                 self.eq(ret, [0, 1, 2])
 
             # check that a dynamic share works
             async with await self.getTestProxy(dmon, 'woke/up') as proxy:
+                self.isin('synapse.tests.test_telepath.Beep', proxy._getClasses())
+                self.notin('synapse.tests.test_telepath.TeleApi', proxy._getClasses())
                 self.eq('up: beep', await proxy.beep())
+                self.eq(['up: beep'], [m async for m in await proxy.genbeep()])
+                # Telepath features are a function of the base object, not the result of getTeleApi
+                self.true(proxy._hasTeleFeat('aware'))
+                self.false(proxy._hasTeleFeat('aware', vers=2))
+                self.false(proxy._hasTeleFeat('newp'))
 
     async def test_telepath_auth(self):
 
@@ -686,10 +950,12 @@ class TeleTest(s_t_utils.SynTest):
             host, port = dmon.addr
 
             url = 'tcp://localhost/auth'
-            await self.asyncraises(s_exc.AuthDeny, s_telepath.openurl(url, port=port))
+            with self.raises(s_exc.AuthDeny):
+                await s_telepath.openurl(url, port=port)
 
             url = 'tcp://visi@localhost/auth'
-            await self.asyncraises(s_exc.AuthDeny, s_telepath.openurl(url, port=port))
+            with self.raises(s_exc.AuthDeny):
+                await s_telepath.openurl(url, port=port)
 
             url = 'tcp://visi:secretsauce@localhost/auth'
             async with await s_telepath.openurl(url, port=port) as proxy:
@@ -703,7 +969,8 @@ class TeleTest(s_t_utils.SynTest):
 
             host, port = await dmon.listen('tcp://127.0.0.1:0/')
 
-            await self.asyncraises(s_exc.BadMesgVers, s_telepath.openurl('tcp://127.0.0.1/', port=port))
+            with self.raises(s_exc.BadMesgVers):
+                await s_telepath.openurl('tcp://127.0.0.1/', port=port)
 
     async def test_alias(self):
 
@@ -782,9 +1049,20 @@ class TeleTest(s_t_utils.SynTest):
                             {'family': 'unix',
                              'addr': sockpath})
 
+    async def test_url_bad_cell_path(self):
+        with self.getTestDir() as dirn:
+            # Touch the sock path
+            s_common.genfile(dirn, 'newp', 'sock').close()
+            cell_url = f'cell://{dirn}/newp'
+            with self.raises(s_exc.LinkErr) as cm:
+                await s_telepath.openurl(cell_url)
+            self.isin('Cell path is not listening', cm.exception.get('mesg'))
+        with self.raises(s_exc.NoSuchPath) as cm:
+            await s_telepath.openurl(cell_url)
+        self.isin('Cell path does not exist', cm.exception.get('mesg'))
+
     async def test_ipv6(self):
-        if s_common.envbool('CIRCLECI'):
-            self.skip('ipv6 listener is not supported in circleci')
+        self.thisEnvMustNot('CIRCLECI')  # ipv6 listener not supported in circleci
 
         foo = Foo()
 
@@ -808,79 +1086,6 @@ class TeleTest(s_t_utils.SynTest):
 
                 # check a standard return value
                 self.eq(30, await prox.bar(10, 20))
-
-    async def test_telepath_client_redir(self):
-
-        class TestRedir(s_telepath.Aware):
-
-            def __init__(self, valu, redir=None):
-                self.valu = valu
-                self.redir = redir
-
-            def getTeleApi(self, link, mesg, path):
-                if self.redir is not None:
-                    raise s_exc.TeleRedir(url=self.redir)
-                return self
-
-            async def dostuff(self, x):
-
-                if self.redir:
-                    raise s_exc.TeleRedir(url=self.redir)
-
-                return x + self.valu
-
-        dmon0 = await s_daemon.Daemon.anit()
-        dmon1 = await s_daemon.Daemon.anit()
-
-        addr0 = await dmon0.listen('tcp://127.0.0.1:0/')
-        addr1 = await dmon1.listen('tcp://127.0.0.1:0/')
-
-        url0 = f'tcp://127.0.0.1:{addr0[1]}/foo'
-        url1 = f'tcp://127.0.0.1:{addr1[1]}/foo'
-
-        rdir0 = TestRedir(10)
-        rdir1 = TestRedir(20, redir=url0)
-
-        dmon0.share('foo', rdir0)
-        dmon1.share('foo', rdir1)
-
-        async with await s_telepath.Client.anit(url0) as targ:
-
-            with self.raises(s_exc.NotReady):
-                targ.dostuff(100)
-
-            await targ.waitready()
-            proxy = await targ.proxy()
-            self.eq(proxy._getSynVers(), s_version.version)
-
-            # Client implements some base helpers the proxy does
-            self.eq(targ._getSynVers(), s_version.version)
-            self.eq(targ._getSynCommit(), s_version.commit)
-            self.eq(targ._getClasses(),
-                    ('synapse.tests.test_telepath.TestRedir',
-                     'synapse.telepath.Aware'))
-            # client works as a passthrough to the proxy
-            self.eq(110, await targ.dostuff(100))
-
-        # this should get redirected to url0...
-        async with await s_telepath.Client.anit(url1) as targ:
-            await targ.waitready()
-            self.eq(110, await targ.dostuff(100))
-
-        # fake out the redirect to connect, then redirect on call...
-        rdir1.redir = None
-        async with await s_telepath.Client.anit(url1) as targ:
-            await targ.waitready()
-            self.eq(120, await targ.dostuff(100))
-            rdir1.redir = url0
-            self.eq(110, await targ.dostuff(100))
-
-        # client is now fini and methods on longer work
-        with self.raises(s_exc.IsFini):
-            await targ.dostuff(100)
-
-        await dmon0.fini()
-        await dmon1.fini()
 
     async def test_telepath_client_failover(self):
 
@@ -909,37 +1114,64 @@ class TeleTest(s_t_utils.SynTest):
 
         urls = (url0, url1)
 
-        async with await s_telepath.Client.anit(urls) as targ:
+        async with await s_telepath.open(urls) as targ:
 
             await targ.waitready()
 
-            self.eq(110, await targ.dostuff(100))
+            prox00 = await targ.proxy(timeout=12)
+            self.eq(110, await prox00.dostuff(100))
+
             self.eq(1, fail0.count)
             self.eq(0, fail1.count)
 
             await dmon0.fini()
+            self.true(await prox00.waitfini(10))
 
-            self.eq(110, await targ.dostuff(100))
+            prox01 = await targ.proxy(timeout=12)
+            self.eq(110, await prox01.dostuff(100))
             self.eq(1, fail0.count)
             self.eq(1, fail1.count)
 
-        async with await s_telepath.Client.anit(urls) as targ:
+        async with await s_telepath.open(urls) as targ:
 
-            with self.getAsyncLoggerStream('synapse.telepath', 'Connect call failed') as stream:
+            with self.getLoggerStream('synapse.telepath') as stream:
 
                 await targ.waitready()
 
                 # Verify the password doesn't leak into the log
-                self.true(await stream.wait(2))
-                stream.seek(0)
-                mesgs = stream.read()
+                await stream.expect('Connect call failed', timeout=2)
+                mesgs = stream.getvalue()
                 self.notin('password', mesgs)
 
-            self.eq(110, await targ.dostuff(100))
+            prox00 = await targ.proxy(timeout=12)
+            self.eq(110, await prox00.dostuff(100))
 
             self.eq(1, fail0.count)
             self.eq(2, fail1.count)
 
+        async with await s_telepath.open(url1) as targ:
+            await targ.waitready(timeout=12)
+            prox00 = await targ.proxy(timeout=12)
+            self.eq(110, await prox00.dostuff(100))
+
+        async def onlink(proxy, urlinfo):
+            self.eq(110, await proxy.dostuff(100))
+            _url = s_telepath.zipurl(urlinfo)
+            logger.info(f'Connected to url={_url}')
+
+        with self.getLoggerStream('synapse.tests.test_telepath') as stream:
+            async with await s_telepath.open(url1, onlink=onlink) as targ:
+                await stream.expect(f'Connected to url=tcp://127.0.0.1:{addr1[1]}/foo', timeout=12)
+
+        # Coverage
+        async def badonlink(proxy, urlinfo):
+            raise ValueError('oopsie')
+
+        with self.getLoggerStream('synapse.telepath') as stream:
+            async with await s_telepath.open(url1, onlink=badonlink) as targ:
+                await stream.expect('onlink: ', timeout=12)
+
+        await dmon0.fini()
         await dmon1.fini()
 
     async def test_telepath_poolsize(self):
@@ -955,7 +1187,6 @@ class TeleTest(s_t_utils.SynTest):
 
             # Validate the Proxy behavior then the client override
             prox = await s_telepath.openurl(url)  # type: Foo
-            prox._link_poolsize = 2
 
             # Start with no links
             self.len(0, prox.links)
@@ -967,53 +1198,76 @@ class TeleTest(s_t_utils.SynTest):
             genr = await prox.genr()  # type: s_coro.GenrHelp
             self.eq(await genr.genr.__anext__(), 10)
 
-            # The link is being used by the genr
-            self.len(0, prox.links)
+            # A new link is in the pool
+            self.len(1, prox.links)
 
-            # and upon exhuastion, that link is put back
+            # and upon exhuastion, the first link is put back
             self.eq(await genr.list(), (20, 30))
-            self.len(1, prox.links)
-            self.true(prox.links[0] is l0)
+            self.len(2, prox.links)
+            self.true(prox.links[1] is l0)
 
-            # Grab the existing link, then do two more calls
-            genr0 = await prox.genr()  # contains l0
-            genr1 = await prox.genr()
-            genr2 = await prox.genr()
-            self.len(0, prox.links)
-            # Consume two of the three generators
-            self.eq(await genr2.list(), (10, 20, 30))
-            self.len(1, prox.links)
-            self.eq(await genr1.list(), (10, 20, 30))
+            # Grabbing a link will still spin up another since we are below low watermark
+            genr = await prox.genr()  # type: s_coro.GenrHelp
+            self.eq(await genr.genr.__anext__(), 10)
+
             self.len(2, prox.links)
-            # Exhausting the lsat generator results in his
-            # link not being placed back into the pool
-            self.eq(await genr0.list(), (10, 20, 30))
-            self.len(2, prox.links)
-            links = set(lnk for lnk in prox.links)
-            self.notin(l0, links)
-            # And that link l0 has been fini'd
-            self.true(l0.isfini)
+
+            self.eq(await genr.list(), (20, 30))
+            self.len(3, prox.links)
+
+            # Fill up pool above low watermark
+            genrs = [await prox.genr() for _ in range(2)]
+            [await genr.list() for genr in genrs]
+            self.len(5, prox.links)
+
+            # Grabbing a link no longer spins up a replacement
+            genr = await prox.genr()  # type: s_coro.GenrHelp
+            self.eq(await genr.genr.__anext__(), 10)
+            self.len(4, prox.links)
+
+            self.eq(await genr.list(), (20, 30))
+            self.len(5, prox.links)
 
             # Tear down a link by hand and place it back
             # into the pool - that will fail b/c the link
             # has been down down.
             l1 = await prox.getPoolLink()
-            self.len(1, prox.links)
+            self.len(4, prox.links)
             await l1.fini()
             await prox._putPoolLink(l1)
-            self.len(1, prox.links)
+            self.len(4, prox.links)
 
             # And all our links are torn down on fini
             await prox.fini()
-            self.len(1, prox.links)
-            for link in prox.links:
-                self.true(link.isfini)
+            self.len(4, prox.links)
+            for link in list(prox.links):
+                self.true(await link.waitfini(1))
+            self.len(0, prox.links)
 
-            # The telepath Client passes through this value as a configuration parameter
-            conf = {'link_poolsize': 2, 'timeout': 2}
-            async with await s_telepath.Client.anit(url, conf=conf) as client:
-                await client.waitready()
-                self.true(client._t_proxy._link_poolsize, 2)
+        with mock.patch('synapse.telepath.LINK_CULL_INTERVAL', 1):
+            async with self.getTestDmon() as dmon:
+                dmon.share('foo', foo)
+                url = f'tcp://127.0.0.1:{dmon.addr[1]}/foo'
+
+                prox = await s_telepath.openurl(url)
+
+                # Fill up pool above high watermark
+                genrs = [await prox.genr() for _ in range(13)]
+                [await genr.list() for genr in genrs]
+                self.len(13, prox.links)
+
+                # Add a fini'd proxy for coverage
+                prox2 = await s_telepath.openurl(url)
+                await prox2.fini()
+                prox2._all_proxies.add(prox2)
+
+                wait = prox.waiter(1, 'pool:link:fini')
+                self.len(1, await wait.wait(timeout=5))
+                self.len(12, prox.links)
+
+                # Cleanup our global state
+                prox2._all_proxies.remove(prox2)
+                await prox.fini()
 
     async def test_link_fini_breaking_tasks(self):
         foo = Foo()
@@ -1024,8 +1278,7 @@ class TeleTest(s_t_utils.SynTest):
 
             async with await s_telepath.openurl(url) as proxy:
 
-                with self.getAsyncLoggerStream('synapse.daemon',
-                                               'task sleepg') as stream:
+                with self.getLoggerStream('synapse.daemon') as stream:
 
                     # Fire up an async generator which will yield a message then
                     # wait for a while so that our break will tear it down
@@ -1036,7 +1289,7 @@ class TeleTest(s_t_utils.SynTest):
                     # Ensure that the sleepg function got canceled.
                     self.true(await asyncio.wait_for(foo.sleepg_evt.wait(), timeout=6))
                     # Ensure we logged the cancellation.
-                    self.true(await stream.wait(6))
+                    await stream.expect('task sleepg', timeout=6)
 
     async def test_link_fini_breaking_tasks2(self):
         '''
@@ -1056,143 +1309,8 @@ class TeleTest(s_t_utils.SynTest):
             self.true(await s_coro.event_wait(foo.simplesleep_evt, 2))
             await prox.fini()
 
-            await self.asyncraises(s_exc.LinkShutDown, task)
-
-    async def test_discovery_consul(self):
-
-        # Example data from https://www.consul.io/api/catalog.html
-        consul_data = [
-            {
-                "ID": "40e4a748-2192-161a-0510-9bf59fe950b5",
-                "Node": "foobar",
-                "Address": "192.168.10.10",
-                "Datacenter": "dc1",
-                "TaggedAddresses": {
-                    "lan": "192.168.10.10",
-                    "wan": "10.0.10.10"
-                },
-                "NodeMeta": {
-                    "somekey": "somevalue"
-                },
-                "CreateIndex": 51,
-                "ModifyIndex": 51,
-                "ServiceAddress": "172.17.0.3",
-                "ServiceEnableTagOverride": False,
-                "ServiceID": "32a2a47f7992:nodea:5000",
-                "ServiceName": "foobar",
-                "ServicePort": 5000,
-                "ServiceMeta": {
-                    "foobar_meta_value": "baz"
-                },
-                "ServiceTaggedAddresses": {
-                    "lan": {
-                        "address": "172.17.0.3",
-                        "port": 5000
-                    },
-                    "wan": {
-                        "address": "198.18.0.1",
-                        "port": 512
-                    }
-                },
-                "ServiceTags": [
-                    "tacos"
-                ],
-                "ServiceProxy": {
-                    "DestinationServiceName": "",
-                    "DestinationServiceID": "",
-                    "LocalServiceAddress": "",
-                    "LocalServicePort": 0,
-                    "Config": None,
-                    "Upstreams": None
-                },
-                "ServiceConnect": {
-                    "Native": False,
-                    "Proxy": None
-                },
-                "Namespace": "default"
-            }
-        ]
-        with self.getTestDir() as dirn:
-            async with await s_cell.Cell.anit(dirn) as cell:
-                root = await cell.auth.getUserByName('root')
-                await root.setPasswd('root')
-                cell.consul_data = consul_data
-                hhost, hport = await cell.addHttpsPort(0)
-                thost, tport = await cell.dmon.listen('tcp://127.0.0.1:0')
-                cell.addHttpApi('/v1/catalog/service/(.*)', ConsulV1Handler, {'cell': cell})
-
-                consul = f'https://127.0.0.1:{hport}'
-
-                burl = f'tcp+consul://root:root@foobar/*?consul_nosslverify=1&consul={consul}'
-                info = s_telepath.chopurl(burl)
-                self.eq(info.get('host'), 'foobar')
-                self.none(info.get('port'))
-
-                # Discovery functions update info dict in place.
-                await s_telepath.disc_consul(info)
-                self.eq(info.get('host'), '192.168.10.10')
-                self.eq(info.get('port'), 5000)
-                self.eq(info.get('original_host'), 'foobar')
-
-                # Support tag_address and service_tag_address
-                url = burl + '&consul_tag_address=wan'
-                info = s_telepath.chopurl(url)
-                await s_telepath.disc_consul(info)
-                self.eq(info.get('host'), '10.0.10.10')
-                self.eq(info.get('port'), 5000)
-                self.eq(info.get('original_host'), 'foobar')
-
-                url = burl + '&consul_service_tag_address=wan'
-                info = s_telepath.chopurl(url)
-                await s_telepath.disc_consul(info)
-                self.eq(info.get('host'), '198.18.0.1')
-                self.eq(info.get('port'), 512)
-                self.eq(info.get('original_host'), 'foobar')
-
-                # Support servicetag based port finding
-                url = burl + '&consul_tag=tacos'
-                info = s_telepath.chopurl(url)
-                await s_telepath.disc_consul(info)
-                self.eq(info.get('host'), '192.168.10.10')
-                self.eq(info.get('port'), 5000)
-                self.eq(info.get('original_host'), 'foobar')
-
-                # Punch in our host/port info into consul_data so we can do a end to end test
-                consul_data[0]['Address'] = thost
-                consul_data[0]['ServicePort'] = tport
-                async with await s_telepath.openurl(burl) as proxy:
-                    self.isin('synapse.lib.cell.CellApi', proxy._getClasses())
-
-                # Sad path - non-existing service name.
-                with self.raises(s_exc.BadUrl) as cm:
-                    url = f'tcp+consul://root:root@newp/*?consul_nosslverify=1&consul={consul}'
-                    await s_telepath.disc_consul(s_telepath.chopurl(url))
-                self.eq(cm.exception.get('name'), 'newp')
-
-                # Sad path - multiple tag resolution.
-                with self.raises(s_exc.BadUrl) as cm:
-                    url = burl + '&consul_tag_address=wan'
-                    url = url + '&consul_service_tag_address=lan'
-                    await s_telepath.disc_consul(s_telepath.chopurl(url))
-                self.eq(cm.exception.get('consul_tag_address'), 'wan')
-                self.eq(cm.exception.get('consul_service_tag_address'), 'lan')
-
-                # Sad path - ssl verification failure
-                with self.raises(s_exc.BadUrl) as cm:
-                    url = f'tcp+consul://root:root@foobar/*?consul={consul}'
-                    await s_telepath.disc_consul(s_telepath.chopurl(url))
-                self.isin('certificate verify failed', cm.exception.get('mesg'))
-                self.isinstance(cm.exception.__context__, ssl.SSLCertVerificationError)
-
-                # Sad path - iterating through results and having a
-                # non-existent consul_tag value.
-                new_data = consul_data[0].copy()
-                new_data['ServiceTags'] = []
-                cell.consul_data.insert(0, new_data)
-                with self.raises(s_exc.BadUrl) as cm:
-                    url = burl + '&consul_tag=burritos'
-                    await s_telepath.disc_consul(s_telepath.chopurl(url))
-                self.eq('burritos', cm.exception.get('tag'))
+            with self.raises(s_exc.LinkShutDown):
+                await task
 
     async def test_telepath_pipeline(self):
 
@@ -1218,7 +1336,7 @@ class TeleTest(s_t_utils.SynTest):
 
                 self.eq(vals, (40, 50, 60))
 
-                self.eq(1, len(proxy.links))
+                self.eq(2, len(proxy.links))
                 self.eq(160, await proxy.bar(80, 80))
 
                 async def boomgenr():
@@ -1248,16 +1366,21 @@ class TeleTest(s_t_utils.SynTest):
             'inits': 0
         }
         evnt = asyncio.Event()
+        loopevent = asyncio.Event()
         origfire = s_telepath.Client._fireLinkLoop
         originit = s_telepath.Client._initTeleLink
 
+        tgt = {'n': 3}
+
         async def countLinkLoops(self):
             cnts['loops'] += 1
+            if cnts['loops'] > tgt.get('n'):
+                loopevent.set()
             await origfire(self)
 
         async def countInitLinks(self, url):
             cnts['inits'] += 1
-            if cnts['inits'] > 3:
+            if cnts['inits'] > tgt.get('n'):
                 evnt.set()
 
             await originit(self, url)
@@ -1281,25 +1404,30 @@ class TeleTest(s_t_utils.SynTest):
             async with await s_telepath.Client.anit(url) as targ:
                 proxy = await targ.proxy(timeout=2)
                 await targ.onlink(onLinkOk)
-                self.eq(1, cnts['ok'])
+                self.ge(cnts['ok'], 1)
                 with self.raises(s_exc.SynErr):
                     await targ.onlink(onlinkExc)
-                self.eq(1, cnts['exc'])
+                self.ge(cnts['exc'], 1)
 
             with mock.patch('synapse.telepath.Client._fireLinkLoop', countLinkLoops):
                 with mock.patch('synapse.telepath.Client._initTeleLink', countInitLinks):
                     async with await s_telepath.Client.anit(url, onlink=onlinkFail) as targ:
-
-                        self.true(await asyncio.wait_for(evnt.wait(), timeout=6))
-                        self.eq(4, cnts['loops'])
-                        self.eq(4, cnts['inits'])
+                        fut = asyncio.gather(asyncio.wait_for(evnt.wait(), timeout=6),
+                                             asyncio.wait_for(loopevent.wait(), timeout=6))
+                        self.eq((True, True), await fut)
+                        self.ge(cnts['loops'], 4)
+                        self.ge(cnts['inits'], 4)
 
                     evnt.clear()
-                    async with await s_telepath.Client.anit(url, onlink=onlinkExc) as targ:
+                    loopevent.clear()
+                    tgt['n'] = 4
 
-                        self.true(await asyncio.wait_for(evnt.wait(), timeout=6))
-                        self.eq(5, cnts['loops'])
-                        self.eq(5, cnts['inits'])
+                    async with await s_telepath.Client.anit(url, onlink=onlinkExc) as targ:
+                        fut = asyncio.gather(asyncio.wait_for(evnt.wait(), timeout=30),
+                                             asyncio.wait_for(loopevent.wait(), timeout=30),)
+                        self.eq((True, True), await fut)
+                        self.ge(cnts['loops'], 5)
+                        self.ge(cnts['inits'], 5)
 
     async def test_client_method_reset(self):
         class Foo:
@@ -1387,15 +1515,13 @@ class TeleTest(s_t_utils.SynTest):
 
     async def test_telepath_default_port(self):
         # Test default ports for dmon listening AND telepath connections.
+
+        # Note: This is the ONLY test that should be listening on a fixed port (27492 - the default telepath port)
+        # Relevant when testing with SYNDEV_AUDIT_PORT_BINDS and SYNDEV_AUDIT_PORT_BINDS_RAISE.
+
         async with await s_daemon.Daemon.anit() as dmon:
             url = 'tcp://127.0.0.1/'
-            try:
-                addr, port = await dmon.listen(url)
-            except OSError as e:
-                if e.errno == 98:
-                    self.skip('Port 27492 already bound, skipping test.')
-                else:
-                    raise
+            _, port = await dmon.listen(url)
             self.eq(port, 27492)
 
             foo = Foo()
@@ -1405,3 +1531,238 @@ class TeleTest(s_t_utils.SynTest):
             async with await s_telepath.openurl(furl) as proxy:
                 self.isin('synapse.tests.test_telepath.Foo', proxy._getClasses())
                 self.eq(await proxy.echo('oh hi mark!'), 'oh hi mark!')
+
+    async def test_tls_support_and_ciphers(self):
+
+        self.thisHostMustNot(platform='darwin')
+
+        foo = Foo()
+
+        async with self.getTestDmon() as dmon:
+            # As a workaround to a Python bug (https://bugs.python.org/issue30945) that prevents localhost:0 from
+            # being connected via TLS, make a certificate for whatever my hostname is and sign it with the test CA
+            # key.
+            hostname = socket.gethostname()
+
+            dmon.certdir.genHostCert(hostname, signas='ca')
+
+            _, port = await dmon.listen(f'ssl://{hostname}:0')
+
+            dmon.share('foo', foo)
+
+            # Ensure tls listener is working before trying downgraded versions
+            async with await s_telepath.openurl(f'ssl://{hostname}/foo', port=port) as prox:
+                self.eq(30, await prox.bar(10, 20))
+
+                # This will generate a large msgpack object which can cause
+                # openssl to have malloc failures. Prior to the write chunking
+                # changes, this would cause a generally fatal error to any
+                # processes which rely on the calls work, such as mirror loops.
+                blob = b'V' * s_const.mebibyte * 256
+                nblobs = 8
+                total = nblobs * len(blob)
+                blobarray = []
+                for i in range(nblobs):
+                    blobarray.append(blob)
+                self.eq(await prox.echosize(blobarray), total)
+
+            sslctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLSv1)
+            with self.raises((ssl.SSLError, ConnectionResetError)):
+                link = await s_link.connect(hostname, port=port, ssl=sslctx)
+
+            sslctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLSv1_1)
+            with self.raises((ssl.SSLError, ConnectionResetError)):
+                link = await s_link.connect(hostname, port=port, ssl=sslctx)
+
+            sslctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLSv1_2)
+            sslctx.set_ciphers('ADH-AES256-SHA')
+            with self.raises(ssl.SSLError):
+                link = await s_link.connect(hostname, port=port, ssl=sslctx)
+
+            sslctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLSv1_2)
+            sslctx.set_ciphers('AES256-GCM-SHA384')
+            with self.raises(ConnectionResetError):
+                link = await s_link.connect(hostname, port=port, ssl=sslctx)
+
+            sslctx = ssl.SSLContext(protocol=ssl.PROTOCOL_TLSv1_2)
+            sslctx.set_ciphers('DHE-RSA-AES256-SHA256')
+            with self.raises(ConnectionResetError):
+                link = await s_link.connect(hostname, port=port, ssl=sslctx)
+
+    async def test_telepath_exception_logging(self):
+
+        async with self.getTestCore() as core:
+
+            addr, port = await core.dmon.listen('tcp://127.0.0.1:0')
+            root = await core.auth.getUserByName('root')
+            await root.setPasswd('secret')
+
+            async with await s_telepath.openurl(f'tcp://127.0.0.1:{port}', user='root', passwd='secret') as prox:
+
+                with self.getLoggerStream('synapse.daemon') as stream:
+                    task = asyncio.create_task(prox.callStorm('$lib.time.sleep(60)'))
+
+                    await asyncio.sleep(2)
+                    task.cancel()
+
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+
+                self.notin('error during task: callStorm', stream.getvalue())
+
+                with self.getLoggerStream('synapse.daemon') as stream:
+                    try:
+                        await prox.callStorm('[inet:newp=invalid]')
+                    except Exception:
+                        pass
+
+                    await stream.expect('error during task: callStorm', timeout=6)
+
+    async def test_telepath_hostname_synerr(self):
+        self.thisHostMustNot(platform='darwin')
+
+        foo = Foo()
+
+        with self.getTestDir() as dirn:
+            path = (s_common.gendir(dirn, 'dmoncerts'),)
+            certdir = s_certdir.CertDir(path=path)
+
+            async with await s_daemon.Daemon.anit(certdir=certdir) as dmon:
+                hostname = socket.gethostname()
+                sni = 'some.sni.local'
+                certdir.genCaCert('loopy')
+                certdir.genHostCert(sni, signas='loopy')
+
+                host, port = await dmon.listen(f'ssl://0.0.0.0:0/?hostname={sni}')
+                dmon.share('foo', foo)
+
+                async with await s_telepath.openurl(f'ssl://{hostname}/foo',
+                                                    port=port, hostname=sni, certdir=certdir) as foo:
+
+                    foo.link.set('hostname', 'deadb33f')
+                    # Ensure that the hostname for the subsequent link creation matches
+                    with self.raises(s_exc.BadCertHost):
+                        await foo.echo('woot')
+
+                    # With the correct hostname on link.info we validate the subsequent link creation.
+                    foo.link.set('hostname', sni)
+                    self.eq('woot', await foo.echo('woot'))
+
+    async def test_telepath_hostname_sni(self):
+        self.thisHostMustNot(platform='darwin')
+
+        foo = Foo()
+
+        hostname = socket.gethostname()
+        caname = 'loopy'
+        default = 'default.sni.local'
+        sni = 'some.sni.local'
+
+        with self.getTestDir() as dirn:
+
+            # This Certdir that works via SNI
+            path = (s_common.gendir(dirn, 'actualcerts'),)
+            certdir = s_certdir.CertDir(path=path)
+            certdir.genCaCert(caname)
+            certdir.genHostCert(sni, signas=caname)
+            sni_context = certdir.getServerSSLContext(sni, caname=caname)
+
+            # Actual disparate CA / content served by the server when there is not an SNI match
+            path2 = (s_common.gendir(dirn, 'defaultcerts'),)
+            default_certdir = s_certdir.CertDir(path=path2)
+            default_certdir.genCaCert(caname)
+            default_certdir.genHostCert(default, signas=caname)
+
+            # Setup our SNI callback.
+            # By default we will use the original context; but if the SNI name matches the sni
+            # var, then we will use the sni_context instead.
+            def sni_callback(ssl_sock: ssl.SSLObject, sni_name, ssl_ctx):
+                if sni_name == sni:
+                    ssl_sock.context = sni_context
+                return None
+
+            async with await s_daemon.Daemon.anit(certdir=default_certdir) as dmon:
+                host, port = await dmon.listen(f'ssl://0.0.0.0:0/?hostname={default}')
+
+                # Setup the SNI callback on the listening context
+                dmon.listenservers[0]._ssl_context.sni_callback = sni_callback
+
+                dmon.share('foo', foo)
+
+                async with await s_telepath.openurl(f'ssl://{hostname}/foo',
+                                                    port=port, hostname=sni, certdir=certdir) as foo:
+
+                    # Without SNI, the client context gets a mismatch between host vs default.sni.local
+                    # and the client sslctx cannot validate that the default cert
+                    foo.link.set('hostname', None)
+                    with self.raises(ssl.SSLCertVerificationError):
+                        await foo.echo('woot')
+
+                    # With a different SNI value, the client still gets a certificate the does not match
+                    # what it expects to get.
+                    foo.link.set('hostname', 'deadb33f')
+                    with self.raises(ssl.SSLCertVerificationError):
+                        await foo.echo('woot')
+
+                    # With the correct hostname on link.info we validate the subsequent link creation.
+                    foo.link.set('hostname', sni)
+                    self.eq('woot', await foo.echo('woot'))
+
+    async def test_taskv2_unexpected_mesg(self):
+
+        foo = Foo()
+        async with self.getTestDmon() as dmon:
+            dmon.share('foo', foo)
+            url = f'tcp://127.0.0.1:{dmon.addr[1]}/foo'
+
+            async with await s_telepath.openurl(url) as proxy:
+
+                mocklink = mock.MagicMock()
+                mocklink.tx = mock.AsyncMock()
+                mocklink.rx = mock.AsyncMock(return_value=('t2:unknwn', {}))
+                mocklink.fini = mock.AsyncMock()
+
+                with mock.patch.object(proxy, 'getPoolLink', mock.AsyncMock(return_value=mocklink)):
+                    with self.raises(s_exc.BadMesgFormat):
+                        await proxy.bar(1, 2)
+
+                mocklink.fini.assert_called_once()
+
+    async def test_telepath_getviewdef(self):
+
+        async with self.getTestCore() as core:
+
+            layr = await core.addLayer()
+            layriden = layr.get('iden')
+            view = await core.addView({'layers': (layriden,)})
+            viewiden = view.get('iden')
+
+            async with core.getLocalProxy() as prox:
+                vdef = await prox.getViewDef(viewiden)
+                self.nn(vdef)
+                self.eq(vdef.get('iden'), viewiden)
+                self.isin('layers', vdef)
+                self.isin('created', vdef)
+
+            async with core.getLocalProxy() as prox:
+                vdef = await prox.getViewDef('newp')
+                self.none(vdef)
+
+            testuser = await core.auth.addUser('testuser')
+            await testuser.setPasswd('secret')
+
+            layr2 = await core.addLayer()
+            layriden2 = layr2.get('iden')
+            view2 = await core.addView({'layers': (layriden2,)})
+            viewiden2 = view2.get('iden')
+
+            async with core.getLocalProxy(user='testuser') as prox:
+                with self.raises(s_exc.AuthDeny):
+                    await prox.getViewDef(viewiden2)
+
+            async with core.getLocalProxy() as prox:
+                vdef = await prox.getViewDef(viewiden2)
+                self.nn(vdef)
+                self.eq(vdef.get('iden'), viewiden2)

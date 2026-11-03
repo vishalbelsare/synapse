@@ -17,10 +17,14 @@ class SmtpLib(s_stormtypes.Lib):
     _storm_locals = (
         {'name': 'message', 'desc': 'Construct a new email message.',
          'type': {'type': 'function', '_funcname': 'message',
-                          'returns': {'type': 'storm:smtp:message',
-                                      'desc': 'The newly constructed storm:smtp:message.'}}},
+                          'returns': {'type': 'inet:smtp:message',
+                                      'desc': 'The newly constructed inet:smtp:message.'}}},
     )
     _storm_lib_path = ('inet', 'smtp',)
+    _storm_lib_perms = (
+        {'perm': ('storm', 'inet', 'smtp', 'send'), 'gate': 'cortex',
+         'desc': 'Controls sending SMTP messages to external servers.'},
+    )
 
     def getObjLocals(self):
         return {
@@ -35,7 +39,7 @@ class SmtpMessage(s_stormtypes.StormType):
     '''
     An SMTP message to compose and send.
     '''
-    _storm_typename = 'storm:smtp:message'
+    _storm_typename = 'inet:smtp:message'
 
     _storm_locals = (
 
@@ -86,12 +90,14 @@ class SmtpMessage(s_stormtypes.StormType):
                         'desc': 'The user name to use authenticating to the SMTP server.'},
                     {'name': 'passwd', 'type': 'str', 'default': None,
                         'desc': 'The password to use authenticating to the SMTP server.'},
-                    {'name': 'usetls', 'type': 'bool', 'default': False,
+                    {'name': 'usetls', 'type': 'boolean', 'default': False,
                         'desc': 'Initiate a TLS connection to the SMTP server.'},
-                    {'name': 'starttls', 'type': 'bool', 'default': False,
+                    {'name': 'starttls', 'type': 'boolean', 'default': False,
                         'desc': 'Use the STARTTLS directive with the SMTP server.'},
                     {'name': 'timeout', 'type': 'int', 'default': 60,
                         'desc': 'The timeout (in seconds) to wait for message delivery.'},
+                    {'type': 'boolean', 'name': 'ssl_verify', 'default': True,
+                     'desc': 'Perform SSL/TLS verification.'},
                   ),
                   'returns': {'type': 'list', 'desc': 'An ($ok, $valu) tuple.'}}},
 
@@ -116,18 +122,17 @@ class SmtpMessage(s_stormtypes.StormType):
 
         self.gtors.update({
             'text': self._getEmailText,
-            'html': self._getEmailText,
+            'html': self._getEmailHtml,
             'sender': self._getSenderEmail,
         })
 
         self.stors.update({
             'text': self._setEmailText,
-            'html': self._setEmailText,
+            'html': self._setEmailHtml,
             'sender': self._setSenderEmail,
         })
 
     async def _setSenderEmail(self, valu):
-        # TODO handle inet:email and ps:contact Nodes
         self.sender = await s_stormtypes.tostr(valu)
 
     async def _getSenderEmail(self):
@@ -145,22 +150,24 @@ class SmtpMessage(s_stormtypes.StormType):
     async def _getEmailHtml(self):
         return self.bodyhtml
 
-    # TODO
-    # async def attach(self, sha256, name, mime):
-
-    async def send(self, host, port=25, user=None, passwd=None, usetls=False, starttls=False, timeout=60):
+    async def send(self, host, port=25, user=None, passwd=None, usetls=False, starttls=False, timeout=60,
+                   ssl_verify=True):
 
         self.runt.confirm(('storm', 'inet', 'smtp', 'send'))
 
         try:
             if self.bodytext is None and self.bodyhtml is None:
-                mesg = 'The storm:smtp:message has no HTML or text body.'
+                mesg = 'The inet:smtp:message has no HTML or text body.'
                 raise s_exc.StormRuntimeError(mesg=mesg)
 
             host = await s_stormtypes.tostr(host)
             port = await s_stormtypes.toint(port)
             usetls = await s_stormtypes.tobool(usetls)
             starttls = await s_stormtypes.tobool(starttls)
+            ssl_verify = await s_stormtypes.tobool(ssl_verify)
+
+            if usetls and starttls:
+                raise s_exc.BadArg(mesg='usetls and starttls are mutually exclusive arguments.')
 
             timeout = await s_stormtypes.toint(timeout)
 
@@ -180,17 +187,23 @@ class SmtpMessage(s_stormtypes.StormType):
 
             recipients = [await s_stormtypes.tostr(e) for e in self.recipients]
 
-            futu = aiosmtplib.send(message,
-                    port=port,
-                    hostname=host,
-                    sender=self.sender,
-                    recipients=recipients,
-                    use_tls=usetls,
-                    start_tls=starttls,
-                    username=user,
-                    password=passwd)
+            ctx = None
+            if usetls or starttls:
+                ctx = self.runt.snap.core.getCachedSslCtx(opts=None, verify=ssl_verify)
 
-            await asyncio.wait_for(futu, timeout=timeout)
+            futu = aiosmtplib.send(message,
+                                   port=port,
+                                   hostname=host,
+                                   sender=self.sender,
+                                   recipients=recipients,
+                                   use_tls=usetls,
+                                   start_tls=starttls,
+                                   username=user,
+                                   password=passwd,
+                                   tls_context=ctx,
+                                   )
+
+            await s_common.wait_for(futu, timeout=timeout)
 
         except asyncio.CancelledError:  # pragma: no cover
             raise

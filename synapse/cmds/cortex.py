@@ -1,5 +1,4 @@
 import os
-import json
 import queue
 import shlex
 import pprint
@@ -10,6 +9,7 @@ import synapse.common as s_common
 
 import synapse.lib.cli as s_cli
 import synapse.lib.cmd as s_cmd
+import synapse.lib.json as s_json
 import synapse.lib.node as s_node
 import synapse.lib.time as s_time
 import synapse.lib.msgpack as s_msgpack
@@ -56,17 +56,6 @@ Examples:
         ('line', {'type': 'glob'}),  # type: ignore
     )
 
-    splicetypes = (
-        'tag:add',
-        'tag:del',
-        'node:add',
-        'node:del',
-        'prop:set',
-        'prop:del',
-        'tag:prop:set',
-        'tag:prop:del',
-    )
-
     def _make_argparser(self):
 
         parser = s_cmd.Parser(prog='log', outp=self, description=self.__doc__)
@@ -111,7 +100,7 @@ Examples:
         editsonly = self.locs.get('log:editsonly')
         nodesonly = self.locs.get('log:nodesonly')
         if fd and not fd.closed:
-            if editsonly and mesg[0] not in (*self.splicetypes, 'node:edits'):
+            if editsonly and mesg[0] != 'node:edits':
                 return
             if nodesonly:
                 if mesg[0] != 'node':
@@ -129,9 +118,7 @@ Examples:
 
         fmt = self.locs.get('log:fmt')
         if fmt == 'jsonl':
-            s = json.dumps(mesg, sort_keys=True) + '\n'
-            buf = s.encode()
-            return buf
+            return s_json.dumps(mesg, sort_keys=True, newline=True)
 
         elif fmt == 'mpk':
             buf = s_msgpack.en(mesg)
@@ -221,10 +208,9 @@ class StormCmd(s_cli.Cmd):
         --editformat <format>: What format of edits the server shall emit.
                 Options are
                    * nodeedits (default),
-                   * splices (similar to < 2.0.0),
                    * count (just counts of nodeedits), or
                    * none (no such messages emitted).
-        --show-prov:  Show provenance messages.
+        --show-prov:  Deprecated. This no longer does anything.
         --raw: Print the nodes in their raw format. This overrides --hide-tags and --hide-props.
         --debug: Display cmd debug information along with nodes in raw format. This overrides other display arguments.
         --path: Get path information about returned nodes.
@@ -239,12 +225,12 @@ class StormCmd(s_cli.Cmd):
     '''
     _cmd_name = 'storm'
 
-    editformat_enums = ('nodeedits', 'splices', 'count', 'none')
+    editformat_enums = ('nodeedits', 'count', 'none')
     _cmd_syntax = (
         ('--hide-tags', {}),  # type: ignore
         ('--show', {'type': 'valu'}),
         ('--show-nodeedits', {}),
-        ('--show-prov', {}),
+        ('--show-prov', {}),  # TODO: remove in 3.0.0
         ('--editformat', {'type': 'enum', 'defval': 'nodeedits', 'enum:vals': editformat_enums}),
         ('--file', {'type': 'valu'}),
         ('--optsfile', {'type': 'valu'}),
@@ -268,7 +254,6 @@ class StormCmd(s_cli.Cmd):
             'err': self._onErr,
             'node:edits': self._onNodeEdits,
             'node:edits:count': self._onNodeEditsCount,
-            'prov:new': self._onProvNew,
         }
         self._indented = False
 
@@ -292,10 +277,6 @@ class StormCmd(s_cli.Cmd):
         count = mesg[1].get('count', 1)
         s_cli.Cmd.printf(self, '.' * count, addnl=False, color=NODEEDIT_COLOR)
         self._indented = True
-
-    def _onProvNew(self, mesg, opts):
-        if opts.get('show-prov'):
-            self.printf(repr(mesg), color=PROVNEW_COLOR)
 
     def _printNodeProp(self, name, valu):
         self.printf(f'        {name} = {valu}')
@@ -382,7 +363,7 @@ class StormCmd(s_cli.Cmd):
                         pos = 33
 
                 self.printf(text, color=BLUE)
-                self.printf(f'{" "*pos}^', color=BLUE)
+                self.printf(f'{" " * pos}^', color=BLUE)
                 self.printf(f'Syntax Error: {mesg}', color=SYNTAX_ERROR_COLOR)
                 return
 
@@ -447,8 +428,8 @@ class StormCmd(s_cli.Cmd):
                 if mesg[0] == 'node':
 
                     if nodesfd is not None:
-                        byts = json.dumps(mesg[1]).encode()
-                        nodesfd.write(byts + b'\n')
+                        byts = s_json.dumps(mesg[1], newline=True)
+                        nodesfd.write(byts)
 
                 try:
                     func = self.cmdmeths[mesg[0]]

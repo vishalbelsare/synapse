@@ -12,8 +12,6 @@ import synapse.vendor.cashaddress.convert as cashaddr_convert  # BCH support
 import synapse.vendor.xrpl.core.addresscodec as xrp_addresscodec  # xrp support
 import synapse.vendor.substrateinterface.utils.ss58 as substrate_ss58  # polkadot support
 
-import synapse.common as s_common
-
 logger = logging.getLogger(__name__)
 
 '''
@@ -77,16 +75,19 @@ def ether_eip55(body: str):
 def eth_check(match: regex.Match):
     text = match.groupdict().get('valu')  # type: str
     body = text[2:]
+
+    ret = ether_eip55(body)
+    if ret is None:
+        return None, {}
+
     # Checksum if we're mixed case or not
     if not body.isupper() and not body.islower():
-
-        ret = ether_eip55(body)
-        if ret is None or ret != text:
+        if ret != text:
             return None, {}
-
         return ('eth', text), {}
+
     # any valid 0x<40 character> hex string is possibly a ETH address.
-    return ('eth', text.lower()), {}
+    return ('eth', ret), {}
 
 def bch_check(match: regex.Match):
     text = match.groupdict().get('valu')
@@ -127,7 +128,7 @@ def cardano_byron_check(match: regex.Match):
     try:
         decoded_text = base58.b58decode(text)
         message = cbor2.loads(decoded_text)
-        if len(message) != 2:
+        if not isinstance(message, list) or len(message) != 2:
             return None, {}
         csum = message[1]
         computed_checksum = binascii.crc32(message[0].value)

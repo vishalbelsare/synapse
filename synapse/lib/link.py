@@ -1,10 +1,10 @@
 import socket
 import asyncio
 import logging
-
-from OpenSSL import crypto
-
 import collections
+
+import cryptography.x509 as c_x509
+import cryptography.hazmat.primitives.hashes as c_hashes
 
 logger = logging.getLogger(__name__)
 
@@ -15,43 +15,15 @@ import synapse.lib.base as s_base
 import synapse.lib.const as s_const
 import synapse.lib.msgpack as s_msgpack
 
-readsize = 10 * s_const.megabyte
-
-async def connect(host, port, ssl=None, hostname=None, linkinfo=None):
-    '''
-    Async connect and return a Link().
-    '''
-    info = {'host': host, 'port': port, 'ssl': ssl, 'hostname': hostname}
-    if linkinfo is not None:
-        info.update(linkinfo)
-
-    ssl = info.get('ssl')
-    hostname = info.get('hostname')
-
-    reader, writer = await asyncio.open_connection(host, port, ssl=ssl, server_hostname=hostname)
-    return await Link.anit(reader, writer, info=info)
-
-async def listen(host, port, onlink, ssl=None):
-    '''
-    Listen on the given host/port and fire onlink(Link).
-
-    Returns a server object that contains the listening sockets
-    '''
-    async def onconn(reader, writer):
-        info = {'tls': bool(ssl)}
-        link = await Link.anit(reader, writer, info=info)
-        link.schedCoro(onlink(link))
-
-    server = await asyncio.start_server(onconn, host=host, port=port, ssl=ssl)
-    return server
+READSIZE = 16 * s_const.mebibyte
+MAXWRITE = 64 * s_const.mebibyte
 
 async def unixlisten(path, onlink):
     '''
     Start an PF_UNIX server listening on the given path.
     '''
-    info = {'path': path, 'unix': True}
-
     async def onconn(reader, writer):
+        info = {'path': path, 'unix': True}
         link = await Link.anit(reader, writer, info=info)
         link.schedCoro(onlink(link))
     return await asyncio.start_unix_server(onconn, path=path)
@@ -60,9 +32,46 @@ async def unixconnect(path):
     '''
     Connect to a PF_UNIX server listening on the given path.
     '''
-    reader, writer = await asyncio.open_unix_connection(path=path)
+    try:
+        reader, writer = await asyncio.open_unix_connection(path=path)
+    except ConnectionRefusedError as e:
+        mesg = f'Cell path is not listening: {path}'
+        raise s_exc.LinkErr(mesg=mesg) from e
+    except FileNotFoundError as e:
+        mesg = f'Cell path does not exist: {path}'
+        raise s_exc.NoSuchPath(mesg=mesg) from e
+
     info = {'path': path, 'unix': True}
     return await Link.anit(reader, writer, info=info)
+
+async def unixwait(path):
+    '''
+    Wait for a unix socket path to be open and listening.
+
+    Args:
+        path: Path to the socket.
+
+    Notes:
+        This will loop forever. Callers should wrap this in ``asyncio.wait_for()``
+        with a known timeout value.
+
+    Returns:
+        None: Returns when the socket can be connected too.
+    '''
+    while True:
+        try:
+
+            reader, writer = await asyncio.open_unix_connection(path=path)
+
+            reader._transport.abort()
+
+            writer.close()
+            await writer.wait_closed()
+
+            return
+
+        except (ConnectionRefusedError, FileNotFoundError):
+            await asyncio.sleep(0.01)
 
 async def linkfile(mode='wb'):
     '''
@@ -78,13 +87,13 @@ async def linkfile(mode='wb'):
 
     return link0, file1
 
-async def linksock():
+async def linksock(forceclose=False):
     '''
     Connect a Link, socket pair.
     '''
     sock0, sock1 = socket.socketpair()
     reader, writer = await asyncio.open_connection(sock=sock0)
-    link0 = await Link.anit(reader, writer, info={'unix': True})
+    link0 = await Link.anit(reader, writer, info={'unix': True}, forceclose=forceclose)
     return link0, sock1
 
 async def fromspawn(spawninfo):
@@ -98,11 +107,13 @@ class Link(s_base.Base):
     '''
     A Link() is created to wrap a socket reader/writer.
     '''
-    async def __anit__(self, reader, writer, info=None):
+    async def __anit__(self, reader, writer, info=None, forceclose=False):
 
         await s_base.Base.__anit__(self)
 
         self.iden = s_common.guid()
+
+        writer.transport.set_write_buffer_limits(high=1)
 
         self.reader = reader
         self.writer = writer
@@ -112,7 +123,8 @@ class Link(s_base.Base):
         self.sock = self.writer.get_extra_info('socket')
         self.peercert = self.writer.get_extra_info('peercert')
 
-        self._drain_lock = asyncio.Lock()
+        self._txlock = asyncio.Lock()
+        self._forceclose = forceclose
 
         if info is None:
             info = {}
@@ -134,13 +146,34 @@ class Link(s_base.Base):
 
         self.info = info
 
+        self._addrinfo = {}
+        # _addrinfo is populated in this order so that as first hit tls links (prod deployments)
+        # then unix links (unit tests with local sockets, container healthchecks, local tools )
+        # then tcp links ( unit tests and legacy deployments )
+        if self.info.get('tls'):
+            self._addrinfo['family'] = 'tls'
+            self._addrinfo['addr'] = self.sock.getpeername()
+        elif self.info.get('unix'):
+            self._addrinfo['family'] = 'unix'
+            # Unix sockets don't use getpeername
+            self._addrinfo['addr'] = self.sock.getsockname()
+        else:
+            self._addrinfo['family'] = 'tcp'
+            self._addrinfo['addr'] = self.sock.getpeername()
+        if self.sock.family == socket.AF_INET:
+            self._addrinfo['ipver'] = 'ipv4'
+        elif self.sock.family == socket.AF_INET6:
+            self._addrinfo['ipver'] = 'ipv6'
+
         self.unpk = s_msgpack.Unpk()
 
         async def fini():
             self.writer.close()
+            if self._forceclose:
+                self.reader._transport.abort()
             try:
                 await self.writer.wait_closed()
-            except (BrokenPipeError, ConnectionResetError) as e:
+            except Exception as e:
                 logger.debug('Link error waiting on close: %s', str(e))
 
         self.onfini(fini)
@@ -150,9 +183,9 @@ class Link(s_base.Base):
 
         if self.certhash is not None:
 
-            byts = info.get('ssl').telessl.getpeercert(True)
-            cert = crypto.load_certificate(crypto.FILETYPE_ASN1, byts)
-            thishash = cert.digest('SHA256').decode().lower().replace(':', '')
+            byts = self.writer.get_extra_info('ssl_object').getpeercert(True)
+            cert = c_x509.load_der_x509_certificate(byts)
+            thishash = s_common.ehex(cert.fingerprint(c_hashes.SHA256()))
             if thishash != self.certhash:
                 mesg = f'Server cert does not match pinned certhash={self.certhash}.'
                 raise s_exc.LinkBadCert(mesg=mesg)
@@ -207,28 +240,31 @@ class Link(s_base.Base):
         '''
         Get a summary of address information related to the link.
         '''
-        ret = {'family': 'tcp',
-               'addr': self.sock.getpeername(),
-               }
-        # Set family information
-        if self.info.get('unix'):
-            ret['family'] = 'unix'
-            # Unix sockets don't use getpeername
-            ret['addr'] = self.sock.getsockname()
-        elif self.info.get('tls'):
-            ret['family'] = 'tls'
-        # Set ipver if needed
-        if self.sock.family == socket.AF_INET:
-            ret['ipver'] = 'ipv4'
-        if self.sock.family == socket.AF_INET6:
-            ret['ipver'] = 'ipv6'
-        return ret
+        return dict(self._addrinfo)
 
     async def send(self, byts):
-        self.writer.write(byts)
-        # Avoid Python bug.  See https://bugs.python.org/issue29930
-        async with self._drain_lock:
-            await self.writer.drain()
+
+        offs = 0
+        size = len(byts)
+
+        async with self._txlock:
+
+            try:
+                while offs < size:
+
+                    self.writer.write(byts[offs:offs + MAXWRITE])
+                    offs += MAXWRITE
+
+                    await self.writer.drain()
+
+            except (asyncio.CancelledError, Exception) as e:
+
+                await self.fini()
+
+                einfo = s_common.retnexc(e)
+                logger.debug('link.tx connection trouble %s', einfo)
+
+                raise
 
     async def tx(self, mesg):
         '''
@@ -237,23 +273,11 @@ class Link(s_base.Base):
         if self.isfini:
             raise s_exc.IsFini()
 
-        byts = s_msgpack.en(mesg)
-        try:
+        byts = await self.pack(mesg)
+        await self.send(byts)
 
-            self.writer.write(byts)
-
-            # Avoid Python bug.  See https://bugs.python.org/issue29930
-            async with self._drain_lock:
-                await self.writer.drain()
-
-        except (asyncio.CancelledError, Exception) as e:
-
-            await self.fini()
-
-            einfo = s_common.retnexc(e)
-            logger.debug('link.tx connection trouble %s', einfo)
-
-            raise
+    def txfini(self):
+        self.sock.shutdown(1)
 
     async def recv(self, size):
         return await self.reader.read(size)
@@ -281,7 +305,7 @@ class Link(s_base.Base):
 
             try:
 
-                byts = await self.reader.read(readsize)
+                byts = await self.reader.read(READSIZE)
                 if not byts:
                     await self.fini()
                     return None
@@ -294,10 +318,11 @@ class Link(s_base.Base):
                 raise
 
             except Exception as e:
+                mesg = f'rx closed unexpectedly {e} link={self.getAddrInfo()}'
                 if isinstance(e, (BrokenPipeError, ConnectionResetError)):
-                    logger.warning('rx error: %s', e)
+                    logger.debug(mesg)
                 else:
-                    logger.exception('rx error')
+                    logger.exception(mesg)
                 await self.fini()
                 return None
 
@@ -317,6 +342,44 @@ class Link(s_base.Base):
 
     def feed(self, byts):
         '''
-        Used by Plex() to unpack bytes.
+        Used by rx() to unpack messages from bytes.
         '''
         return self.unpk.feed(byts)
+
+    async def pack(self, mesg):
+        '''
+        Used by tx() to pack messages into bytes
+        '''
+        return s_msgpack.en(mesg)
+
+async def connect(host, port, ssl=None, hostname=None, linkinfo=None, linkcls=Link):
+    '''
+    Async connect and return a <linkcls>.
+    '''
+    assert issubclass(linkcls, Link)
+
+    info = {'host': host, 'port': port, 'ssl': ssl, 'hostname': hostname, 'tls': bool(ssl)}
+    if linkinfo is not None:
+        info.update(linkinfo)
+
+    ssl = info.get('ssl')
+    hostname = info.get('hostname')
+
+    reader, writer = await asyncio.open_connection(host, port, ssl=ssl, server_hostname=hostname)
+    return await linkcls.anit(reader, writer, info=info)
+
+async def listen(host, port, onlink, ssl=None, linkcls=Link):
+    '''
+    Listen on the given host/port and fire onlink(<linkcls>).
+
+    Returns a server object that contains the listening sockets
+    '''
+    assert issubclass(linkcls, Link)
+
+    async def onconn(reader, writer):
+        info = {'tls': bool(ssl)}
+        link = await linkcls.anit(reader, writer, info=info)
+        link.schedCoro(onlink(link))
+
+    server = await asyncio.start_server(onconn, host=host, port=port, ssl=ssl)
+    return server

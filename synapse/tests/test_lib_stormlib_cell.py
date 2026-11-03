@@ -1,14 +1,20 @@
 import synapse.exc as s_exc
 
-import synapse.lib.stormlib.cell as s_cell
+import synapse.lib.coro as s_coro
+import synapse.lib.const as s_const
+import synapse.lib.stormlib.cell as s_stormlib_cell
 
 import synapse.tests.utils as s_test
+import synapse.tests.test_lib_stormsvc as s_t_stormsvc
 
 class StormCellTest(s_test.SynTest):
 
     async def test_stormlib_cell(self):
 
         async with self.getTestCore() as core:
+
+            ret = await core.callStorm('return ( $lib.cell.iden )')
+            self.eq(ret, core.getCellIden())
 
             ret = await core.callStorm('return ( $lib.cell.getCellInfo() )')
             self.eq(ret, await core.getCellInfo())
@@ -25,9 +31,9 @@ class StormCellTest(s_test.SynTest):
 
             # New cores have stormvar set to the current max version fix
             vers = await core.callStorm('return ( $lib.globals.get($key) )',
-                                        {'vars': {'key': s_cell.runtime_fixes_key}})
+                                        {'vars': {'key': s_stormlib_cell.runtime_fixes_key}})
             self.nn(vers)
-            self.eq(vers, s_cell.getMaxHotFixes())
+            self.eq(vers, s_stormlib_cell.getMaxHotFixes())
 
             user = await core.addUser('bob')
             opts = {'user': user.get('iden')}
@@ -44,6 +50,122 @@ class StormCellTest(s_test.SynTest):
             with self.raises(s_exc.AuthDeny):
                 await core.callStorm('return ( $lib.cell.getHealthCheck() )', opts=opts)
 
+    async def test_stormlib_cell_uptime(self):
+
+        async with self.getTestCoreProxSvc(s_t_stormsvc.StormvarServiceCell) as (core, prox, svc):
+
+            day = await core.callStorm('return($lib.time.format($lib.time.now(), "%Y-%m-%d"))')
+
+            msgs = await core.stormlist('uptime')
+            self.stormIsInPrint('up 00:00:', msgs)
+            self.stormIsInPrint(f'since {day}', msgs)
+
+            msgs = await core.stormlist('uptime stormvar')
+            self.stormIsInPrint('up 00:00:', msgs)
+            self.stormIsInPrint(f'since {day}', msgs)
+
+            msgs = await core.stormlist('uptime newp')
+            self.stormIsInErr('No service with name/iden: newp', msgs)
+
+            svc.starttime = svc.starttime - (1 * s_const.day + 2 * s_const.hour) / 1000
+            msgs = await core.stormlist('uptime stormvar')
+            self.stormIsInPrint('up 1D 02:00:', msgs)
+            self.stormIsInPrint(day, msgs)
+
+            resp = await core.callStorm('return($lib.cell.uptime())')
+            self.eq(core.startms, resp['starttime'])
+            self.lt(resp['uptime'], s_const.minute)
+
+    async def test_stormlib_cell_getmirrors(self):
+
+        async with self.getTestAha() as aha:
+
+            provurl = await aha.addAhaSvcProv('00.cortex')
+            coreconf = {'aha:provision': provurl}
+            ahawait = aha.waiter(1, 'aha:svcadd')
+
+            async with self.getTestCore(conf=coreconf) as core00:
+
+                self.gt(len(await ahawait.wait(timeout=6)), 0)  # nexus replay fires 2 events
+
+                user = await core00.addUser('low')
+                with self.raises(s_exc.AuthDeny):
+                    await core00.callStorm('return($lib.cell.getMirrorUrls())', opts={'user': user.get('iden')})
+
+                self.eq([], await core00.callStorm('return($lib.cell.getMirrorUrls())'))
+
+                provinfo = {'mirror': '00.cortex'}
+                provurl = await aha.addAhaSvcProv('01.cortex', provinfo=provinfo)
+                ahawait = aha.waiter(1, 'aha:svcadd')
+
+                coreconf = {'aha:provision': provurl}
+                async with self.getTestCore(conf=coreconf) as core01:
+
+                    self.gt(len(await ahawait.wait(timeout=6)), 0)  # nexus replay fires 2 events
+                    self.true(await s_coro.event_wait(core01.nexsroot._mirready, timeout=6))
+
+                    await core01.nodes('[ inet:ipv4=1.2.3.4 ]')
+                    self.len(1, await core00.nodes('inet:ipv4=1.2.3.4'))
+
+                    expurls = ['aha://01.cortex.synapse']
+
+                    self.eq(expurls, await core00.callStorm('return($lib.cell.getMirrorUrls())'))
+                    self.eq(expurls, await core01.callStorm('return($lib.cell.getMirrorUrls())'))
+
+                provurl = await aha.addAhaSvcProv('00.testsvc')
+                svcconf = {'aha:provision': provurl}
+                ahawait = aha.waiter(1, 'aha:svcadd')
+
+                async with self.getTestCell(s_t_stormsvc.StormvarServiceCell, conf=svcconf) as svc00:
+
+                    self.gt(len(await ahawait.wait(timeout=6)), 0)  # nexus replay fires 2 events
+
+                    await self.addSvcToCore(svc00, core00, svcname='testsvc')
+
+                    with self.raises(s_exc.NoSuchName):
+                        await core00.callStorm('return($lib.cell.getMirrorUrls(name=newp))')
+
+                    self.eq([], await core00.callStorm('return($lib.cell.getMirrorUrls(name=testsvc))'))
+
+                    provinfo = {'mirror': '00.testsvc'}
+                    provurl = await aha.addAhaSvcProv('01.testsvc', provinfo=provinfo)
+                    ahawait = aha.waiter(1, 'aha:svcadd')
+
+                    svcconf = {'aha:provision': provurl}
+                    async with self.getTestCell(s_t_stormsvc.StormvarServiceCell, conf=svcconf) as svc01:
+
+                        self.gt(len(await ahawait.wait(timeout=6)), 0)  # nexus replay fires 2 events
+                        self.true(await s_coro.event_wait(svc01.nexsroot._mirready, timeout=6))
+
+                        await svc01.sync()
+
+                        expurls = ('aha://01.testsvc.synapse',)
+
+                        self.eq(expurls, await core00.callStorm('return($lib.cell.getMirrorUrls(name=testsvc))'))
+
+                    await aha.delAhaSvc('00.testsvc.synapse')
+
+                    with self.raises(s_exc.NoSuchName):
+                        await core00.callStorm('return($lib.cell.getMirrorUrls(name=testsvc))')
+
+        # No AHA case
+
+        async with self.getTestCore() as core:
+
+            emesg = 'Enumerating mirror URLs is only supported when AHA is configured'
+
+            with self.raises(s_exc.BadConfValu) as cm:
+                await core.callStorm('return($lib.cell.getMirrorUrls())')
+                self.eq(emesg, cm.exception.get('mesg'))
+
+            async with self.getTestCell(s_t_stormsvc.StormvarServiceCell) as svc:
+
+                await self.addSvcToCore(svc, core, svcname='testsvc')
+
+                with self.raises(s_exc.BadConfValu) as cm:
+                    await core.callStorm('return($lib.cell.getMirrorUrls(name=testsvc))')
+                    self.eq(emesg, cm.exception.get('mesg'))
+
     async def test_stormfix_autoadds(self):
 
         async def get_regression_views(cortex):
@@ -56,7 +178,7 @@ class StormCellTest(s_test.SynTest):
                         }
                         $lib.exit('No view found for name={name}', name=$name)
                     }
-                    $ret = $lib.dict()
+                    $ret = ({})
                     $ret.baseview=$get_view(default)
                     $ret.fork1a=$get_view(base1a)
                     $ret.fork2a=$get_view(base2a)
@@ -80,7 +202,7 @@ class StormCellTest(s_test.SynTest):
 
             msgs = await core.stormlist('$r = $lib.cell.hotFixesCheck() $lib.print("r={r}", r=$r)')
             self.stormIsInPrint('Would apply fix (1, 0, 0) for [Create nodes for known missing autoadds.]', msgs)
-            self.stormIsInPrint('r=True', msgs)
+            self.stormIsInPrint('r=true', msgs)
 
             q = '$lib.debug=$lib.true $r = $lib.cell.hotFixesApply() $lib.print("r={r}", r=$r)'
             mesg = '\n'.join(['The following Views will be fixed in order:', '68695c660aa6981192d70e954af0c8e3',
@@ -93,7 +215,7 @@ class StormCellTest(s_test.SynTest):
             self.stormIsInPrint('fix (2, 0, 0)', msgs)
 
             msgs = await core.stormlist('$r = $lib.cell.hotFixesCheck() $lib.print("r={r}", r=$r)')
-            self.stormIsInPrint('r=False', msgs)
+            self.stormIsInPrint('r=false', msgs)
 
             name2view = await get_regression_views(core)
 
@@ -138,7 +260,7 @@ class StormCellTest(s_test.SynTest):
             msgs = await core.stormlist('$r = $lib.cell.hotFixesCheck() $lib.print("r={r}", r=$r)')
             m = 'Would apply fix (2, 0, 0) for [Populate crypto:currency:coin nodes from existing addresses.]'
             self.stormIsInPrint(m, msgs)
-            self.stormIsInPrint('r=True', msgs)
+            self.stormIsInPrint('r=true', msgs)
 
             q = '$lib.debug=$lib.true $r = $lib.cell.hotFixesApply() $lib.print("r={r}", r=$r)'
 
@@ -169,7 +291,7 @@ class StormCellTest(s_test.SynTest):
             self.len(0, await core.nodes('it:sec:cpe:v2_2', opts={'view': view2}))
 
             # Set the hotfix valu
-            opts = {'vars': {'key': s_cell.runtime_fixes_key, 'valu': (2, 0, 0)}}
+            opts = {'vars': {'key': s_stormlib_cell.runtime_fixes_key, 'valu': (2, 0, 0)}}
             await core.callStorm('$lib.globals.set($key, $valu)', opts)
 
             # Run all hotfixes.
@@ -181,3 +303,50 @@ class StormCellTest(s_test.SynTest):
             self.len(1, await core.nodes('it:sec:cpe:v2_2', opts={'view': view0}))
             self.len(2, await core.nodes('it:sec:cpe:v2_2', opts={'view': view1}))
             self.len(1, await core.nodes('it:sec:cpe:v2_2', opts={'view': view2}))
+
+    async def test_stormfix_riskhasvuln(self):
+
+        async with self.getTestCore() as core:
+
+            view0 = core.getView().iden
+            view1 = await core.callStorm('return($lib.view.get().fork().iden)')
+            view2 = await core.callStorm('return($lib.view.add(($lib.layer.add().iden,)).iden)')
+
+            self.len(1, await core.nodes('''
+                [ risk:hasvuln=*
+                    :vuln={[ risk:vuln=* ]}
+                    :software={[ it:prod:softver=* :name=view0 ]}
+                ]
+            ''', opts={'view': view0}))
+
+            self.len(1, await core.nodes('''
+                risk:hasvuln
+                [ :software={[ it:prod:softver=* :name=view1 ]} ]
+            ''', opts={'view': view1}))
+
+            self.len(1, await core.nodes('''
+                [ risk:hasvuln=*
+                    :vuln={[ risk:vuln=* ]}
+                    :host={[ it:host=* :name=view2 ]}
+                ]
+            ''', opts={'view': view2}))
+
+            opts = {'vars': {'key': s_stormlib_cell.runtime_fixes_key, 'valu': (2, 0, 0)}}
+            await core.callStorm('$lib.globals.set($key, $valu)', opts)
+
+            msgs = await core.stormlist('$lib.cell.hotFixesCheck()')
+            printmesgs = [m[1]['mesg'] for m in msgs if m[0] == 'print']
+            self.isin('Would apply fix (3, 0, 0)', printmesgs[0])
+            self.eq('', printmesgs[1])
+            self.isin('Would apply fix (4, 0, 0)', printmesgs[2])
+            self.eq('', printmesgs[3])
+            self.isin('This hotfix should', printmesgs[4])
+            self.eq('', printmesgs[-1])
+
+            msgs = await core.stormlist('$lib.cell.hotFixesApply()')
+            self.stormIsInPrint('Applying hotfix (4, 0, 0) for [Create risk:vulnerable nodes', msgs)
+            self.stormIsInPrint('Applied hotfix (4, 0, 0)', msgs)
+
+            self.len(1, await core.nodes('risk:vulnerable -> it:prod:softver +:name=view0', opts={'view': view0}))
+            self.len(1, await core.nodes('risk:vulnerable -> it:prod:softver +:name=view1', opts={'view': view1}))
+            self.len(1, await core.nodes('risk:vulnerable -> it:host', opts={'view': view2}))

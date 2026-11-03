@@ -37,8 +37,8 @@ class HiveLoadTest(s_test.SynTest):
             hivepath0 = os.path.join(dirn, 'hivesave0.mpk')
             s_msgpack.dumpfile(htree0, hivepath0)
 
-            async with self.getTestHiveDmon() as dmon:
-                hurl = self.getTestUrl(dmon, 'hive')
+            async with self.getTestCell() as cell:
+                hurl = cell.getLocalUrl()
 
                 argv = [hurl, hivepath0]
 
@@ -48,6 +48,7 @@ class HiveLoadTest(s_test.SynTest):
                 with mock.patch('synapse.telepath.Proxy._getSynVers', _getOldSynVers):
                     outp = self.getTestOutp()
                     retn = await s_hiveload.main(argv, outp=outp)
+                    outp.expect('WARNING: synapse.tools.hive.load is deprecated in 2.167.0 and will be removed in 3.0.0')
                     outp.expect('Hive version 0.0.0 is outside of the hive.load supported range')
                     self.eq(1, retn)
 
@@ -63,43 +64,39 @@ class HiveLoadTest(s_test.SynTest):
             s_msgpack.dumpfile(htree1, hivepath1)
             s_common.yamlsave(htree0, yamlpath0)
 
-            async with self.getTestHiveDmon() as dmon:
-
-                hive = dmon.shared.get('hive')
-                hurl = self.getTestUrl(dmon, 'hive')
+            async with self.getTestCell() as cell:
+                hurl = cell.getLocalUrl()
 
                 retn = await s_hiveload.main([hurl, hivepath0])
                 self.eq(0, retn)
 
-                self.eq(20, await hive.get(('hehe',)))
-                self.eq(30, await hive.get(('haha',)))
-                self.eq('bar', await hive.get(('haha', 'foo')))
-                self.eq('faz', await hive.get(('haha', 'baz')))
+                self.eq(20, await cell.hive.get(('hehe',)))
+                self.eq(30, await cell.hive.get(('haha',)))
+                self.eq('bar', await cell.hive.get(('haha', 'foo')))
+                self.eq('faz', await cell.hive.get(('haha', 'baz')))
 
                 retn = await s_hiveload.main([hurl, hivepath1])
                 self.eq(0, retn)
 
-                self.eq(20, await hive.get(('hehe',)))
-                self.eq(30, await hive.get(('haha',)))
-                self.eq('bar', await hive.get(('haha', 'foo')))
-                self.eq('faz', await hive.get(('haha', 'baz')))
+                self.eq(20, await cell.hive.get(('hehe',)))
+                self.eq(30, await cell.hive.get(('haha',)))
+                self.eq('bar', await cell.hive.get(('haha', 'foo')))
+                self.eq('faz', await cell.hive.get(('haha', 'baz')))
 
                 retn = await s_hiveload.main(['--trim', hurl, hivepath1])
                 self.eq(0, retn)
 
-                self.eq(20, await hive.get(('hehe',)))
-                self.eq(30, await hive.get(('haha',)))
-                self.eq('faz', await hive.get(('haha', 'baz')))
+                self.eq(20, await cell.hive.get(('hehe',)))
+                self.eq(30, await cell.hive.get(('haha',)))
+                self.eq('faz', await cell.hive.get(('haha', 'baz')))
 
-                self.none(await hive.get(('haha', 'foo')))
+                self.none(await cell.hive.get(('haha', 'foo')))
 
-            async with self.getTestHiveDmon() as dmon:
-
-                hive = dmon.shared.get('hive')
-                hurl = self.getTestUrl(dmon, 'hive')
+            async with self.getTestCell() as cell:
+                hurl = cell.getLocalUrl()
 
                 await s_hiveload.main(['--path', 'v/i/s/i', '--yaml', hurl, yamlpath0])
-                self.eq('bar', await hive.get(('v', 'i', 's', 'i', 'haha', 'foo')))
+                self.eq('bar', await cell.hive.get(('v', 'i', 's', 'i', 'haha', 'foo')))
 
             path = os.path.join(dirn, 'cell')
             async with await s_cell.Cell.anit(path) as cell:

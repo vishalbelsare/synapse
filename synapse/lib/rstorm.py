@@ -1,9 +1,12 @@
 import os
+import sys
 import copy
-import json
+import shlex
 import pprint
 import logging
+import argparse
 import contextlib
+import subprocess
 import collections
 
 import vcr
@@ -15,20 +18,22 @@ import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.lib.base as s_base
+import synapse.lib.json as s_json
 import synapse.lib.output as s_output
 import synapse.lib.dyndeps as s_dyndeps
 import synapse.lib.stormhttp as s_stormhttp
 
 import synapse.cmds.cortex as s_cmds_cortex
 
-import synapse.tools.storm as s_storm
-import synapse.tools.genpkg as s_genpkg
+import synapse.tools.storm._cli as s_storm
+import synapse.tools.storm.pkg.gen as s_genpkg
 
 
-re_directive = regex.compile(r'^\.\.\s(storm.*|[^:])::(?:\s(.*)$|$)')
+re_directive = regex.compile(r'^\.\.\s(shell.*|storm.*|[^:])::(?:\s(.*)$|$)')
 
 logger = logging.getLogger(__name__)
 
+ONLOAD_TIMEOUT = int(os.getenv('SYNDEV_PKG_LOAD_TIMEOUT', 30))  # seconds
 
 class OutPutRst(s_output.OutPutStr):
     '''
@@ -46,7 +51,6 @@ class OutPutRst(s_output.OutPutStr):
             mesg = '\n'.join((parts[0], mesg0))
 
         return s_output.OutPutStr.printf(self, mesg, addnl)
-
 
 class StormOutput(s_cmds_cortex.StormCmd):
     '''
@@ -67,7 +71,7 @@ class StormOutput(s_cmds_cortex.StormCmd):
         self.stormopts = stormopts or {}
 
         # hide a few mesg types by default
-        for mtype in ('init', 'fini', 'node:edits', 'node:edits:count', 'prov:new'):
+        for mtype in ('init', 'fini', 'node:edits', 'node:edits:count', ):
             self.cmdmeths[mtype] = self._silence
 
         self.core = core
@@ -103,11 +107,13 @@ class StormOutput(s_cmds_cortex.StormCmd):
             body = resp.get('body')
 
             if isinstance(body, (dict, list)):
-                body = json.dumps(body)
+                body = s_json.dumps(body)
+            elif isinstance(body, str):
+                body = body.encode()
 
             info = {
                 'code': resp.get('code', 200),
-                'body': body.encode(),
+                'body': body,
             }
 
         return s_stormhttp.HttpResp(info)
@@ -125,8 +131,8 @@ class StormOutput(s_cmds_cortex.StormCmd):
             # in any of those cases, default to using vcr
             try:
                 with open(path, 'r') as fd:
-                    byts = json.load(fd)
-            except (FileNotFoundError, json.decoder.JSONDecodeError):
+                    byts = s_json.load(fd)
+            except (FileNotFoundError, s_exc.BadJsonText):
                 byts = None
 
             if not byts:
@@ -165,7 +171,9 @@ class StormOutput(s_cmds_cortex.StormCmd):
         if self.ctx.pop('storm-fail', None):
             s_cmds_cortex.StormCmd._onErr(self, mesg, opts)
             return
-        raise s_exc.StormRuntimeError(mesg=mesg)
+        (errname, errinfo) = mesg[1]
+        errinfo.setdefault('_errname', errname)
+        raise s_exc.StormRuntimeError(**errinfo)
 
     async def runCmdOpts(self, opts):
 
@@ -207,7 +215,7 @@ class StormCliOutput(s_storm.StormCli):
         self.ctx = {}
         self._print_skips.append('init')
         self._print_skips.append('fini')
-        self._print_skips.append('prov:new')
+        self._print_skips.append('prov:new')  # TODO: Remove in v3.0.0
         self._print_skips.append('node:edits')
         self._print_skips.append('node:edits:count')
 
@@ -246,11 +254,13 @@ class StormCliOutput(s_storm.StormCli):
             body = resp.get('body')
 
             if isinstance(body, (dict, list)):
-                body = json.dumps(body)
+                body = s_json.dumps(body)
+            elif isinstance(body, str):
+                body = body.encode()
 
             info = {
                 'code': resp.get('code', 200),
-                'body': body.encode(),
+                'body': body,
             }
 
         return s_stormhttp.HttpResp(info)
@@ -268,8 +278,8 @@ class StormCliOutput(s_storm.StormCli):
             # in any of those cases, default to using vcr
             try:
                 with open(path, 'r') as fd:
-                    byts = json.load(fd)
-            except (FileNotFoundError, json.decoder.JSONDecodeError):
+                    byts = s_json.load(fd)
+            except (FileNotFoundError, s_exc.BadJsonText):
                 byts = None
 
             if not byts:
@@ -322,6 +332,8 @@ class StormRst(s_base.Base):
         self.core = None
 
         self.handlers = {
+            'shell': self._handleShell,
+            'shell-env': self._handleShellEnv,
             'storm': self._handleStorm,
             'storm-cli': self._handleStormCli,
             'storm-pkg': self._handleStormPkg,
@@ -332,6 +344,7 @@ class StormRst(s_base.Base):
             'storm-cortex': self._handleStormCortex,
             'storm-envvar': self._handleStormEnvVar,
             'storm-expect': self._handleStormExpect,
+            'storm-python-path': self._handlePythonPath,
             'storm-multiline': self._handleStormMultiline,
             'storm-mock-http': self._handleStormMockHttp,
             'storm-vcr-opts': self._handleStormVcrOpts,
@@ -361,6 +374,22 @@ class StormRst(s_base.Base):
         if handler is None:
             raise s_exc.NoSuchName(mesg=f'The {directive} directive is not supported', directive=directive)
         return handler
+
+    async def _handlePythonPath(self, text):
+        '''
+        Add the text to sys.path.
+
+        Args:
+            text: The path to add.
+        '''
+        if not os.path.isdir(text):
+            raise s_exc.NoSuchDir(mesg=f'The path {text} is not a directory', path=text)
+        if text not in sys.path:
+            logger.debug(f'Inserting {text} into sys.path')
+            sys.path.insert(0, text)
+            def onfini():
+                sys.path.remove(text)
+            self.onfini(onfini)
 
     async def _handleStorm(self, text):
         '''
@@ -413,7 +442,16 @@ class StormRst(s_base.Base):
         core = self._reqCore()
 
         pkg = s_genpkg.loadPkgProto(text)
+
+        if pkg.get('onload') is not None or pkg.get('inits') is not None:
+            waiter = core.waiter(1, 'core:pkg:onload:complete')
+        else:
+            waiter = None
+
         await core.addStormPkg(pkg)
+
+        if waiter is not None and not await waiter.wait(timeout=ONLOAD_TIMEOUT):
+            raise s_exc.SynErr(mesg=f'Package onload failed to run for {pkg.get("name")}')
 
     async def _handleStormPre(self, text):
         '''
@@ -449,9 +487,12 @@ class StormRst(s_base.Base):
 
         splts = text.split(' ', 2)
         ctor, svcname = splts[:2]
-        svcconf = json.loads(splts[2].strip()) if len(splts) == 3 else {}
+        svcconf = s_json.loads(splts[2].strip()) if len(splts) == 3 else {}
 
         svc = await self._getCell(ctor, conf=svcconf)
+
+        onloadcnt = len(svc.cellapi._storm_svc_pkgs)
+        waiter = core.waiter(onloadcnt, 'core:pkg:onload:complete') if onloadcnt else None
 
         svc.dmon.share('svc', svc)
         root = await svc.auth.getUserByName('root')
@@ -463,8 +504,11 @@ class StormRst(s_base.Base):
         await core.nodes(f'service.add {svcname} {surl}')
         await core.nodes(f'$lib.service.wait({svcname})')
 
+        if waiter is not None and not await waiter.wait(timeout=ONLOAD_TIMEOUT):
+            raise s_exc.SynErr(mesg=f'Package onload failed to run for service {svcname}')
+
     async def _handleStormFail(self, text):
-        valu = json.loads(text)
+        valu = s_json.loads(text)
         assert valu in (True, False), f'storm-fail must be a boolean: {text}'
         self.context['storm-fail'] = valu
 
@@ -481,7 +525,7 @@ class StormRst(s_base.Base):
     async def _handleStormMultiline(self, text):
         key, valu = text.split('=', 1)
         assert key.isupper()
-        valu = json.loads(valu)
+        valu = s_json.loads(valu)
         assert isinstance(valu, str)
         multi = self.context.get('multiline', {})
         multi[key] = valu
@@ -494,7 +538,7 @@ class StormRst(s_base.Base):
         Args:
             text (str): JSON string, e.g. {"vars": {"foo": "bar"}}
         '''
-        item = json.loads(text)
+        item = s_json.loads(text)
         self.context['storm-opts'] = item
 
     async def _handleStormClearHttp(self, text):
@@ -562,7 +606,7 @@ class StormRst(s_base.Base):
         Args:
             text (str): JSON string, e.g. {"filter_query_args": true}
         '''
-        item = json.loads(text)
+        item = s_json.loads(text)
         self.context['storm-vcr-opts'] = item
 
     async def _handleStormVcrCallback(self, text):
@@ -573,6 +617,65 @@ class StormRst(s_base.Base):
         if cb is None:
             raise s_exc.NoSuchCtor(mesg=f'Failed to get callback "{text}"', ctor=text)
         self.context['storm-vcr-callback'] = cb
+
+    async def _handleShell(self, text):
+        '''
+        Execute shell with the supplied arguments.
+        '''
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('--include-stderr', action='store_true', help='Include stderr in output.')
+        parser.add_argument('--hide-query', action='store_true', help='Do not include the command in the output.')
+        parser.add_argument('--fail-ok', action='store_true', help='Non-zero return values are non-fatal.')
+        opts, args = parser.parse_known_args(shlex.split(text))
+
+        # Remove any command line arguments
+        query = text
+        query = query.replace('--include-stderr', '')
+        query = query.replace('--hide-query', '')
+        query = query.replace('--fail-ok', '')
+        query = query.strip()
+
+        env = dict(os.environ)
+        env.update(self.context.get('shell-env', {}))
+
+        stderr = None
+        if opts.include_stderr:
+            stderr = subprocess.STDOUT
+
+        proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=stderr, env=env, text=True)
+        if proc.returncode != 0 and not opts.fail_ok:
+            mesg = f'Error when executing shell directive: {text} (rv: {proc.returncode})'
+            raise s_exc.SynErr(mesg=mesg)
+
+        self._printf('::\n\n')
+
+        if not opts.hide_query:
+            self._printf(f'  {query}\n\n')
+
+        for line in proc.stdout.splitlines():
+            self._printf(f'  {line}\n')
+
+        self._printf('\n\n')
+
+    async def _handleShellEnv(self, text):
+        '''
+        Env to use in subsequent shell queries.
+
+        Args:
+            text (str): [KEY=VALUE ...]
+                Note: No arguments will reset the shell environment.
+        '''
+        text = text.strip()
+        if not text:
+            return self.context.pop('shell-env')
+
+        env = {}
+
+        for item in text.split(' '):
+            key, val = item.split('=')
+            env[key] = val
+
+        self.context['shell-env'] = env
 
     async def _readline(self, line):
 

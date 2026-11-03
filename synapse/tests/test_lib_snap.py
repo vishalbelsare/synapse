@@ -1,13 +1,16 @@
 import gc
 import random
 import asyncio
+import weakref
 import contextlib
 import collections
+import unittest.mock as mock
 
 import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.lib.coro as s_coro
+import synapse.lib.snap as s_snap
 
 from synapse.tests.utils import alist
 import synapse.tests.utils as s_t_utils
@@ -276,6 +279,16 @@ class SnapTest(s_t_utils.SynTest):
             self.len(1, await alist(view1.eval('inet:ipv4 +:asn=42')))
             self.len(1, await alist(view1.eval('inet:ipv4 +#woot')))
 
+            await view0.core.nodes('[ inet:ipv4=1.1.1.1 :asn=5 ]')
+            nodes = await view0.core.nodes('inet:ipv4=1.1.1.1 [ :asn=6 ]', opts={'view': view1.iden})
+
+            await view0.core.nodes('inet:ipv4=1.1.1.1 | delnode')
+            edits = await nodes[0]._getPropDelEdits('asn')
+
+            root = view0.core.auth.rootuser
+            async with await view1.snap(user=root) as snap:
+                await snap.applyNodeEdit((nodes[0].buid, 'inet:ipv4', edits))
+
     async def test_cortex_lift_layers_bad_filter(self):
         '''
         Test a two layer cortex where a lift operation gives the wrong result
@@ -330,6 +343,19 @@ class SnapTest(s_t_utils.SynTest):
             self.len(1, await alist(view0.eval('[ inet:ipv4=1.2.3.4 :asn=99 ]')))
             self.len(0, await alist(view1.eval('inet:ipv4:asn=99')))
 
+            self.len(1, await alist(view0.eval('[ inet:ipv4=1.2.3.5 :asn=43 ]')))
+            self.len(2, await alist(view1.eval('inet:ipv4:asn')))
+
+            await view0.core.addTagProp('score', ('int', {}), {})
+
+            self.len(1, await alist(view1.eval('inet:ipv4=1.2.3.4 [ +#foo:score=42 ]')))
+            self.len(1, await alist(view0.eval('inet:ipv4=1.2.3.4 [ +#foo:score=42 ]')))
+            self.len(1, await alist(view0.eval('inet:ipv4=1.2.3.4 [ +#foo:score=99 ]')))
+            self.len(1, await alist(view0.eval('inet:ipv4=1.2.3.5 [ +#foo:score=43 ]')))
+
+            nodes = await alist(view1.eval('#foo:score'))
+            self.len(2, await alist(view1.eval('#foo:score')))
+
     async def test_cortex_lift_bytype(self):
         async with self.getTestCore() as core:
             await core.nodes('[ inet:dns:a=(vertex.link, 1.2.3.4) ]')
@@ -340,12 +366,8 @@ class SnapTest(s_t_utils.SynTest):
 
     async def test_clearcache(self):
 
-        # Type hinting since we dont do the type hinting
-        # properly in the Cortex anymore... :(
-        import synapse.lib.snap as s_snap
-
         async with self.getTestCore() as core:
-            async with await core.snap() as snap0:  # type: s_snap.Snap
+            async with await core.snap() as snap0:
 
                 original_node0 = await snap0.addNode('test:str', 'node0')
                 self.len(1, snap0.buidcache)
@@ -358,7 +380,7 @@ class SnapTest(s_t_utils.SynTest):
                 self.len(4, snap0.livenodes)
                 self.len(3, snap0.tagnorms)
 
-                async with await core.snap() as snap1:  # type: s_snap.Snap
+                async with await core.snap() as snap1:
                     snap1_node0 = await snap1.getNodeByNdef(('test:str', 'node0'))
                     await snap1_node0.delTag('foo.bar.baz')
                     self.notin('foo.bar.baz', snap1_node0.tags)
@@ -414,6 +436,10 @@ class SnapTest(s_t_utils.SynTest):
             self.len(1, await view1.nodes('#woot:score=20'))
 
             self.len(1, await view0.nodes('[ test:int=10 +#woot:score=40 ]'))
+
+            self.len(1, await view0.nodes('[ test:int=20 +#woot:score=10 ]'))
+            self.len(1, await view1.nodes('[ test:int=20 +#foo:score=10 ]'))
+            self.len(2, await view1.nodes('#woot:score'))
 
     async def test_cortex_lift_layers_ordering(self):
 
@@ -561,7 +587,10 @@ class SnapTest(s_t_utils.SynTest):
     async def test_snap_editor(self):
 
         async with self.getTestCore() as core:
-            nodes = await core.nodes('[ media:news=63381924986159aff183f0c85bd8ebad +(refs)> {[ inet:fqdn=vertex.link ]} ]')
+
+            await core.nodes('$lib.model.ext.addTagProp(test, (str, ({})), ({}))')
+            await core.nodes('[ media:news=63381924986159aff183f0c85bd8ebad +(refs)> {[ inet:fqdn=vertex.link ]} +#foo ]')
+
             root = core.auth.rootuser
             async with await core.view.snap(user=root) as snap:
                 async with snap.getEditor() as editor:
@@ -571,13 +600,132 @@ class SnapTest(s_t_utils.SynTest):
                     self.len(0, editor.getNodeEdits())
 
                     self.true(await news.addEdge('pwns', s_common.ehex(fqdn.buid)))
+                    self.false(await news.addEdge('pwns', s_common.ehex(fqdn.buid)))
                     nodeedits = editor.getNodeEdits()
                     self.len(1, nodeedits)
                     self.len(1, nodeedits[0][2])
 
+                    self.true(await news.delEdge('pwns', s_common.ehex(fqdn.buid)))
+                    nodeedits = editor.getNodeEdits()
+                    self.len(0, nodeedits)
+
+                    self.true(await news.addEdge('pwns', s_common.ehex(fqdn.buid)))
+                    nodeedits = editor.getNodeEdits()
+                    self.len(1, nodeedits)
+                    self.len(1, nodeedits[0][2])
+
+                    self.false(await news.hasData('foo'))
+                    await news.setData('foo', 'bar')
+                    self.true(await news.hasData('foo'))
+
+                    self.false(news.hasTagProp('foo', 'test'))
+                    await news.setTagProp('foo', 'test', 'bar')
+                    self.true(news.hasTagProp('foo', 'test'))
+
+                async with snap.getEditor() as editor:
+                    news = await editor.addNode('media:news', '63381924986159aff183f0c85bd8ebad')
+
+                    self.true(await news.delEdge('pwns', s_common.ehex(fqdn.buid)))
+                    self.false(await news.delEdge('pwns', s_common.ehex(fqdn.buid)))
+                    nodeedits = editor.getNodeEdits()
+                    self.len(1, nodeedits)
+                    self.len(1, nodeedits[0][2])
+
+                    self.true(await news.addEdge('pwns', s_common.ehex(fqdn.buid)))
+                    nodeedits = editor.getNodeEdits()
+                    self.len(0, nodeedits)
+
+                    snap.strict = False
+                    self.false(await news.addEdge(1, s_common.ehex(fqdn.buid)))
+                    self.false(await news.addEdge('pwns', 1))
+                    self.false(await news.addEdge('pwns', 'bar'))
+                    self.false(await news.delEdge(1, s_common.ehex(fqdn.buid)))
+                    self.false(await news.delEdge('pwns', 1))
+                    self.false(await news.delEdge('pwns', 'bar'))
+
+                    self.true(await news.hasData('foo'))
+
+                    self.true(news.hasTagProp('foo', 'test'))
+
             self.len(1, await core.nodes('media:news -(pwns)> *'))
 
-            self.len(1, await core.nodes('[ inet:dns:soa=(lol,) :fqdn=vertex.link ]'))
-            self.len(1, await core.nodes('inet:dns:soa=(lol,) [ :fqdn=vertex.link ]'))
+            self.len(1, await core.nodes('[ test:ro=foo :writeable=hehe :readable=haha ]'))
+            self.len(1, await core.nodes('test:ro=foo [ :readable = haha ]'))
             with self.raises(s_exc.ReadOnlyProp):
-                await core.nodes('inet:dns:soa=(lol,) [ :fqdn=woot.com ]')
+                await core.nodes('test:ro=foo [ :readable=newp ]')
+
+            # with gc disabled, editors and their protonodes are freed by reference counting alone
+            editors = []
+
+            class Editor(s_snap.SnapEditor):
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    editors.append(weakref.ref(self))
+
+            gc.collect()
+            gc.disable()
+            try:
+                with mock.patch.object(s_snap, 'SnapEditor', Editor):
+
+                    async with await core.view.snap(user=root) as snap:
+
+                        fnode = await snap.getNodeByNdef(('inet:fqdn', 'vertex.link'))
+
+                        async with snap.getNodeEditor(fnode) as protonode:
+                            await protonode.set('issuffix', False)
+
+                        self.len(0, protonode.ctx.protonodes)
+
+                        with self.raises(s_exc.BadArg):
+                            async with snap.getNodeEditor(fnode) as protonode:
+                                await protonode.set('issuffix', True)
+                                await protonode.addTag('gc')
+                                raise s_exc.BadArg()
+
+                        self.len(0, protonode.ctx.protonodes)
+
+                        async with snap.getEditor() as editor:
+                            await editor.addNode('inet:fqdn', 'gc.vertex.link')
+
+                        self.len(0, editor.protonodes)
+
+                        with self.raises(s_exc.BadArg):
+                            async with snap.getEditor() as editor:
+                                await editor.addNode('inet:fqdn', 'newp.vertex.link')
+                                raise s_exc.BadArg()
+
+                        self.len(0, editor.protonodes)
+
+                        nodedefs = [(('inet:fqdn', f'{x}.gc.vertex.link'), {}) for x in range(10)]
+                        self.len(10, await alist(snap.addNodes(nodedefs)))
+
+                del editor
+                del protonode
+
+                self.gt(len(editors), 0)
+                self.eq([], [ref for ref in editors if ref() is not None])
+
+            finally:
+                gc.enable()
+
+            # edits are only applied when the editor exits normally
+            self.len(1, await core.nodes('inet:fqdn=vertex.link +:issuffix=0'))
+            self.len(0, await core.nodes('inet:fqdn=vertex.link +#gc'))
+            self.len(1, await core.nodes('inet:fqdn=gc.vertex.link'))
+            self.len(0, await core.nodes('inet:fqdn=newp.vertex.link'))
+
+    async def test_snap_subs_depth(self):
+
+        async with self.getTestCore() as core:
+            fqdn = '.'.join(['x' for x in range(300)]) + '.foo.com'
+            q = f'[ inet:fqdn="{fqdn}"]'
+            nodes = await core.nodes(q)
+            self.len(1, nodes)
+            self.eq(nodes[0].get('zone'), 'foo.com')
+
+    async def test_snap_path_depr(self):
+
+        async with self.getTestCore() as core:
+            msgs = await core.stormlist('[ test:str=foo ]', opts={'path': True})
+            self.stormIsInWarn("The 'path' option is deprecated", msgs)

@@ -32,7 +32,8 @@ class MultiSlabSeqn(s_base.Base):
     async def __anit__(self,  # type: ignore
                        dirn: str,
                        opts: Optional[Dict] = None,
-                       slabopts: Optional[Dict] = None):
+                       slabopts: Optional[Dict] = None,
+                       cell=None):
         '''
         Args:
             dirn (str):  directory where to store the slabs
@@ -49,6 +50,7 @@ class MultiSlabSeqn(s_base.Base):
         self.offsevents: List[Tuple[int, int, asyncio.Event]] = []  # as a heap
         self._waitcounter = 0
 
+        self.cell = cell
         self.dirn: str = dirn
         s_common.gendir(self.dirn)
         self.slabopts: Dict[str, Any] = {} if slabopts is None else slabopts
@@ -148,7 +150,7 @@ class MultiSlabSeqn(s_base.Base):
                     firstidx = firstitem[0]  # might not match the separately stored first index due to culling
 
                     if firstidx < fnstartidx:
-                        raise s_exc.BadCoreStore('Multislab:  filename inconsistent with contents')
+                        raise s_exc.BadCoreStore(mesg='Multislab:  filename inconsistent with contents')
 
                     lastidx = seqn.index() - 1
 
@@ -159,7 +161,7 @@ class MultiSlabSeqn(s_base.Base):
             self.firstindx = lowindx
 
         if self.firstindx > self.indx:
-            raise s_exc.BadCoreStore('Invalid firstindx value')
+            raise s_exc.BadCoreStore(mesg='Invalid firstindx value')
 
         await self._initTailSlab(fnstartidx)
 
@@ -281,6 +283,9 @@ class MultiSlabSeqn(s_base.Base):
             fn = self.slabFilename(self.dirn, startidx)
 
             slab = await s_lmdbslab.Slab.anit(fn, **self.slabopts)
+            if self.cell is not None:
+                slab.addResizeCallback(self.cell.checkFreeSpace)
+
             seqn = slab.getSeqn('nexuslog')
 
             self._openslabs[startidx] = slab, seqn
@@ -348,8 +353,43 @@ class MultiSlabSeqn(s_base.Base):
         else:
             indx = self.indx
 
-        assert self.tailseqn
         retn = self.tailseqn.add(item, indx=indx)
+
+        if advances:
+            self.indx += 1
+
+            self._wake_waiters()
+
+        return retn
+
+    async def addWithPackRetn(self, item, indx=None):
+        '''
+        Add a single item to the sequence, returning the offset and packed item.
+        '''
+        advances = True
+
+        if indx is not None:
+            if indx < self.firstindx:
+                raise s_exc.BadIndxValu(mesg=f'indx lower than first index in sequence {self.firstindx}')
+
+            if indx < self._ranges[-1]:
+                ridx = self._getRangeIndx(indx)
+                assert ridx is not None
+
+                async with self._getSeqn(ridx) as seqn:
+                    retn = seqn.addWithPackRetn(item, indx=indx)
+
+                return retn
+
+            if indx >= self.indx:
+                self.indx = indx
+            else:
+                advances = False
+        else:
+            indx = self.indx
+
+        assert self.tailseqn
+        retn = self.tailseqn.addWithPackRetn(item, indx=indx)
 
         if advances:
             self.indx += 1

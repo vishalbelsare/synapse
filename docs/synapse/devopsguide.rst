@@ -41,8 +41,8 @@ HTTPS Certificates
 ------------------
 
 Synapse services that expose HTTPS APIs will automatically generate a self-signed certificate and key if they are not found
-at ``sslcert.crt`` and ``sslkey.pem`` in the service storage directory. At any time, you can replace these self-signed
-files with a certificate and key generated using :ref:`syn-tools-easycert` or generated and signed by an external CA.
+at ``sslcert.pem`` and ``sslkey.pem`` in the service storage directory. At any time, you can replace these self-signed
+files with a certificate and key generated using :ref:`syn-tools-utils-easycert` or generated and signed by an external CA.
 
 Common Devops Tasks
 ===================
@@ -56,19 +56,19 @@ Generating a Backup
     If you are a Synapse Enterprise customer you should deploy the Synapse-Backup_ Advanced Power-Up.
 
 It is strongly recommended that users schedule regular backups of all services deployed within their Synapse
-ecosystem. Each service must be backed up using either the **live** backup tool ``synapse.tools.livebackup`` or
-the offline backup tool ``synapse.tools.backup``.
+ecosystem. Each service must be backed up using either the **live** backup tool ``synapse.tools.service.livebackup`` or
+the offline backup tool ``synapse.tools.service.backup``.
 
 For a production deployment similar to the one described in the :ref:`deploymentguide` you can easily run
 the backup tool by executing a shell **inside** the docker container.  For example, if we were generating
 a backup of the Cortex we would::
 
     cd /srv/syn/00.cortex
-    docker-compose exec 00.cortex /bin/bash
+    docker compose exec 00.cortex /bin/bash
 
 And from the shell executed within the container::
 
-    python -m synapse.tools.livebackup
+    python -m synapse.tools.service.livebackup
 
 This will generate a backup in a time stamp directory similar to::
 
@@ -85,11 +85,23 @@ At this point it is safe to use standard tools like ``mv``, ``tar``, and ``scp``
 
 .. note::
 
-    It is important that you use ``synapse.tools.livebackup`` to ensure a transactionally consistant backup.
+    It is important that you use ``synapse.tools.service.livebackup`` to ensure a transactionally consistant backup.
+
+.. note::
+
+    When taking a backup of a service, the backup is written by the service locally to disk. This may take
+    up storage space equal to the current size of the service. If the service does not have the ``backup:dir`` option
+    configured for a dedicated backup directory (or volume), this backup is made to ``/vertex/storage/backups`` by
+    default. If the volume backing ``/vertex/storage`` reaches a maximum capacity, the backup process will fail.
+
+    To avoid this from being an issue, when using the default configuration, make sure services do not exceed 50% of
+    their storage utilization. For example, a Cortex that has a size of 32GB of utilized space may take up 32GB
+    during a backup. The volume backing ``/vertex/storage`` should be at least 64GB in size to avoid issues taking
+    backups.
 
 It is also worth noting that the newly created backup is a defragmented / optimized copy of the databases.
 We recommend occasionally scheduling a maintenance window to create a "cold backup" using the offline
-``synapse.tools.backup`` command with the service offline and deploy the backup copy when bringing the service
+``synapse.tools.service.backup`` command with the service offline and deploy the backup copy when bringing the service
 back online.  Regularly performing this "restore from cold backup" procedure can dramatically improve performance
 and resource utilization.
 
@@ -103,15 +115,15 @@ simple. For a production deployment similar to the one described in :ref:`deploy
 the backup file as described in :ref:`devops-task-backup`::
 
     cd /srv/syn/00.cortex
-    docker-compose down
+    docker compose down
     mv storage storage.broken
     cp -R /nfs/backups/00.cortex/20220422094622 storage
-    docker-compose up -d
+    docker compose up -d
 
 Then you can tail the logs to ensure the service is fully restored::
 
     cd /srv/syn/00.cortex
-    docker-compose logs -f
+    docker compose logs -f
 
 .. _devops-task-promote:
 
@@ -123,22 +135,22 @@ Promoting a Mirror
     as well as use TLS client-certificates for service authentication.
 
 To gracefully promote a mirror which was deployed in a similar fashion to the one described in :ref:`deploymentguide`
-you can use the built-in promote tool ``synapse.tools.promote``. Begin by executing a shell within the mirror container::
+you can use the built-in promote tool ``synapse.tools.service.promote``. Begin by executing a shell within the mirror container::
 
     cd /srv/syn/01.cortex
-    docker-compose exec 01.cortex /bin/bash
+    docker compose exec 01.cortex /bin/bash
 
 And from the shell executed within the container::
 
-    python -m synapse.tools.promote
+    python -m synapse.tools.service.promote
 
 Once completed, the previous leader will now be configured as a follower of the newly promoted leader.
 
 .. note::
 
     If you are promoting the follower due to a catastrophic failure of the previous leader, you may use the
-    command ``synapse.tools.promote --failure`` to force promotion despite not being able to carry out a graceful
-    handoff. It is **critcal that you not bring the previous leader back online** once this has been done. To regain
+    command ``synapse.tools.service.promote --failure`` to force promotion despite not being able to carry out a graceful
+    handoff. It is **critical that you not bring the previous leader back online** once this has been done. To regain
     redundancy, deploy a new mirror using the AHA provisioning process described in the :ref:`deploymentguide`.
 
 .. _devops-task-update:
@@ -151,24 +163,29 @@ services which have mirrors deployed, you must ensure that the mirrors are updat
 change messages can be consumed. If you are using a mirrors-of-mirrors tree topology, the update should be deployed in
 a "leafs first" order.
 
+.. note::
+
+    A service mirror will enter into read-only mode if they detect that their leader is a higher version than they are.
+
 Continuing with our previous example from the :ref:`deploymentguide` we would update the mirror ``01.cortex`` first::
 
     cd /srv/syn/01.cortex
-    docker-compose pull
-    docker-compose down
-    docker-compose up -d
+    docker compose pull
+    docker compose down
+    docker compose up -d
 
 After ensuring that the mirror has come back online and is fully operational, we will update the leader which may
 include a :ref:`datamigration` while it comes back online::
 
     cd /srv/syn/00.cortex
-    docker-compose pull
-    docker-compose down
-    docker-compose up -d
+    docker compose pull
+    docker compose down
+    docker compose up -d
 
 .. note::
 
-    Once a Synapse service update has been deployed, you may **NOT** revert to a previous version!
+    Once a Synapse service update has been deployed, you may **NOT** revert to a previous version! Reverting services
+    to prior versions is not supported.
 
 .. _datamigration:
 
@@ -179,8 +196,9 @@ When a Synapse release contains a data migration for a part of the Synapse data 
 what component is being migrated and why. This will be made under the ``Automated Migrations`` header, at the
 top of the changelog.
 
-Automatic data migrations may cause additional startup times on the first boot of the version. When beginning a data
-migration, a WARNING level log message will be printed for each stage of the migration::
+Automatic data model migrations may cause additional load on the on the first boot of the version, as the migrations
+are run in the background. When beginning a data migration, a WARNING level log message will be printed for each stage
+of the migration::
 
      beginning model migration -> (0, 2, 8)
 
@@ -191,6 +209,9 @@ Once complete, a WARNING level log message will be issued::
 .. note::
 
     Please ensure you have a tested backup available before applying these updates.
+
+Synapse Services may have additional data migrations applied during updates as well. These will always be noted in the
+Changelog for an individual service.
 
 .. _modelflagday:
 
@@ -219,6 +240,94 @@ environment to help identify any tweaks that may be necessary due to the updated
 
     Please ensure you have a tested backup available before applying these updates.
 
+.. _devops-task-low-downtime-updates:
+
+Low Downtime Updates
+~~~~~~~~~~~~~~~~~~~~
+
+For services that are deployed in a mirror configuration, service upgrades can be performed with minimal downtime.
+
+#. Update the service mirrors.
+#. Use the Synapse ``synapse.tools.service.promote`` tool to promote a service as a mirror. This will start any data migrations
+   which need to happen. Cortex data model migrations will be checked and executed as well.
+#. Update the old service leader.
+
+Continuing with our previous example from the :ref:`deploymentguide` we would update the mirror ``01.cortex`` first::
+
+    cd /srv/syn/01.cortex
+    docker compose pull
+    docker compose down
+    docker compose up -d
+
+Then we would promote the mirror to being a leader. This promotion will also start any data migrations that need to
+be performed::
+
+    cd /srv/syn/01.cortex
+    docker compose exec 01.cortex python -m synapse.tools.service.promote
+
+After the promotion is completed, the previous leader can be updated. Since it is now mirroring ``01.cortex``, it will
+start to replicate any changes from the leader once it comes online, including any data migrations that are being
+performed::
+
+    cd /srv/syn/00.cortex
+    docker compose pull
+    docker compose down
+    docker compose up -d
+
+Restarting the old leader ensures that any services previously talking to ``aha://cortex...`` will automatically
+reconnect to the new leader.
+
+Update Sequencing
+~~~~~~~~~~~~~~~~~
+
+.. note::
+
+    Some of the services mentioned here are part of our commercial offering.
+
+When deploying updates, we suggest deploying updates to the entire ecosystem in the following order:
+
+#. AHA, Axon, and the JSONStor services:
+
+    This order ensures that the AHA service, Axon, and JSONStor services are all updated first.
+
+#. Cortex:
+
+    Next, the Cortex should be updated. It may use new or updated APIs from the previous services.
+
+#. Search and Metrics services:
+
+    The Search and Metrics updates, in turn, may use new or updated APIs from the Cortex.
+
+#. Optic:
+
+    The Optic service may use new or updated APIs from the previous services. Optic has its own version
+    requirements for communicating with the Cortex and will not work if that version requirement is unmet.
+
+#. Any remaining Advanced Power-Ups:
+
+    Remaining Advanced Power-Ups would provide new or updated functionality to other services.
+
+#. Any Rapid Power-Ups:
+
+    Some Rapid Power-Ups may integrate with Advanced Power-Ups to provide additional functionality. Having the Advanced
+    Power-Ups updated ensures that any optional dependencies that the Rapid Power-Ups may have would be met.
+
+Updating Rapid Power-Ups
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+When updating Rapid Power-Ups, the ``vertex.pkg.upgrade`` command can be used to upgrade all installed packages, or to
+upgrade individual packages.
+
+If you are using the Optic UI for managing Rapid Power-Ups, you can use it to review available upgrades and review
+their changelogs prior to upgrading. It can also be used to update all available Rapid Power-Ups for you at once.
+
+Release Cadence
+~~~~~~~~~~~~~~~
+
+Vertex does not follow a strict release cadence for Synapse, Advanced Power-Ups, or Rapid Power-Ups. As we develop new
+functionality and address issues, we will release new versions of Synapse and Power-Ups on an as-needed basis.
+We recommend that users and organizations adopt an upgrade cycle that works for their operational needs.
+
 .. _devops-task-logging:
 
 Configure Logging
@@ -235,50 +344,151 @@ to the ``docker`` container::
     SYN_LOG_STRUCT=true
 
 These structured logs are designed to be easy to ingest into third party log collection platforms. They contain the log
-message, level, time, and metadata about where the log message came from::
+message, level, time, and metadata about where the log message came from. The structure contains the following keys:
+
+``service``
+  The full AHA service name is present when the service is registered with AHA. Logs from early in the boot process of
+  a service may not have this field populated.
+
+``message``
+  The log message text.
+
+``logger``
+  Metadata about the logger which created the log message.
+
+``time``
+  Timestamp when the log message was emitted.
+
+``user`` and ``username``
+  User information appears at the top level of each log entry when an authenticated user context is active.
+
+``params``
+  Extra log metadata which recorded with the logging call. This includes additional data about the log event,
+  represented in a structured way for inspection.
+
+``error``
+  Exception information is recorded under the ``error`` key (previously this was ``err``). The ``error`` object
+  contains a ``code`` (exception class name), ``traceback`` (list of frames), ``mesg`` (human-readable message), and an
+  ``info`` dictionary for ``SynErr`` subclasses. Chained exceptions are included via ``cause`` and ``context``
+  sub-keys, corresponding to the Python ``__cause__`` and ``__context__`` attributes on Exception classes. Exception
+  groups are included via a ``group`` list.
+
+The following is an example of a the log event for a user executing a Storm query::
 
     {
-      "message": "log level set to INFO",
+      "service": "00.cortex.synapse",
+      "message": "Executing storm query {[inet:asn=1234]} as [someUsername]",
       "logger": {
-        "name": "synapse.lib.cell",
+        "name": "synapse.storm",
+        "func": "_logStormQuery",
         "process": "MainProcess",
-        "filename": "common.py",
-        "func": "setlogging"
+        "thread": "MainThread"
       },
       "level": "INFO",
-      "time": "2021-06-28 15:47:54,825"
+      "time": "2026-02-13 10:38:24,545",
+      "user": "e3532bc88fa66afb592e6a1474a98675",
+      "username": "someUsername",
+      "params": {  # Param
+        "mode": "storm",
+        "view": "715a5c9ae37e4045795ea3f3cabb44fb",
+        "text": "[inet:asn=1234]",
+        "hash": "ef94e89eb3bc309a40242876f6c5f296"
+      }
     }
 
-When exceptions are logged with structured logging, we capture additional information about the exception, including the
-entire traceback. In the event that the error is a Synapse Err class, we also capture additional metadata which was
-attached to the error. In the following example, we also have the query text, username and user iden available in the
-log message pretty-printed log message::
+While a human friendly ``message`` key is present, the ``params`` captures additional structured data, such as the raw
+query text and the view that the query was executed in.
+
+The following error example shows an example of a exception raised during the execution of a Storm query. The execption
+``info`` is present, showing the ``key=valu`` data that was captured; and the query text is also captured in ``params``
+by the this particular error handler. ::
 
     {
-      "message": "Error during storm execution for { || }",
+      "service": "00.cortex.synapse",
+      "message": "Error during storm execution for { $lib.raise(Newp, 'ruh roh', key=valu) }",
       "logger": {
         "name": "synapse.lib.view",
+        "func": "runStorm",
         "process": "MainProcess",
-        "filename": "view.py",
-        "func": "runStorm"
+        "thread": "MainThread"
       },
       "level": "ERROR",
-      "time": "2021-06-28 15:49:34,401",
-      "err": {
-        "efile": "coro.py",
-        "eline": 233,
-        "esrc": "return await asyncio.get_running_loop().run_in_executor(forkpool, _runtodo, todo)",
-        "ename": "forked",
-        "at": 1,
-        "text": "||",
-        "mesg": "No terminal defined for '|' at line 1 col 2.  Expecting one of: #, $, (, *, + or -, -(, -+>, -->, ->, :, <(, <+-, <-, <--, [, break, command name, continue, fini, for, function, if, init, property name, return, switch, while, whitespace or comment, yield, {",
-        "etb": ".... long traceback ...",
-        "errname": "BadSyntax"
+      "time": "2026-02-13 11:24:06,853",
+      "user": "e3532bc88fa66afb592e6a1474a98675",
+      "username": "someUsername"
+      "error": {
+        "code": "StormRaise",
+        "traceback": [
+          ... list of traceback frames ...
+          [
+            "/home/epiphyte/PycharmProjects/synapse/synapse/lib/stormtypes.py",
+            1751,
+            "_raise",
+            "raise s_exc.StormRaise(**info)"
+          ]
+        ],
+        "info": {
+          "key": "valu",
+          "errname": "Newp",
+          ... additional error information ...
+          }
+        },
+        "mesg": "ruh roh"
       },
-      "text": "||",
-      "username": "root",
-      "user": "3189065f95d3ab0a6904e604260c0be2"
+      "params": {
+        "text": "$lib.raise(Newp, 'ruh roh', key=valu)",
+      }
     }
+
+Custom date formatting strings can also be provided by setting the ``SYN_LOG_DATEFORMAT`` string. This is expected to be a
+strftime_ format string. The following shows an example of setting this value::
+
+    SYN_LOG_DATEFORMAT="%d%m%Y %H:%M:%S"
+
+produces the following output::
+
+    28062021 15:48:01 [INFO] log level set to DEBUG [common.py:setlogging:MainThread:MainProcess]
+
+This will also be used to format the ``time`` key used for structured logging.
+
+.. warning::
+    Milliseconds are not available when using the date formatting option. This will result in a loss of precision for
+    the timestamps that appear in log output.
+
+.. _devops-task-diskfree:
+
+Configure Free Space Requirement
+--------------------------------
+
+To avoid the risk of data corruption due to lack of disk space, Synapse services periodically
+check the amount of free space available and will switch to read-only mode if they are below
+a minimum threshold. This threshold can be controlled via the ``limit:disk:free`` configuration
+option, and is set to 5% free space by default.
+
+If the available free space goes below the minimum threshold, the service will continue
+the free space checks and re-enable writes if the available space returns above the
+threshold.
+
+.. _devops-task-storage:
+
+Storage Requirements
+--------------------
+
+A Synapse service's storage directory must meet the following requirements:
+
+- The storage directory must be a local filesystem on a block device attached to exactly one host.
+- Network filesystems such as NFS (including AWS EFS), CephFS, and SMB/CIFS are unsupported.
+- Writes acknowledged to the host must be durable and must not be reordered. Any write cache between the service and
+  its block device must not acknowledge a write before it is persisted. Configurations to check include Ceph RBD
+  volumes with the RBD client cache enabled, Azure managed disks with ``ReadWrite`` host caching, and any hypervisor,
+  host, or storage controller write cache that does not honor flush requests.
+- The ``vm.dirty_expire_centisecs=20`` and ``vm.dirty_writeback_centisecs=20`` settings are required. See
+  :ref:`devops-task-performance` for how to set them.
+- Backups and archives may be copied to network storage, but a service's storage directory must not be on it.
+
+.. important::
+
+    Network filesystems are **unsupported** for a Synapse service's storage directory.
 
 .. _devops-task-performance:
 
@@ -290,23 +500,24 @@ Recommendations for good performance for other database systems may also apply t
 run best when given as much RAM as possible. Under **ideal** circumstances, the amount of RAM exceeds the total database
 storage size.
 
-Minimizing storage latency is important for a high performance Synapse service. Locating the storage volume backed by a
-mechanical hard drive is **strongly** discouraged.  For the same reason, running Synapse services from an NFS file system
-(including NFS-based systems like AWS EFS) is **strongly** discouraged.
+Minimizing storage latency is important for a high performance Synapse service. Locating the storage volume on a
+mechanical hard drive is **strongly** discouraged. Network filesystems are unsupported for service storage; see
+:ref:`devops-task-storage`.
 
 The default settings of most Linux-based operating systems are not set for ideal performance.
 
 Consider setting the following Linux system variables.  These can be set via /etc/sysctl.conf, the sysctl utility, or
-writing to the /proc/sys file system.
+writing to the /proc/sys file system. The ``vm.dirty_expire_centisecs`` and ``vm.dirty_writeback_centisecs`` settings
+are **required** (see :ref:`devops-task-storage`).
 
 ``vm.swappiness=10``
     Reduce preference for kernel to swap out memory-mapped files.
 
 ``vm.dirty_expire_centisecs=20``
-    Define "old" data to be anything changed more than 200 ms ago.
+    **Required.** Define "old" data to be anything changed more than 200 ms ago.
 
 ``vm.dirty_writeback_centisecs=20``
-    Accelerate writing "old" data back to disk.
+    **Required.** Accelerate writing "old" data back to disk.
 
 ``vm.dirty_background_ratio=2``
     This is expressed as a percentage of total RAM in the system.  After the total amount of dirty memory exceeds this
@@ -327,6 +538,51 @@ writing to the /proc/sys file system.
     This setting is particularly important for systems with lots of writing (e.g. making new nodes), lots of RAM, and
     relatively slow storage.
 
+.. _devops-task-onboot-optimize:
+
+Optimize Databases
+------------------
+
+As noted in :ref:`devops-task-backup`, restoring a service from a backup will result in
+the service having a defragmented / optimized copy of its databases. An alternative method
+for optimizing the databases in place is by using the ``onboot:optimize`` configuration
+option. Setting ``onboot:optimize`` to ``true`` will delay startup to optimize LMDB 
+databases during boot to recover free space and increase performance. Depending on
+the amount of activity since the last time the databases were optimized, this process
+may take a significant amount of time. To reduce downtime during this process,
+deployments with mirrors are encouraged to use a strategy like that described in
+:ref:`devops-task-low-downtime-updates` to first optimize a mirror, then promote that mirror
+to being the leader and optimizing the old service leader.
+
+After the optimization process is completed, the ``onboot:optimize`` option can be set
+back to ``false``. It is not necessary to optimize the databases on every boot of a
+service, but regularly scheduling an optimization pass based on the write activity of
+the service will help ensure optimal performance.
+
+When an optimization is performed, the service records the time and directory size before
+and after the optimization. This information is available in the ``optimized`` key of the
+dictionary returned by ``getCellInfo()`` and persists across restarts.
+
+.. note::
+
+    During the optimization process, the service will make an optimized copy of each
+    LMDB database used by the service which will then be atomically swapped into place
+    of the existing database. As a result, an amount of free space equal to the size of
+    the largest database will be required during the optimization.
+
+.. note::
+
+    Though not encouraged, it is safe to shutdown a service during the optimization
+    process. Progress on the LMDB database being optimized at the time of shutdown will be lost.
+
+.. note::
+
+    The optimization process runs before the service has bound its listeners, so healthcheck
+    probes will fail for the entire duration of the optimization. In orchestrated deployments
+    (e.g. Kubernetes), a liveness or readiness probe with too short a failure window can
+    terminate the service mid-optimization. See the Healthchecks guidance in
+    :ref:`orch-kubernetes-deployment` for recommended probe settings.
+
 .. _devops-task-users:
 
 Managing Users and Roles
@@ -339,10 +595,10 @@ Managing users and service accounts in the Synapse ecosystem is most easily acco
 executed from **within** the service ``docker`` container. In this example we add the user ``visi``
 as an admin user to the Cortex by running the following command from **within the Cortex container**::
 
-    python -m synapse.tools.moduser --add --admin visi
+    python -m synapse.tools.service.moduser --add --admin visi
 
 If the deployment is using AHA and TLS client certificates and the user will be connecting via the Telepath API using the
-:ref:`syn-tools-storm` CLI tool, will will also need to provision a user TLS certificate for them. This can be done using
+:ref:`syn-tools-storm` CLI tool, will also need to provision a user TLS certificate for them. This can be done using
 the ``synapse.tools.aha.provision.user`` command from **within the AHA container**::
 
     python -m synapse.tools.aha.provision.user visi
@@ -358,11 +614,115 @@ Which will produce output similar to::
 Once the one-time enrollment URL has been passed along to the user, the **user must run an enrollment command** to configure
 their environment to use the AHA server and generate a user certificate from the host they will be using to run the Storm CLI::
 
-    python -m synapse.tools.enroll ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+    python -m synapse.tools.aha.enroll ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
 
 Once they are enrolled, the user can connect using the Telepath URL ``aha://cortex.<yournetwork>``::
 
     python -m synapse.tools.storm aha://cortex.<yournetwork>
+
+.. _ devops-task-users-password:
+
+Managing Password Policies
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Services can be configured with password policies. These can be used to define the complexity of a password, the number
+of allowed login attempts, and the number of previous passwords to check against. This is configured by setting the
+``auth:passwd:policy`` configuration value for the service, with the desired policy settings. The policy object
+accepts the following keys:
+
+``attempts``
+    Maximum number of incorrect attempts before locking user account. This is an integer value.
+
+``previous``
+    Number of previous passwords to disallow. This is an integer value.
+
+``complexity``
+    The complexity key must be set to an object. It can have the following keys:
+
+    ``length``
+        Minimum password character length. This is an integer value with a minimum value of 1.
+
+    ``sequences``
+        Maximum sequence length in a password. Sequences can be letters or numbers, forward or reverse. This is an
+        integer value with a minimum value of 2.
+
+    ``upper:count``
+        The minimum number of uppercase characters required in password. This is an integer value.
+
+    ``upper:valid``
+        All valid uppercase characters. This defaults to a string of uppercase ASCII characters. This can be set to
+        a null value to disable any checking of the uppercase characters rules.
+
+    ``lower:count``
+        The minimum number of lowercase characters required in password. This is an integer value.
+
+    ``lower:valid``
+        All valid lowercase characters. This defaults to a string of lowercase ASCII characters. This can be set to
+        a null value to disable any checking of the lowercase character rules.
+
+    ``special:count``
+        The minimum number of special characters required in password. This is an integer value.
+
+    ``special:valid``
+        All valid special characters. This defaults to a string of ASCII punctuation characters. This can be set to
+        a null value to disable any checking of the special characters rules.
+
+    ``number:count``
+        The minimum number of digit characters required in password. This is an integer value.
+
+    ``number:valid``
+        All valid digit characters. This defaults to a string of ASCII number characters. This can be set to
+        a null value to disable any checking of the number character rules.
+
+The following example shows setting a password policy on the Cortex with the following policy:
+
+* Maximum of three failed password login attempts before locking.
+
+* Keep the previous two passwords to prevent password reuse.
+
+* Complexity rules:
+
+    * Require at least 12 total characters.
+
+    * Disallow sequences of more than 3 characters in a row.
+
+    * Require at least two uppercase characters.
+
+    * Require at least two lowercase characters.
+
+    * Specify a custom set of lowercase characters to check against (ASCII & some unicode characters).
+
+    * Require at least two special characters.
+
+    * Require at least two numbers.
+
+The following Compose file shows using the policy:
+
+::
+
+    services:
+      00.cortex:
+        user: "999"
+        image: vertexproject/synapse-cortex:v2.x.x
+        network_mode: host
+        restart: unless-stopped
+        volumes:
+            - ./storage:/vertex/storage
+        environment:
+            SYN_CORTEX_AXON: aha://axon...
+            SYN_CORTEX_JSONSTOR: aha://jsonstor...
+            SYN_CORTEX_AUTH_PASSWD_POLICY: '{"complexity": {"length": 12, "sequences": 3, "upper:count": 2, "lower:count": 2, "lower:valid": "abcdefghijklmnopqrstuvwxyzαβγ", "special:count": 2, "number:count": 2}, "attempts": 3, "previous": 2}'
+
+Attempting to set a user password which fails to meet the complexity requirements would produce an error::
+
+    storm> auth.user.mod lowuser --passwd hehe
+    ERROR: Cannot change password due to the following policy violations:
+      - Password must be at least 12 characters.
+      - Password must contain at least 2 uppercase characters, 0 found.
+      - Password must contain at least 2 special characters, 0 found.
+      - Password must contain at least 2 digit characters, 0 found.
+    complete. 0 nodes in 146 ms (0/sec).
+
 
 .. _devops-task-aha:
 
@@ -400,6 +760,525 @@ Then restart the Axon container. As it restarts, the service will generate user 
 ``cell.yaml`` file to include the necessary AHA configuration options. The ``dmon:listen`` option will be updated
 to reflect the use of SSL/TLS and the requirement to use client certificates for authentication. As additional services
 are provisioned, you may update the URLs they use to connect to the Axon to ``aha://axon...``.
+
+.. note::
+    When specifying a connection string using AHA, you can append a ``mirror=true`` parameter to the connection string
+    (e.g. ``aha://cortex...?mirror=true``) to cause AHA to prefer connecting to a service mirror rather than the leader
+    (if mirrors are available).
+
+Deployment Options
+------------------
+
+The following are some additional deployment options not covered in the :ref:`deploymentguide`.
+
+.. note::
+  These examples assume the reader has reviewed and understood the Synapse Deployment Guide.
+
+
+Telepath Listening Port
+~~~~~~~~~~~~~~~~~~~~~~~
+
+If you need to deploy a service to have Telepath listen on a specific port, you can use the provision tool to specify
+the port to bind. This example will show deploying the Axon to a specific Telepath listening port.
+
+**Inside the AHA container**
+
+Generate a one-time use provisioning URL, with the ``--dmon-port`` option::
+
+    python -m synapse.tools.aha.provision.service --dmon-port 30001 01.axon
+
+You should see output that looks similar to this::
+
+    one-time use URL: ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+
+**On the Host**
+
+Create the container directory::
+
+    mkdir -p /srv/syn/01.axon/storage
+    chown -R 999 /srv/syn/01.axon/storage
+
+Create the ``/srv/syn/01.axon/docker-compose.yaml`` file with contents::
+
+    services:
+      01.axon:
+        user: "999"
+        image: vertexproject/synapse-axon:v2.x.x
+        network_mode: host
+        restart: unless-stopped
+        volumes:
+            - ./storage:/vertex/storage
+        environment:
+            # disable HTTPS API for now to prevent port collisions
+            - SYN_AXON_HTTPS_PORT=null
+            - SYN_AXON_AHA_PROVISION=ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+
+After starting the service, the Axon will now be configured to bind its Telepath listening port to 30001. This can be
+seen in the services ``cell.yaml`` file.
+
+  ::
+
+    ---
+    aha:name: 01.axon
+    aha:network: <yournetwork>
+    aha:provision: ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+    aha:registry:
+    - ssl://root@aha.<yournetwork>
+    aha:user: root
+    dmon:listen: ssl://0.0.0.0:30001?hostname=01.axon.<yournetwork>&ca=<yournetwork>
+    ...
+
+HTTPS Listening Port
+~~~~~~~~~~~~~~~~~~~~
+
+If you need to deploy a service to have HTTPs listen on a specific port, you can use the provision tool to specify
+the port to bind. This example will show deploying the Cortex to a specific HTTPS listening port.
+
+**Inside the AHA container**
+
+Generate a one-time use provisioning URL, with the ``--https-port`` option::
+
+    python -m synapse.tools.aha.provision.service --https-port 8443 02.cortex
+
+You should see output that looks similar to this::
+
+    one-time use URL: ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+
+**On the Host**
+
+Create the container directory::
+
+    mkdir -p /srv/syn/02.cortex/storage
+    chown -R 999 /srv/syn/02.cortex/storage
+
+Create the ``/srv/syn/01.axon/docker-compose.yaml`` file with contents::
+
+    services:
+      02.cortex:
+        user: "999"
+        image: vertexproject/synapse-axon:v2.x.x
+        network_mode: host
+        restart: unless-stopped
+        volumes:
+            - ./storage:/vertex/storage
+        environment:
+            - SYN_CORTEX_AHA_PROVISION=ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+
+After starting the service, the Cortex will now be configured to bind its HTTPS listening port to 8443. This can be
+seen in the services ``cell.yaml`` file.
+
+  ::
+
+    ---
+    aha:name: 02.cortex
+    aha:network: <yournetwork>
+    aha:provision: ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+    aha:registry:
+    - ssl://root@aha.<yournetwork>
+    aha:user: root
+    dmon:listen: ssl://0.0.0.0:0?hostname=02.cortex.<yournetwork>&ca=<yournetwork>
+    https:port: 8443
+    ...
+
+
+.. _devops-task-nexustrim:
+
+Trimming the Nexus Log
+----------------------
+
+The Nexus log can be trimmed to reduce the storage size of any Synapse Service that has Nexus logging enabled.
+This is commonly done before taking backups to reduce to their size.
+
+For a Cortex **without** any mirrors, this is best accomplished in Storm via the following query::
+
+    $lib.cell.trimNexsLog()
+
+The Storm API call will rotate the Nexus log and then delete the older entries.
+
+If the Cortex is mirrored, a list of Telepath URLs of all mirrors must be provided.
+This ensures that all mirrors have rotated their Nexus logs before the cull operation is executed.
+
+.. warning::
+    If this list is omitted, or incorrect, the mirrors may become de-synchronized
+    which will require a re-deployment from a backup of the upstream.
+
+The Telepath URLs can be provided to the Storm API as follows::
+
+    $mirrors = ("aha://01.cortex...", "aha://02.cortex...")
+    $lib.cell.trimNexsLog(consumers=$mirrors)
+
+.. _devops-deprecation-warnings:
+
+Viewing Deprecation Warnings
+----------------------------
+
+When functionality in Synapse is deprecated, it is marked with a library function to note that it is
+deprecated. When the deprecated functionality is invoked, it will log a warning message that the deprecated function
+has been utilized.
+
+For example, if a HTTP caller uses the ``api/v1/storm/nodes`` API, it would log the following message::
+
+    2025-11-18 10:31:33,100 [WARNING] "HTTP API /api/v1/storm/nodes" is deprecated in 2.110.0 and will be removed in 3.0.0 [common.py:deprecated:MainThread:MainProcess]
+
+Instances of these messages would indicate that there is a process or user that is utilizing this deprecated
+functionality. This may require updating Synapse components ( such as Rapid Power-Ups ) or working with users to
+remove the usage of deprecated functionality.
+
+These logs are cached so that they should generally only log once per the lifetime of a given process.
+
+Entrypoint Hooking
+------------------
+
+Synapse service containers provide two ways that users can modify the container startup process, in order to execute
+their own scripts or commands.
+
+The first way to modify the startup process is using a script that executes before services start. This can be
+configured by mapping in a file at ``/vertex/boothooks/preboot.sh`` and making sure it is marked as an executable.
+If this file is present, the script will be executed prior to booting the service. If this does not return ``0``, the
+container will fail to start up.
+
+One example for using this hook is to use ``certbot`` to create HTTPS certificates for a Synapse service. This example
+assumes the Cortex is running as root, so that certbot can bind port 80 to perform the ``http-01`` challenge. Non-root
+deployments may require additional port mapping for a given deployment.
+
+Create a boothooks directory::
+
+  mkdir -p /srv/syn/00.cortex/bookhooks
+
+Copy the following script to ``/srv/syn/cortex/bookhooks/preboot.sh`` and use ``chmod`` to mark it as an executable
+file:
+
+.. literalinclude:: devguides/certbot.sh
+    :language: bash
+
+That directory will be mounted at ``/vertex/boothooks``. The following Compose file shows mounting that
+directory into the container and setting environment variables for the script to use::
+
+  services:
+    00.cortex:
+      image: vertexproject/synapse-cortex:v2.x.x
+      network_mode: host
+      restart: unless-stopped
+      volumes:
+          - ./storage:/vertex/storage
+          - ./boothooks:/vertex/boothooks
+      environment:
+          SYN_LOG_LEVEL: "DEBUG"
+          SYN_CORTEX_STORM_LOG: "true"
+          SYN_CORTEX_AHA_PROVISION: "ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>"
+          CERTBOT_HOSTNAME: "cortex.acme.corp"
+          CERTBOT_EMAIL: "user@acme.corp"
+
+When started, the container will attempt to run the script before starting the Cortex service.
+
+The second way to modify a container startup process is running a script concurrently to the service. This can be set
+by mapping in a file at ``/vertex/boothooks/concurrent.sh``, also as an executable file. If this file is present, the
+script is executed as a backgrounded task prior to starting up the Synapse service. This script would be stopped
+when the container is stopped.
+
+.. note::
+
+    If a volume is mapped into ``/vertex/boothooks/`` it will not be included in any backups made by a Synapse service
+    using the backup APIs. Making backups of any data persisted in these locations is the responsibility of the
+    operator configuring the container.
+
+Containers with Custom Users
+----------------------------
+
+By default, Synapse service containers will work running as ``root`` ( uid 0 ) and ``synuser`` ( uid 999 ) without any
+modification. In order to run a Synapse service container as a different user that is not built into the container by
+default, the user, group and home directory need to be added to the image. This can be done with a custom Dockerfile to
+modify a container. For example, the following Dockerfile would add the user ``altuser`` to the Container with a user
+id value of 8888::
+
+    FROM vertexproject/synapse-cortex:v2.x.x
+    RUN set -ex \
+    && groupadd -g 8888 altuser \
+    && useradd -r --home-dir=/home/altuser -u 8888 -g altuser --shell /bin/bash altuser \
+    && mkdir -p /home/altuser \
+    && chown 8888:8888 /home/altuser
+
+Running this with a ``docker build`` command can be used to create the image ``customcortex:v2.x.x``::
+
+    $ docker build -f Dockerfile --tag  customcortex:v2.x.x .
+    Sending build context to Docker daemon  4.608kB
+    Step 1/2 : FROM vertexproject/synapse-cortex:v2.113.0
+    ---> 8a2dd3465700
+    Step 2/2 : RUN set -ex && groupadd -g 8888 altuser && useradd -r --home-dir=/home/altuser -u 8888 -g altuser --shell /bin/bash altuser && mkdir -p /home/altuser && chown 8888:8888 /home/altuser
+    ---> Running in 9c7b30365c2d
+    + groupadd -g 8888 altuser
+    + useradd -r --home-dir=/home/altuser -u 8888 -g altuser --shell /bin/bash altuser
+    + mkdir -p /home/altuser
+    + chown 8888:8888 /home/altuser
+    Removing intermediate container 9c7b30365c2d
+     ---> fd7173d42923
+    Successfully built fd7173d42923
+    Successfully tagged customcortex:v2.x.x
+
+That custom user can then be used to run the Cortex::
+
+    services:
+      00.cortex:
+        user: "8888"
+        image: customcortex:v2.x.x
+        network_mode: host
+        restart: unless-stopped
+        volumes:
+        - ./storage:/vertex/storage
+        environment:
+        - SYN_CORTEX_AXON=aha://axon...
+        - SYN_CORTEX_JSONSTOR=aha://jsonstor...
+        - SYN_CORTEX_AHA_PROVISION=ssl://aha.<yournetwork>:27272/<guid>?certhash=<sha256>
+
+The following bash script can be used to help automate this process, by adding the user to an image and appending
+the custom username to the image tag:
+
+.. literalinclude:: devguides/adduserimage.sh
+    :language: bash
+
+Saving this to ``adduserimage.sh``, it can then be used to quickly modify an image. The following example shows running
+this to add a user named ``foouser`` with the uid 1234::
+
+    $ ./adduserimage.sh vertexproject/synapse-aha:v2.113.0 foouser 1234
+    Add user/group foouser with 1234 into vertexproject/synapse-aha:v2.113.0, creating: vertexproject/synapse-aha:v2.113.0-foouser
+    Sending build context to Docker daemon  4.608kB
+    Step 1/2 : FROM vertexproject/synapse-aha:v2.113.0
+     ---> 53251b832df0
+    Step 2/2 : RUN set -ex && groupadd -g 1234 foouser && useradd -r --home-dir=/home/foouser -u 1234 -g foouser --shell /bin/bash foouser && mkdir -p /home/foouser && chown 1234:1234 /home/foouser
+     ---> Running in 1c9e793d6761
+    + groupadd -g 1234 foouser
+    + useradd -r --home-dir=/home/foouser -u 1234 -g foouser --shell /bin/bash foouser
+    + mkdir -p /home/foouser
+    + chown 1234:1234 /home/foouser
+    Removing intermediate container 1c9e793d6761
+     ---> 21a12f395462
+    Successfully built 21a12f395462
+    Successfully tagged vertexproject/synapse-aha:v2.113.0-foouser
+
+Configure Custom CA Certificates for HTTP Requests
+--------------------------------------------------
+
+The Cortex and Axon can be configured to use additional CA certificates when making HTTP requests via Storm. To do this,
+you need to provide the certificates (in PEM format only) to the Cortex in a directory on disk, and then configure the
+Cortex to look up that directory via the ``tls:ca:dir`` configuration option.
+
+The following Compose file shows an example using this option with the Cortex.
+
+::
+
+    services:
+      00.cortex:
+        user: "999"
+        image: vertexproject/synapse-cortex:v2.x.x
+        network_mode: host
+        restart: unless-stopped
+        volumes:
+            - ./storage:/vertex/storage
+            - ./tls-ca-certs:/vertex/tls-ca-certs
+        environment:
+            SYN_CORTEX_TLS_CA_DIR: /vertex/tls-ca-certs
+
+.. note::
+
+   CA certificates provided via the ``tls:ca:dir`` configuration option MUST include the full chain of certificates all
+   the way up to the root. Providing only partial CA chains may result in verification failures.
+
+   This chain should start with the specific certificate for the principal who “is” the client or server, and then the
+   certificate for the issuer of that certificate, and then the certificate for the issuer of that certificate, and so
+   on up the chain until you get to a certificate which is self-signed, that is, a certificate which has the same subject
+   and issuer, sometimes called a root certificate.
+
+Configure Custom CA Certificates with Kubernetes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+To configure custom CA certificates with kubernetes, do the following:
+
+#. Create a config map from your CA certificate files.
+
+    The example has a pre-created root CA and an intermediate CA certificate in PEM format::
+
+        $ ls -l ./cas
+        total 8
+        -rw-rw-r-- 1 user user 1708 Feb 14 19:19 intermediate.crt
+        -rw-rw-r-- 1 user user 1696 Feb 14 19:19 root.crt
+
+        $ kubectl create configmap tls-ca-certs --from-file ./cas
+        configmap/tls-ca-certs created
+
+        $ kubectl describe configmap tls-ca-certs
+        Name:         tls-ca-certs
+        Namespace:    default
+        Labels:       <none>
+        Annotations:  <none>
+
+    Example Data::
+
+        intermediate.crt:
+
+        -----BEGIN CERTIFICATE-----
+        MIIEwTCCAqmgAwIBAgIRALMB8pwt2Ivp29Ij5DqnPfYwDQYJKoZIhvcNAQELBQAw
+        <snip certificate body ...>
+        5haPeH+7M+DxEhwanIcfBXNY/7Xn
+        -----END CERTIFICATE-----
+
+        root.crt:
+
+        -----BEGIN CERTIFICATE-----
+        MIIEuDCCAqCgAwIBAgIQY7KrFPXtwpWTYfCA2pktSjANBgkqhkiG9w0BAQsFADAP
+        <snip certificate body ...>
+        i03ynl21g6erwz0c
+        -----END CERTIFICATE-----
+
+#. Add the ``volume``, ``volumeMount``, and ``environment`` variables to the
+   Cortex. You may need to specify permissions on your certificates as needed,
+   as long as they are readable by your Cortex user, that is fine.
+
+    Example volume::
+
+        - name: tls-ca-certs
+          configMap:
+            name: tls-ca-certs
+
+    Example volumeMount::
+
+        - mountPath: /vertex/tls-ca-certs
+          name: tls-ca-certs
+
+    Example environment variable::
+
+        - name: SYN_CORTEX_TLS_CA_DIR
+          value: "/vertex/tls-ca-dir-certs/"
+
+#. Verify the TLS certificates were loaded by making an HTTPS request in Storm.
+
+    ::
+
+        $lib.print($lib.inet.http.get(<URL TO SERVER WITH CUSTOM CERTIFICATES>))
+
+    On success, you should see an ``inet:http:resp`` with code 200 and reason OK::
+
+        inet:http:resp: {'code': 200, 'reason': 'OK', 'headers': ... }
+
+    If the TLS CA certificates are not being loaded properly, a response similar to
+    the following will be seen::
+
+        inet:http:resp: {'code': -1, 'reason': "Exception occurred during request: ClientConnectorCertificateError ...", ...}
+
+In this example, the volume with the configmap contains symlinks which are
+treated as directories. When the SSLContext is created with those additional
+files, Synapse attempts to load the directory, will fail and then log an
+exception. This does not stop the SSLContext from being created with the
+additonal CA files.
+
+.. note::
+
+    For the Axon, the wget and wput API functionality can also be configured to
+    use a TLS directory for loading additional certificates. The configuration
+    is similar to the Cortex, but uses the ``SYN_AXON_TLS_CA_DIR`` environment
+    variable.
+
+Axon Blob Export and Import
+---------------------------
+
+For situations where an organization needs to synchronize Axon blobs between two Axons
+that do not connect directly to each other, due to network segmentation as an example,
+there are command line tools available to export blobs from a source Axon and then import
+those blobs into a different Axon. For Axons that can communicate directly, the
+``axon2axon`` tool should be used for live synchronization.
+
+- ``synapse.tools.axon.dump``: Export blobs from a specified Axon into one or more tar.gz archive files.
+- ``synapse.tools.axon.load``: Import blobs from one or more tar.gz archive files into a specified Axon.
+
+In these situations, an export is created using
+``synapse.tools.axon.dump``. The output of this tool is one or more tar.gz
+archive files that can then be manually copied over to the destination Axon
+environment. Once the files have been copied, the ``synapse.tools.axon.load``
+tool can be used to import them into the destination Axon.
+
+.. note::
+
+   The ``synapse.tools.axon.dump`` export tool creates a state tracking YAML
+   file for recording the next expected offset from the Axon that was exported.
+   The state tracking file allows the export tool to create incremental exports
+   from the time of the last execution without requiring the offset to be
+   separately tracked. By default, the state tracking file is saved in the output
+   directory with name ``<celliden>.yaml``.
+
+Export blobs from an Axon
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Exporting blobs from an Axon can be done with the
+``synapse.tools.axon.dump`` command::
+
+    python -m synapse.tools.axon.dump --url <axonurl> <outputdir>
+
+When running the export tool from within the Axon container, the ``--url``
+option does not need to be provided as it will default to the local service.
+
+Import blobs into an Axon
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Importing blobs into an Axon can be done with the
+``synapse.tools.axon.load`` command::
+
+    python -m synapse.tools.axon.load <axonurl> <archive1.tar.gz> [<archive2.tar.gz> ...]
+
+The import tool will automatically process the provided tar.gz archive files,
+so there is no need to import them one at a time or specify them in a particular order.
+
+Copying node edits between Cortexes
+-----------------------------------
+
+For situations where an organization may want to synchronize node edits between
+two unconnected (no direct network connection) Cortexes, there are command line
+tools available to export nodes edits from a layer on the source Cortex and then
+import those same edits into a layer on a different Cortex.
+
+- ``synapse.tools.cortex.layer.dump``: Export node edits from a specified layer on a
+  Cortex.
+- ``synapse.tools.cortex.layer.load``: Import node edits to a specified layer on a
+  Cortex.
+
+In these situations, an export would be created using
+``synapse.tools.cortex.layer.dump``. The output of this tool is one or more export
+files that can then be manually copied over to the destination Cortex
+environment. Once the files have been copied, the ``synapse.tools.cortex.layer.load``
+tool can be used to import them into the destination Cortex.
+
+.. note::
+
+   The ``synapse.tools.cortex.layer.dump`` export tool creates a state tracking YAML
+   file for recording the next expected offset from the layer that was exported.
+   The state tracking files allows the export tool to create incremental exports
+   from the time of the last execution without requiring the offset to be
+   separately tracked.
+
+   The filename for the state tracking file is automatically saved in the output
+   directory and follows the name ``<celliden>.<layriden>.yaml`` but an
+   alternate path can be specified using the ``--statefile`` command line
+   option.
+
+Export node edits from a Cortex
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Exporting node edits from a layer can be done with the
+``synapse.tools.cortex.layer.dump`` command::
+
+    python -m synapse.tools.cortex.layer.dump --url <cortexurl> <layriden> <outdir>
+
+When running the export tool from within the Cortex container, the ``--url``
+option does not need to be provided as it will default to the local service.
+
+Import node edits into a Cortex
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Importing node edits into a layer can be done with the
+``synapse.tools.cortex.layer.load`` command::
+
+    python -m synapse.tools.cortex.layer.load <layriden> <nodeedits file(s)...>
+
+The import tool will automatically order the node edit files based on starting
+offset so there is no need to import them one at a time or specify them in a
+particular order.
 
 Synapse Services
 ================
@@ -457,7 +1336,7 @@ accomplished using the ``withTeleEnv()`` context manager::
 
                 info = await proxy.getCellInfo()
                 print(repr(info))
-                
+
         return 0
 
     sys.exit(asyncio.run(main(sys.argv[1:]))))
@@ -505,7 +1384,7 @@ A typical Axon deployment does not require any additional configuration. For the
 For example, to allow the user ``visi`` to upload, download, and confirm files you would execute the following command
 from **inside the Axon container**::
 
-    python -m synapse.tools.moduser --add visi --allow axon
+    python -m synapse.tools.service.moduser --add visi --allow axon
 
 .. _devops-svc-jsonstorcell:
 
@@ -553,8 +1432,13 @@ When enabled, the log message contains the query text and username::
 
     2021-06-28 16:17:55,775 [INFO] Executing storm query {inet:ipv4=1.2.3.4} as [root] [cortex.py:_logStormQuery:MainThread:MainProcess]
 
-When structured logging is also enabled for a Cortex, the query text, username, and user iden are included as individual
-fields in the logged message as well::
+Queries dispatched by the ``storm.exec`` command or ``$lib.storm.eval()`` are logged through this same
+configuration, with the message noting which command or library ran the query::
+
+    2021-06-28 16:17:55,775 [INFO] Executing storm query via storm.exec {-:asn=10} as [root] [cortex.py:_logStormQuery:MainThread:MainProcess]
+
+When structured logging is also enabled for a Cortex, the username and user iden are included as top level
+fields, and the query text, its hash, and the view it ran in are included under ``params``::
 
     {
       "message": "Executing storm query {inet:ipv4=1.2.3.4} as [root]",
@@ -566,9 +1450,14 @@ fields in the logged message as well::
       },
       "level": "INFO",
       "time": "2021-06-28 16:18:47,232",
-      "text": "inet:ipv4=1.2.3.4",
       "username": "root",
-      "user": "3189065f95d3ab0a6904e604260c0be2"
+      "user": "3189065f95d3ab0a6904e604260c0be2",
+      "params": {
+        "text": "inet:ipv4=1.2.3.4",
+        "hash": "d5104ba9d0f213c4be7795a2ffb2f890",
+        "mode": "storm",
+        "view": "2018eb90b3e5b7756e94219a34a3ad4d"
+      }
     }
 
 This logging does interplay with the underlying log configuration ( :ref:`devops-task-logging` ). The
@@ -577,92 +1466,635 @@ not be emitted.
 
 For the full list supported options, see the :ref:`autodoc-conf-cortex`.
 
+.. _devops-svc-cortex-ext-http:
+
+Extended HTTP API
+~~~~~~~~~~~~~~~~~
+
+.. highlight:: none
+
+The Cortex can be configured ( via Storm ) to service custom HTTP API endpoints. These user defined endpoints execute
+Storm code in order to generate responses. This allows creating custom HTTP API responses or URL paths which may meet
+custom needs.
+
+These endpoints have a base URL of ``/api/ext/``. Additional path components in a request are used to resolve which API
+definition is used to handle the response.
+
+The Storm queries which implement these endpoints will have a ``$request`` object ( see
+:ref:`stormprims-http-api-request-f527` ) added to them. This object is used to send custom data back to the caller.
+This object contains helpers to access the request data, as well as functions to send data back to the caller.
+
+.. note::
+
+    Several examples show curl_ and jq_ being used to access endpoints or process data. These tools are not required
+    in order to interact with the Extended HTTP API.
+
+A Simple Example
+++++++++++++++++
+
+The following simple example shows adding an API endpoint and setting the ``GET`` method on it that just returns a
+simple message embedded in a dictionary::
+
+    $api = $lib.cortex.httpapi.add('demo/path00')
+    $api.methods.get = ${
+        $mesg=`Hello! I am a request made to {$request.path}`
+        $headers = ({"Some": "Value"})
+        $body = ({"mesg": $mesg})
+        $request.reply(200, headers=$headers, body=$body)
+     }
+
+When accessing that HTTP API endpoint on the Cortex, the response data has the status code, custom headers, and custom
+body in the reponse::
+
+    $ curl -D - -sku "root:root" "https://127.0.0.1:4443/api/ext/demo/path00"
+    HTTP/1.1 200 OK
+    Content-Type: application/json; charset=utf8"
+    Date: Tue, 17 Oct 2023 16:21:32 GMT
+    Some: value
+    Content-Length: 53
+
+    {"mesg": "Hello! I am a request made to demo/path00"}
+
+The ``$request.reply()`` method automatically will convert primitive objects into a JSON response, enabling rapid
+development of JSON based API endpoints.
+
+Accessing Request Data
+++++++++++++++++++++++
+
+The ``$request`` object has information available about the request itself. The following API example shows access to
+all of that request data, and echoes it back to the caller::
+
+    $api = $lib.cortex.httpapi.add('demo/([a-z0-9]*)')
+    $api.methods.post = ${
+        $body = ({
+            "method": $request.method,        // The HTTP method
+            "headers": $request.headers,      // Any request headers
+            "params": $request.params,        // Any requets parameters
+            "uri": $request.uri,              // The full URI requested
+            "path": $request.path,            // The path component after /api/ext/
+            "args": $request.args,            // Any capture groups matched from the path.
+            "client": $request.client,        // Requester client IP
+            "iden": $request.api.iden,        // The iden of the HTTP API handling the request
+            "nbyts": $lib.len($request.body), // The raw body is available as bytes
+        })
+        try {
+            $body.json = $request.json        // Synapse will lazily load the request body as json upon access
+        } catch StormRuntimeError as err {    // But it may not be json!
+            $body.json = 'err'
+        }
+        $headers = ({'Echo': 'hehe!'})
+        $request.reply(200, headers=$headers, body=$body)
+    }
+
+Accessing that endpoint shows that request information is echoed back to the caller::
+
+    $ curl -sku "root:secret" -XPOST -d '{"some":["json", "items"]}' "https://127.0.0.1:4443/api/ext/demo/ohmy?hehe=haha" | jq
+    {
+      "method": "POST",
+      "headers": {
+        "host": "127.0.0.1:4443",
+        "authorization": "Basic cm9vdDpzZWNyZXQ=",
+        "user-agent": "curl/7.81.0",
+        "accept": "*/*",
+        "content-length": "26",
+        "content-type": "application/x-www-form-urlencoded"
+      },
+      "params": {
+        "hehe": "haha"
+      },
+      "uri": "/api/ext/demo/ohmy?hehe=haha",
+      "path": "demo/ohmy",
+      "args": [
+        "ohmy"
+      ],
+      "client": "127.0.0.1",
+      "iden": "50cf80d0e332a31608331490cd453103",
+      "nbyts": 26,
+      "json": {
+        "some": [
+          "json",
+          "items"
+        ]
+      }
+    }
+
+
+The ``$request.headers`` are accessed in a case-insensitive manner.  ``$request.parameters`` are case sensitive. The
+following example shows that::
+
+    $api = $lib.cortex.httpapi.get(50cf80d0e332a31608331490cd453103)
+    $api.methods.get = ${
+        $body=({
+            "ua":   $request.headers."UseR-AGent",  // case insensitive match on the User-Agent string
+            "hehe": $request.params.hehe,
+            "HEHE": $request.params.HEHE,
+        })
+        $request.reply(200, body=$body)
+    }
+
+The output of that endpoint::
+
+    $ curl -s -k -u "root:secret" "https://127.0.0.1:4443/api/ext/demo/casemath?hehe=haha&HEHE=uppercase"  | jq
+    {
+      "ua": "curl/7.81.0",
+      "hehe": "haha",
+      "HEHE": "uppercase"
+    }
+
+.. note::
+
+    Request headers and parameters are flattened into a single key / value mapping. Duplicate request headers or
+    parameters are not exposed in the ``$request`` object.
+
+Managing HTTP APIs
+++++++++++++++++++
+
+When creating an Extended HTTP API, the request path must be provided. This path component is matched against any
+path components after ``/api/ext/*`` when determining which API endpoint will service the request. The API endpoints are
+matched in order, comparing their ``path`` against the requested path using a case sensitive fullmatch_ regular
+expression comparison. Newly created API endpoints are added to the end of the list for matching. It is best for
+these endpoints to be ordered from most specific to least specific.
+
+To list the registered APIs, their order, and path information, use the ``cortex.httpapi.list`` command::
+
+    storm> cortex.httpapi.list
+     order | iden                             | owner                | auth  | runas  | path
+    =======|==================================|======================|=======|========|======
+    0      | 50cf80d0e332a31608331490cd453103 | root                 | true  | owner  | demo/([a-z0-9]*)
+    1      | 586311d3a7a26d6138bdc07169e4cde5 | root                 | true  | owner  | demo/path00
+    2      | 1896bda5dbd97615ee553059079620ba | root                 | true  | owner  | demo/path01
+    3      | daaf33e23b16540acdc872fee2de1b61 | root                 | true  | owner  | something/Else
+
+In this example, there are four items listed. The ``path`` of the first item will match the paths for the second and
+third items. The index for the first item needs to be moved using the ``cortex.httpapi.index`` commmand. That command
+allows users to change the order in which the API endpoints are matched::
+
+    storm> cortex.httpapi.index 50cf80d0e332a31608331490cd453103 3
+    Set HTTP API 50cf80d0e332a31608331490cd453103 to index 3
+
+    storm> cortex.httpapi.list
+     order | iden                             | owner                | auth  | runas  | path
+    =======|==================================|======================|=======|========|======
+    0      | 586311d3a7a26d6138bdc07169e4cde5 | root                 | true  | owner  | demo/path00
+    1      | 1896bda5dbd97615ee553059079620ba | root                 | true  | owner  | demo/path01
+    2      | daaf33e23b16540acdc872fee2de1b61 | root                 | true  | owner  | something/Else
+    3      | 50cf80d0e332a31608331490cd453103 | root                 | true  | owner  | demo/([a-z0-9]*)
+
+
+The endpoints in the example are now checked in a "more specific" to "least specific" order.
+
+The path of an endpoint can also be changed. This can be done by assigning a new value to the ``path`` attribute on
+the ``http:api`` object in Storm::
+
+    storm> $api=$lib.cortex.httpapi.get(1896bda5dbd97615ee553059079620ba) $api.path="demo/mynew/path"
+    complete. 0 nodes in 8 ms (0/sec).
+
+    storm> cortex.httpapi.list
+     order | iden                             | owner                | auth  | runas  | path
+    =======|==================================|======================|=======|========|======
+    0      | 586311d3a7a26d6138bdc07169e4cde5 | root                 | true  | owner  | demo/path00
+    1      | 1896bda5dbd97615ee553059079620ba | root                 | true  | owner  | demo/mynew/path
+    2      | daaf33e23b16540acdc872fee2de1b61 | root                 | true  | owner  | something/Else
+    3      | 50cf80d0e332a31608331490cd453103 | root                 | true  | owner  | demo/([a-z0-9]*)
+
+The path components which match each regular expression capture group in the ``path`` will be set in the
+``$request.args`` data. An endpoint can capture multiple args this way::
+
+    // Set the echo API handler defined earlier to have a path which has multiple capture groups
+    $api = $lib.cortex.httpapi.get(50cf80d0e332a31608331490cd453103)
+    $api.path="demo/([a-z0-9]+)/(.*)"
+
+The capture groups are then available::
+
+    $ curl -sku "root:secret" -XPOST "https://127.0.0.1:4443/api/ext/demo/foobar1/AnotherArgument/inTheGroup"  | jq '.args'
+    [
+      "foobar1",
+      "AnotherArgument/inTheGroup"
+    ]
+
+
+.. note::
+
+    The Cortex does not make any attempt to do any inspection of path values which may conflict between the endpoints.
+    This is because the paths for a given endpoint may be changed, they can contain regular expressions, and they may
+    have their resolution order changed. Cortex users are responsible for configuring their endpoints with correct
+    paths and order to meet their use cases.
+
+The Extended HTTP APIs can also be given a name and a description. The following shows setting the ``name`` and
+``desc`` fields, and then showing the details of the API using ``cortex.httpapi.stat``. This command shows detailed
+information about the Extended HTTP API endpoint::
+
+    $api = $lib.cortex.httpapi.get(50cf80d0e332a31608331490cd453103)
+    $api.name="demo wildcard"
+    $api.desc='''This API endpoint is a wildcard example. It has a GET method and a POST method available.'''
+
+    // Stat output
+    storm> cortex.httpapi.stat 50cf80d0e332a31608331490cd453103
+    Iden: 50cf80d0e332a31608331490cd453103
+    Creator: root (b13c21813628ac4464b78b5d7c55cd64)
+    Created: 2023/10/18 14:02:52.070
+    Updated: 2023/10/18 14:07:29.448
+    Path: demo/([a-z0-9]+)/(.*)
+    Owner: root (b13c21813628ac4464b78b5d7c55cd64)
+    Runas: owner
+    View: default (a1877dd028915d90862e35e24b491bfc)
+    Readonly: false
+    Authenticated: true
+    Name: demo wildcard
+    Description: This API endpoint is a wildcard example. It has a GET method and a POST method available.
+
+    No user permissions are required to run this HTTP API endpoint.
+    The handler defines the following HTTP methods:
+    Method: POST
+    $body = ({
+                "method": $request.method,        // The HTTP method
+                "headers": $request.headers,      // Any request headers
+                "params": $request.params,        // Any requets parameters
+                "uri": $request.uri,              // The full URI requested
+                "path": $request.path,            // The path component after /api/ext/
+                "args": $request.args,            // Any capture groups matched from the path.
+                "client": $request.client,        // Requester client IP
+                "iden": $request.api.iden,        // The iden of the HTTP API handling the request
+                "nbyts": $lib.len($request.body), // The raw body is available as bytes
+            })
+            try {
+                $body.json = $request.json        // Synapse will lazily load the request body as json upon access
+            } catch StormRuntimeError as err {    // But it may not be json!
+                $body.json = 'err'
+            }
+            $headers = ({'Echo': 'hehe!'})
+            $request.reply(200, headers=$headers, body=$body)
+
+    Method: GET
+    $body=({
+                "ua":   $request.headers."UseR-AGent",  // case insensitive match on the User-Agent string
+                "hehe": $request.params.hehe,
+                "HEHE": $request.params.HEHE,
+            })
+            $request.reply(200, body=$body)
+
+    No vars are set for the handler.
+
+Supported Methods
++++++++++++++++++
+
+The endpoints support the following HTTP Methods:
+
+- ``GET``
+- ``PUT``
+- ``HEAD``
+- ``POST``
+- ``PATCH``
+- ``DELETE``
+- ``OPTIONS``
+
+The logic which implements these methods is set via Storm. The following example shows setting two simple methods for a
+given endpoint::
+
+    $api = $lib.cortex.httpapi.get(586311d3a7a26d6138bdc07169e4cde5)
+    $api.methods.get = ${ $request.reply(200, headers=({"X-Method": "GET"}))
+    $api.methods.put = ${ $request.reply(200, headers=({"X-Method": "PUT"}))
+
+These methods can be removed as well by assigning ``$lib.undef`` to the value::
+
+    // Remove the GET method
+    $api = $lib.cortex.httpapi.get(586311d3a7a26d6138bdc07169e4cde5)
+    $api.methods.put = $lib.undef
+
+Users are not required to implement their methods in any particular styles or conventions. The only method specific
+restriction on the endpoint logic is for the ``HEAD`` method. Any body content that is sent in response to the ``HEAD``
+method will not be transmitted to the requester. This body content will be omitted from being transmitted without
+warning or error.
+
+A request which is made with for method that a matching handler does not implement will return an HTTP 405 error.
+
+Authentication, Permissions, and Users
+++++++++++++++++++++++++++++++++++++++
+
+Since the endpoints are executed by running Storm queries to generate responses, Synapse must resolve the associated
+:ref:`gloss-user` and a :ref:`gloss-view` which will be used to run the query. There are a few important properties of
+the endpoints that users configuring them must be aware of.
+
+**owner**
+
+    By default, the user that creates an endpoint is marked as the ``owner`` for that endpoint. This is the default
+    user that will execute the Storm queries which implement the HTTP Methods. This value can be changed by setting
+    the ``.owner`` property on the endpoint object to a different User.
+
+    A user marked as the ``owner`` of an endpoint does not have any permissions granted that allows them to edit the
+    endpoint.
+
+**view**
+
+    The View that an Extended HTTP API endpoint is created in is recorded as the View that the Storm endpoints are
+    executed in. This View can be changed by assigning the ``.view`` property on the endpoint object to a different
+    View.
+
+**authenticated**
+
+    By default, the endpoints require the requester to have an authenticated session. Information about API
+    authentication can be found at :ref:`http-api-authentication`. This authentication requirement can be disabled by
+    setting the ``.authenticated`` property on the endpoint object to ``$lib.false``. That will allow the endpoint to
+    be resolved without presenting any sort of authentication information.
+
+**runas**
+
+    By default, the Storm logic is run by the user that is marked as the ``owner``. Endpoints can instead be configured
+    to run as the authenticated user by setting the ``.runas`` property on the HTTP API object to ``user``.  In order
+    to change the behavior to executing the queries as the owner, the value should be set to ``owner``.
+
+    When an endpoint is configured with ``runas`` set to ``user`` and ``authenticated`` to ``$lib.false`` any
+    calls to that API will be executed as the ``owner``.
+
+This allows creating endpoints that run in one of three modes:
+
+- Authenticated & runs as the Owner
+- Authenticated & runs as the User
+- Unauthenticated & runs as the Owner
+
+These three modes can be demonstrated by configuring endpoints that will echo back the current user::
+
+    // Create a query object that we will use for each handler
+    $echo=${ $request.reply(200, body=$lib.user.name()) }
+
+    // Create the first endpoint with a default configuration.
+    $api0 = $lib.cortex.httpapi.add('demo/owner')
+    $api0.methods.get=$echo
+
+    // Create the second endpoint which runs its logic as the requester.
+    $api1 = $lib.cortex.httpapi.add('demo/user')
+    $api1.runas=user
+    $api1.methods.get=$echo
+
+    // Create the third endpoint which does not require authentication.
+    $api2 = $lib.cortex.httpapi.add('demo/noauth')
+    $api2.authenticated=$lib.false  // Disable authentication
+    $api2.methods.get=$echo
+
+Accessing those endpoints with different users gives various results::
+
+    # The demo/owner endpoint runs as the owner
+    $ curl -sku "root:secret" "https://127.0.0.1:4443/api/ext/demo/owner"  | jq
+    "root"
+
+    $ curl -sku "lowuser:demo" "https://127.0.0.1:4443/api/ext/demo/owner"  | jq
+    "root"
+
+    # The demo/user endpoint runs as the requester
+    $ curl -sku "root:secret" "https://127.0.0.1:4443/api/ext/demo/user"  | jq
+    "root"
+
+    $ curl -sku "lowuser:demo" "https://127.0.0.1:4443/api/ext/demo/user"  | jq
+    "lowuser"
+
+    # The demo/noauth endpoint runas the owner
+    $ curl -sk "https://127.0.0.1:4443/api/ext/demo/noauth"  | jq
+    "root"
+
+If the owner or an authenticated user does not have permission to execute a Storm query in the configured View, or if
+the endpoints' View is deleted from the Cortex, this will raise a fatal error and return an HTTP 500 error. Once a
+query has started executing, regular Storm permissions apply.
+
+Endpoints can also have permissions defined for them. This allows locking down an endpoint such that while a user may
+still have access to the underlying view, they may lack the specific permissions required to execute the endpoint.
+These permissions are checked against the authenticated user, and not the endpoint owner. The following example shows
+setting a single permission on one of our earlier endpoints::
+
+    $api=$lib.cortex.httpapi.get(bd4679ab8e8a1fbc030b46e275ddba96)
+    $api.perms=(your.custom.permission,)
+
+Accessing it as a user without the specified permission generates an ``AuthDeny`` error::
+
+    $ curl -sku "lowuser:demo" "https://127.0.0.1:4443/api/ext/demo/owner"  | jq
+    {
+      "status": "err",
+      "code": "AuthDeny",
+      "mesg": "User (lowuser) must have permission your.custom.permission"
+    }
+
+The user can have that permission granted via Storm::
+
+    storm> auth.user.addrule lowuser your.custom.permission
+    Added rule your.custom.permission to user lowuser.
+
+Then the endpoint can be accessed::
+
+    $ curl -sku "lowuser:demo" "https://127.0.0.1:4443/api/ext/demo/owner"  | jq
+    "root"
+
+For additional information about managing user permissions, see :ref:`admin_create_users_roles`.
+
+.. note::
+
+    When the Optic UI is used to proxy the ``/api/ext`` endpoint, authentication must be done using Optic's login
+    endpoint. Basic auth is not available.
+
+Readonly Mode
++++++++++++++
+
+The Storm queries for a given handler may be executed in a ``readonly`` runtime. This is disabled by default. This can
+be changed by setting the ``readonly`` attribute on the ``http:api`` object::
+
+    // Enable the Storm queries to be readonly
+    $api = $lib.cortex.httpapi.get($yourIden)
+    $api.readonly = $lib.true
+
+Endpoint Variables
+++++++++++++++++++
+
+User defined variables may be set for the queries as well. These variables are mapped into the runtime for each method.
+This can be used to provide constants or other information which may change, without needing to alter the underlying
+Storm code which defines a method. These can be read ( or removed ) by altering the ``$api.vars`` dictionary. This is
+an example of using a variable in a query::
+
+    // Set a variable that a method uses:
+
+    $api = $lib.cortex.httpapi.get($yourIden)
+    $api.methods.get = ${
+        $mesg = `There are {$number} things available!`
+        $request.reply(200, body=({"mesg": $mesg})
+    }
+    $api.vars.number = (5)
+
+When executing this method, the JSON response would be the following::
+
+    {"mesg": "There are 5 things available!"}
+
+If ``$api.vars.number = "several"`` was executed, the JSON response would now be the following::
+
+    {"mesg": "There are several things available!"}
+
+Variables can be removed by assigning ``$lib.undef`` to them::
+
+    $api = $lib.cortex.httpapi.get($yourIden)
+    $api.vars.number = $lib.undef
+
+Sending Custom Responses
+++++++++++++++++++++++++
+
+Responses can be made which are not JSON formatted. The ``$request.reply()`` method can be used to send raw bytes. The
+user must provide any appropriate headers alongside their request.
+
+**HTML Example**
+
+The following example shows an endpoint which generates a small amount of HTML. It uses an HTML template stored in in
+the method ``vars``. This template has a small string formatted in it, converted to bytes, and then the headers are
+set. The end result can be then rendered in a web browser::
+
+    $api = $lib.cortex.httpapi.add('demo/html')
+    $api.vars.template = '''<!DOCTYPE html>
+    <html>
+    <body>
+    <h1>A Header</h1>
+    <p>{mesg}</p>
+    </body>
+    </html>'''
+    $api.methods.get = ${
+        $duration = $lib.model.type(duration).repr($lib.cell.uptime().uptime)
+        $mesg = `The Cortex has been up for {$duration}`
+        $html = $template.format(mesg=$mesg)
+        $buf = $html.encode()
+        $headers = ({
+            "Content-Type": "text/html",
+            "Content-Length": `{$lib.len($buf)}`
+        })
+        $request.reply(200, headers=$headers, body=$buf)
+    }
+
+Accessing this endpoint with ``curl`` shows the following::
+
+    $ curl -D - -sku "root:secret" "https://127.0.0.1:4443/api/ext/demo/html"
+    HTTP/1.1 200 OK
+    Content-Type: text/html
+    Date: Wed, 18 Oct 2023 14:07:47 GMT
+    Content-Length: 137
+
+    <!DOCTYPE html>
+    <html>
+    <body>
+    <h1>A Header</h1>
+    <p>The Cortex has been up for 1D 00:59:12.704</p>
+    </body>
+    </html>f
+
+**Streaming Examples**
+
+The ``http:request`` object has methods that allow a user to send the response code, headers and body separately.
+One use for this is to create a streaming response. This can be used when the total response size may not be known
+or to avoid incurring memory pressure on the Cortex when computing results.
+
+The following examples generates some JSONLines data::
+
+    $api = $lib.cortex.httpapi.add('demo/jsonlines')
+    $api.methods.get = ${
+        $request.sendcode(200)
+        // This allows a browser to view the response
+        $request.sendheaders(({"Content-Type": "text/plain; charset=utf8"}))
+        $values = ((1), (2), (3))
+        for $i in $values {
+            $data = ({'i': $i})
+            $body=`{$lib.json.save($data)}\n`
+            $request.sendbody($body.encode())
+        }
+    }
+
+Accessing this endpoint shows the JSONLines rows sent back::
+
+    $ curl -D - -sku "root:secret" "https://127.0.0.1:4443/api/ext/demo/jsonlines"
+    HTTP/1.1 200 OK
+    Content-Type: text/plain; charset=utf8
+    Date: Wed, 18 Oct 2023 14:31:29 GMT
+     nosniff
+    Transfer-Encoding: chunked
+
+    {"i": 1}
+    {"i": 2}
+    {"i": 3}
+
+In a similar fashion, a CSV can be generated. This example shows an integer and its square being computed::
+
+    $api = $lib.cortex.httpapi.add('demo/csv')
+    $api.methods.get = ${
+        $request.sendcode(200)
+        $request.sendheaders(({"Content-Type": "text/csv"}))
+
+        // Header row
+        $header="i, square\n"
+        $request.sendbody($header.encode())
+
+        $n = 10  // Number of rows to compute
+        for $i in $lib.range($n) {
+            $square = ($i * $i)
+            $body = `{$i}, {$square}\n`
+            $request.sendbody($body.encode())
+        }
+    }
+
+Accessing this shows the CSV content being sent back::
+
+    $ curl -D - -sku "root:secret" "https://127.0.0.1:4443/api/ext/demo/csv"
+    HTTP/1.1 200 OK
+    Content-Type: text/csv
+    Date: Wed, 18 Oct 2023 14:43:37 GMT
+    Transfer-Encoding: chunked
+
+    i, square
+    0, 0
+    1, 1
+    2, 4
+    3, 9
+    4, 16
+    5, 25
+    6, 36
+    7, 49
+    8, 64
+    9, 81
+
+
+When using the ``sendcode()``, ``sendheaders()``, and ``sendbody()`` APIs the order in which they are called does
+matter. The status code and headers can be set at any point before sending body data. They can even be set multiple
+times if the response logic needs to change a value it previously set.
+
+Once the body data has been sent, the status code and headers will be sent to the HTTP client and cannot be changed.
+Attempting to change the status code or send additional headers will have no effect. This will generate a warning
+message on the Cortex.
+
+The **minimum** data that the Extended HTTP API requires for a response to be considered valid is setting the status
+code. If the status code is not set by an endpoint, or if body content is sent prior to setting the endpoint, then
+an HTTP 500 status code will be sent to the caller.
+
+Messages and Error Handling
++++++++++++++++++++++++++++
+
+Messages sent out of the Storm runtime using functions such as ``$lib.print()``, ``$lib.warn()``, or ``$lib.fire()``
+are not available to HTTP API callers. The ``$lib.log`` Storm library can be used for doing out of band logging of
+messages that need to be generated while handling a response.
+
+A Storm query which generates an error which tears down the Storm runtime with an ``err`` message will result in an
+HTTP 500 response being sent. The error will be encoded in the Synapse HTTP API error convention documented at
+:ref:`http-api-conventions`.
+
+For example, if the previous example where the handler sent a ``mesg``  about the ``$number`` of things available was
+run after the variable  ``$number`` was removed, the code would generate the following response body:
+
+.. highlight:: none
+
+::
+
+    {"status": "err", "code": "NoSuchVar", "mesg": "Missing variable: number"}
+
+Custom error handling of issues that arise inside of the Storm query execution can be handled with the
+:ref:`flow-try-catch`. This allows a user to have finer control over their error codes, headers and error body content.
+
+.. note::
+
+    The HTTP 500 response will not be sent if there has already been body data send by the endpoint.
+
 Devops Details
 ==============
 
 Orchestration
 -------------
-
-.. _orch-hashistack:
-
-Hashistack
-~~~~~~~~~~
-
-Hashicorp's Nomad and Consul can be used to run Synapse ecosystem components. We provide a few different examples that
-can be used to help get an operations team up off the ground with using that platform for orchestration purposes.
-
-**Nomad**
-
-Nomad is traditionally used as a job and scheduler, but it may also be used to execute longer running services. The use
-of Nomad for running Synapse ecosystem components is fairly straightforward. The main consideration is in making sure
-that jobs have persistent storage available to them as necessary.
-
-The following example for running a Cortex has a few items of note.
-
-- The use of a ``constraint`` directive to tie this job to a specific host. In this case, the constraint directive is
-  using an AWS instance-id field in order to identify which host the job is supposed to be executed on.
-- The docker configuration section maps in the local volume ``/data/vertex/synapse_core0`` to ``/vertex/storage``. This
-  is the persistent storage for the Cortex.
-- The docker port map names ``telepath`` and ``https`` ports.
-- The Cortex service has several boot time configuration options by environment variables, including the default root
-  password.
-- The ``service`` blocks will be used to do registration with Consul, which will make the Cortex discoverable inside of
-  the Nomad cluster, without needing to know hostname/IP or port information for accessing the service.
-
-.. literalinclude:: devguides/cortex.hcl
-    :language: text
-
-A second example is shown below, this time for the Synapse Maxmind Advanced Power-Up. This example differs
-mainly in that it shows how to use a ``cell.yaml`` file to do some boot time configuration.
-
-- First, a ``template`` directive is used to push a YAML file to ``./local/cell.yaml`` when the job is deployed.
-- Second, the Docker entrypoint has been replaced with shell script one-liner. This copies the data from
-  ``./local/cell.yaml`` and over to ``/vertex/storage/cell.yaml``. This location would be the mapped in persistent
-  storage location for the service.
-- Last, after copying the file, the shell script launches the service process.
-- In addition, this example also shows a place where an authentication username for Docker Hub (our container image
-  repository) would be placed into the job file, so that the Docker daemon can retrieve the image.
-
-.. literalinclude:: devguides/maxmind.hcl
-    :language: text
-
-**Consul and Telepath**
-
-The Telepath client is aware of being able to resolve remote service locations via a Consul server. The Telepath
-connection string must be formed like the following::
-
-    tcp+consul://<user>:<password>@<service name>/<sharename>?consul=<url_consul_server>&consul_tag=telepath
-
-For example, to connect to the Cortex (assuming the Consul server was available at ``consul.vpc.lan``) you could use
-the following example::
-
-    tcp+consul://root:secret@synapse-core01/*?consul=http://consul.vpc.lan:8500&consul_tag=telepath
-
-    # Invoking command from the command line
-    python -m synapse.tools.cmdr "tcp+consul://root:secret@synapse-core01/*?consul=http://consul.vpc.lan:8500&consul_tag=telepath"
-
-From this, the Telepath Proxy looks up the ``synapse-core01`` service in the Consul catalog, and retrieves the first
-entry from that service which matches the tag ``telepath``. It then uses the IP and Port from the catalog entry in order
-to connect to the cortex. Another example would be using this to connect the Maxmind service to the cortex::
-
-    # Our Maxmind Consul URL
-    # tcp+consul://root:secret@synapse-maxmind/*?consul=http://consul.vpc.lan:8500&consul_tag=telepath
-
-    # Add the service
-    cli> storm service.add maxmind "tcp+consul://root:secret@synapse-maxmind/*?consul=http://consul.vpc.lan:8500&consul_tag=telepath"
-    Executing query at 2020/06/30 15:14:04.446
-    added 39fc7c15165291e58a62978ee79e9329 (maxmind): tcp+consul://root:secret@synapse-maxmind/*?consul=http://consul.vpc.lan:8500&consul_tag=telepath
-    complete. 0 nodes in 1 ms (0/sec).
-
-    # List the service
-    cli> storm service.list
-    Executing query at 2020/06/30 15:14:06.502
-
-    Storm service list (iden, ready, name, url):
-        39fc7c15165291e58a62978ee79e9329 True (maxmind): tcp+consul://root:****@synapse-maxmind/*?consul=http://consul.vpc.lan:8500&consul_tag=telepath
-
-    1 services
-    complete. 0 nodes in 1 ms (0/sec).
 
 .. _orch-kubernetes:
 
@@ -670,78 +2102,541 @@ Kubernetes
 ~~~~~~~~~~
 
 A popular option for Orchestration is Kubernetes. Kubernetes is an open-source system for automating the deployment,
-scaling and management of containerized applications. We provide examples that you can use to quickly get started
-using Kubernetes to orchestrate your Synapse deployment.  These examples include an Aha cell, an Axon, a Cortex,
-the Maxmind connector, and the Optic UI.
+scaling and management of containerized applications. Synapse does work in Kubernetes environments.
 
-Since all Telepath services connect via Aha, this allows for easy lookup of services via Aha. This allows for users to
-ignore most application awareness of port numbers. For example, the Maxmind connector can easily be added to the
-Cortex via ``service.add maxmind aha://root:demo@maxmind.aha.demo.net``.
+.. note::
 
-The Optic deployment uses an ``initContainers`` container to copy the TLS certificates into the service directory for
-Optic. The Traefik ``IngressRouteTCP`` directs all TLS traffic to the service to the Optic service. Since the TLS
-certificates have been put into the Cell directory for Optic, and the ``IngressRouteTCP`` acts a TLS passthrough,
-users are using TLS end to end to connect to Optic.
+    If you are using these examples to get started with Synapse on Kubernetes, you may need to adapt them to meet
+    operational needs for your environment.
 
-Passwords used for doing inter-service communications are stored in Kubernetes Secrets and are interpolated from
-environment variables to form Telepath URLs when needed. To keep these examples from being too large, passwords are
-shared between services.
+.. _orch-kubernetes-deployment:
 
-The following examples make the following assumptions:
+Example Deployment
+++++++++++++++++++
 
-1. A PersistentVolumeClaim provider is available. These examples use Digital Ocean block storage.
-2. Traefik is available to provide ``IngressRouteTCP`` providers. The examples here are treated as TLS passthrough
-   examples with a default websecure ``entryPoint``, which means the service must provide its own TLS endpoint. Further
-   Traefik configuration for providing TLS termination and connecting to backend services over TLS is beyond the scope
-   of this documentation.
-3. There is a ``cert-manager`` Certificate provider available to generate a Let's Encrypt TLS certificate.
-4. There is a secret ``regcred`` available which can be used to pull a Docker pull secret that can access the private
-   images.
+The following examples walk through deploying an example Synapse deployment ( based on :ref:`deploymentguide` ), but
+inside of a managed Kubernetes cluster managed by Digital Ocean. This deployment makes a few assumptions:
 
-**Single Pod**
+  Synapse Deployment Guide
+    This guide assumes a familiarity with the Synapse deployment guide. Concepts covered there are not repeated here.
 
-This single pod example can be readily used, provided that the assumptions noted earlier are accounted for. The DNS name
-for the Certificate, IngressRouteTCP, and SYN_OPTIC_NETLOC value would need to be updated to account for your own DNS
-settings.
+  namespace
+    These examples use the Kubernetes ``default`` namespace.
 
-.. literalinclude:: devguides/demo-aha-onepod.yaml
+  PersistentVolumeClaim
+    These examples use PersistentVolumeClaim (PVC) to create a persistent storage location. All Synapse services assume
+    they have some persistent storage to read and write to.  This example uses the ``storageClass`` of
+    ``do-block-storage``. You may need to alter these examples to provide a ``storageClass`` that is appropriate
+    for your environment. The ``storageClass`` must provision block storage attached to a single node, and claims must
+    use the ``ReadWriteOnce`` access mode. ``ReadWriteMany`` and NFS-backed storage classes are unsupported for service
+    storage (see :ref:`devops-task-storage`).
+
+  Aha naming
+    In Kubernetes, we rely on the default naming behavior for services to find the Aha service via DNS. The Aha service
+    uses a naming convention starting with ``aha`` followed by a two-digit number (e.g., ``aha00``) to support multiple instances.
+    The service's DNS name is configured using the ``SYN_AHA_DNS_NAME`` environment variable, which follows the pattern
+    ``<service-name>.<namespace>.svc.cluster.local``. For example, with the default namespace, the DNS name would be
+    ``aha00.default.svc.cluster.local``. The Aha service will automatically bind on ``0.0.0.0`` since we cannot bind the
+    DNS label provided by Kubernetes prior to the Pod running Aha being available. The ``SYN_AHA_AHA_NETWORK`` value can be
+    set to any desired Certificate Authority name (e.g., ``dev.synapse``) and is used for SSL certificate validation between Synapse services.
+
+Aha
+^^^
+
+The following ``aha.yaml`` can be used to deploy an Aha service.
+
+.. literalinclude:: ./kubernetes/aha.yaml
     :language: yaml
-    :lines: 1-284
 
-**Multiple Pods**
+This can be deployed via ``kubectl apply``. That will create the PVC, deployment, and service.
 
-Each service can also be broken into separate pods. This example is broken down across three sections, a Cortex, an Axon,
-and other services. This lines up with three distinct Persistent Volume Claims being made to host the data for the
-services. This isolates the storage between the Cortex, Axon and other services. Each service is deployed into its own
-pods; and each Telepath-capable service reports itself into an Aha server.
+.. highlight:: bash
 
-First, the shared Secret.
+::
 
-.. literalinclude:: devguides/demo-aha-pods.yaml
+    $ kubectl apply -f aha.yaml
+    persistentvolumeclaim/example-aha00 created
+    deployment.apps/aha00 created
+    service/aha00 created
+
+You can see the startup logs as well:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl logs -l app.kubernetes.io/instance=aha00
+    2025-03-12 20:30:49,620 [INFO] log level set to DEBUG [common.py:setlogging:MainThread:MainProcess]
+    2025-03-12 20:30:49,620 [INFO] Starting ahacell version 2.202.0, Synapse version: 2.202.0 [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:30:49,621 [DEBUG] Set config valu from envar: [SYN_AHA_DNS_NAME] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:30:49,621 [DEBUG] Set config valu from envar: [SYN_AHA_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:30:49,621 [DEBUG] Set config valu from envar: [SYN_AHA_AHA_NETWORK] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:30:49,637 [INFO] Adding CA certificate for dev.synapse [aha.py:initServiceRuntime:MainThread:MainProcess]
+    2025-03-12 20:30:49,637 [INFO] Generating CA certificate for dev.synapse [aha.py:genCaCert:MainThread:MainProcess]
+    2025-03-12 20:30:49,782 [INFO] Adding user certificate for root@dev.synapse [aha.py:_genUserCert:MainThread:MainProcess]
+    2025-03-12 20:30:50,654 [INFO] dmon listening: ssl://0.0.0.0?hostname=aha00.default.svc.cluster.local&ca=dev.synapse [cell.py:_bindDmonListen:MainThread:MainProcess]
+    2025-03-12 20:30:50,656 [INFO] provision listening: ssl://0.0.0.0:27272?hostname=aha00.default.svc.cluster.local [aha.py:initServiceNetwork:MainThread:MainProcess]
+    2025-03-12 20:30:50,657 [INFO] ...ahacell API (telepath): ssl://0.0.0.0?hostname=aha00.default.svc.cluster.local&ca=dev.synapse [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:30:50,657 [INFO] ...ahacell API (https): disabled [cell.py:initFromArgv:MainThread:MainProcess]
+
+Axon
+^^^^
+
+The following ``axon.yaml`` can be used as the basis to deploy an Axon service.
+
+.. literalinclude:: ./kubernetes/axon.yaml
     :language: yaml
-    :lines: 17-27
 
-The Cortex is straightforward. It uses a PVC, it is configured via environment variables, and has its Telepath
-port exposed as a service that other Pods can connect to. This example also adds a ``startupProbe`` and
-``livenessProbe`` added to check the Cortex (and other services). This allows us to know when the service is available;
-since the Cortex may take some time to load all of the memory maps associated with layer data.
+Before we deploy that, we need to create the Aha provisioning URL. We can do that via ``kubectl exec``. That should look
+like the following:
 
-.. literalinclude:: devguides/demo-aha-pods.yaml
+.. highlight:: bash
+
+::
+
+    $ kubectl exec deployment/aha00 -- python -m synapse.tools.aha.provision.service 00.axon
+    one-time use URL: ssl://aha00.default.svc.cluster.local:27272/405f7b971824071aeb6ef01abca1a2c8?certhash=2fc63156e8fde22dfa805901b11d80d19fac861f6ef3aac86180ad93a8dd77b7
+
+We want to copy that URL into the ``SYN_AXON_AHA_PROVISION`` environment variable, so that block looks like the
+following:
+
+.. highlight:: yaml
+
+::
+
+    - name: SYN_AXON_AHA_PROVISION
+      value: "ssl://aha00.default.svc.cluster.local:27272/405f7b971824071aeb6ef01abca1a2c8?certhash=2fc63156e8fde22dfa805901b11d80d19fac861f6ef3aac86180ad93a8dd77b7"
+
+This can then be deployed via ``kubectl apply``:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl apply -f axon.yaml
+    persistentvolumeclaim/example-axon00 created
+    deployment.apps/axon00 created
+
+You can see the Axon logs as well. These show provisioning and listening for traffic:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl logs -l app.kubernetes.io/instance=axon00
+    2025-03-12 20:31:56,904 [INFO] log level set to DEBUG [common.py:setlogging:MainThread:MainProcess]
+    2025-03-12 20:31:56,904 [INFO] Starting axon version 2.202.0, Synapse version: 2.202.0 [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:31:56,904 [DEBUG] Set config valu from envar: [SYN_AXON_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:31:56,904 [DEBUG] Set config valu from envar: [SYN_AXON_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:31:56,904 [INFO] Provisioning axon from AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2025-03-12 20:31:56,937 [DEBUG] Set config valu from envar: [SYN_AXON_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:31:56,937 [DEBUG] Set config valu from envar: [SYN_AXON_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:31:58,273 [INFO] Done provisioning axon AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2025-03-12 20:31:58,334 [INFO] dmon listening: ssl://0.0.0.0:0?hostname=00.axon.dev.synapse&ca=dev.synapse [cell.py:_bindDmonListen:MainThread:MainProcess]
+    2025-03-12 20:31:58,335 [INFO] ...axon API (telepath): ssl://0.0.0.0:0?hostname=00.axon.dev.synapse&ca=dev.synapse [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:31:58,335 [INFO] ...axon API (https): disabled [cell.py:initFromArgv:MainThread:MainProcess]
+
+The hostname ``00.axon.dev.synapse`` seen in the logs is **not** a DNS label in Kubernetes. That is an
+internal label used by the service to resolve SSL certificates that it provisioned with the Aha service, and as the
+name that it uses to register with the Aha service.
+
+
+JSONStor
+^^^^^^^^
+
+The following ``jsonstor.yaml`` can be used as the basis to deploy a JSONStor service.
+
+.. literalinclude:: ./kubernetes/jsonstor.yaml
     :language: yaml
-    :lines: 37-147
 
-The Axon is very similar to the Cortex.
+Before we deploy that, we need to create the Aha provisioning URL. We can do that via ``kubectl exec``. That should look
+like the following:
 
-.. literalinclude:: devguides/demo-aha-pods.yaml
+.. highlight:: bash
+
+::
+
+    $ kubectl exec deployment/aha00 -- python -m synapse.tools.aha.provision.service 00.jsonstor
+    one-time use URL: ssl://aha00.default.svc.cluster.local:27272/85941d2f2c3ffbe16605cff50d7dfc0d?certhash=e88f51ea894c9606fd610c4d46a46026fd25575d7f9851ea8b0ade4963207591
+
+We want to copy that URL into the ``SYN_JSONSTOR_AHA_PROVISION`` environment variable, so that block looks like the
+following:
+
+.. highlight:: yaml
+
+::
+
+    - name: SYN_JSONSTOR_AHA_PROVISION
+      value: "ssl://aha00.default.svc.cluster.local:27272/85941d2f2c3ffbe16605cff50d7dfc0d?certhash=e88f51ea894c9606fd610c4d46a46026fd25575d7f9851ea8b0ade4963207591"
+
+
+This can then be deployed via ``kubectl apply``:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl apply -f jsonstor.yaml
+    persistentvolumeclaim/example-jsonstor00 created
+    deployment.apps/jsonstor00 created
+
+You can see the JSONStor logs as well. These show provisioning and listening for traffic:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl logs -l app.kubernetes.io/instance=jsonstor00
+    2025-03-12 20:32:29,606 [INFO] log level set to DEBUG [common.py:setlogging:MainThread:MainProcess]
+    2025-03-12 20:32:29,607 [INFO] Starting jsonstorcell version 2.202.0, Synapse version: 2.202.0 [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:32:29,607 [DEBUG] Set config valu from envar: [SYN_JSONSTOR_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:32:29,607 [DEBUG] Set config valu from envar: [SYN_JSONSTOR_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:32:29,607 [INFO] Provisioning jsonstorcell from AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2025-03-12 20:32:29,640 [DEBUG] Set config valu from envar: [SYN_JSONSTOR_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:32:29,640 [DEBUG] Set config valu from envar: [SYN_JSONSTOR_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:32:30,570 [INFO] Done provisioning jsonstorcell AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2025-03-12 20:32:30,633 [INFO] dmon listening: ssl://0.0.0.0:0?hostname=00.jsonstor.dev.synapse&ca=dev.synapse [cell.py:_bindDmonListen:MainThread:MainProcess]
+    2025-03-12 20:32:30,635 [INFO] ...jsonstorcell API (telepath): ssl://0.0.0.0:0?hostname=00.jsonstor.dev.synapse&ca=dev.synapse [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:32:30,635 [INFO] ...jsonstorcell API (https): disabled [cell.py:initFromArgv:MainThread:MainProcess]
+
+The hostname ``00.jsonstor.dev.synapse`` seen in the logs is **not** a DNS label in Kubernetes. That is an
+internal label used by the service to resolve SSL certificates that it provisioned with the Aha service, and as the
+name that it uses to register with the Aha service.
+
+Cortex
+^^^^^^
+
+The following ``cortex.yaml`` can be used as the basis to deploy the Cortex.
+
+.. literalinclude:: ./kubernetes/cortex.yaml
     :language: yaml
-    :lines: 155-253
 
-The last set of components shown here is the most complex. It includes the Aha server, the Maxmind connector, and the
-Optic UI.
+Before we deploy that, we need to create the Aha provisioning URL. This uses a fixed listening port for the Cortex, so
+that we can later use port-forwarding to access the Cortex service. We do this via ``kubectl exec``. That should look
+like the following:
 
-.. literalinclude:: devguides/demo-aha-pods.yaml
+::
+
+    $ kubectl exec deployment/aha00 -- python -m synapse.tools.aha.provision.service 00.cortex --dmon-port 27492
+    one-time use URL: ssl://aha00.default.svc.cluster.local:27272/5aa07a461673424fa19dcf7d5e17f460?certhash=e88f51ea894c9606fd610c4d46a46026fd25575d7f9851ea8b0ade4963207591
+
+We want to copy that URL into the ``SYN_CORTEX_AHA_PROVISION`` environment variable, so that block looks like the
+following:
+
+.. highlight:: bash
+
+::
+
+    - name: SYN_CORTEX_AHA_PROVISION
+      value: "ssl://aha00.default.svc.cluster.local:27272/5aa07a461673424fa19dcf7d5e17f460?certhash=e88f51ea894c9606fd610c4d46a46026fd25575d7f9851ea8b0ade4963207591"
+
+
+This can then be deployed via ``kubectl apply``:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl apply -f cortex.yaml
+    persistentvolumeclaim/example-cortex00 created
+    deployment.apps/cortex00 created
+    service/cortex created
+
+
+You can see the Cortex logs as well. These show provisioning and listening for traffic, as well as the connection being
+made to the Axon and JSONStor services:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl logs -l app.kubernetes.io/instance=cortex00
+    2025-03-12 20:33:52,998 [INFO] log level set to DEBUG [common.py:setlogging:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [INFO] Starting cortex version 2.202.0, Synapse version: 2.202.0 [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [DEBUG] Set config valu from envar: [SYN_CORTEX_AXON] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [DEBUG] Set config valu from envar: [SYN_CORTEX_JSONSTOR] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [DEBUG] Set config valu from envar: [SYN_CORTEX_STORM_LOG] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [DEBUG] Set config valu from envar: [SYN_CORTEX_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [DEBUG] Set config valu from envar: [SYN_CORTEX_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:52,998 [INFO] Provisioning cortex from AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2025-03-12 20:33:53,030 [DEBUG] Set config valu from envar: [SYN_CORTEX_AXON] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:53,030 [DEBUG] Set config valu from envar: [SYN_CORTEX_JSONSTOR] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:53,030 [DEBUG] Set config valu from envar: [SYN_CORTEX_STORM_LOG] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:53,030 [DEBUG] Set config valu from envar: [SYN_CORTEX_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:53,030 [DEBUG] Set config valu from envar: [SYN_CORTEX_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2025-03-12 20:33:55,169 [INFO] Done provisioning cortex AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2025-03-12 20:33:55,533 [WARNING] Detected 255 deprecated properties unlocked and not in use, recommend locking (https://v.vtx.lk/deprlock). [cortex.py:_warnDeprLocks:MainThread:MainProcess]
+    2025-03-12 20:33:55,660 [INFO] dmon listening: ssl://0.0.0.0:27492?hostname=00.cortex.dev.synapse&ca=dev.synapse [cell.py:_bindDmonListen:MainThread:MainProcess]
+    2025-03-12 20:33:55,661 [INFO] ...cortex API (telepath): ssl://0.0.0.0:27492?hostname=00.cortex.dev.synapse&ca=dev.synapse [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:33:55,661 [INFO] ...cortex API (https): disabled [cell.py:initFromArgv:MainThread:MainProcess]
+    2025-03-12 20:33:55,664 [DEBUG] Connected to remote axon aha://axon... [cortex.py:onlink:MainThread:MainProcess]
+    2025-03-12 20:33:55,697 [DEBUG] Connected to remote jsonstor aha://jsonstor... [cortex.py:onlink:MainThread:MainProcess]
+
+The hostname ``00.cortex.dev.synapse`` seen in the logs is **not** a DNS label in Kubernetes. That is an
+internal label used by the service to resolve SSL certificates that it provisioned with the Aha service, and as the
+name that it uses to register with the Aha service.
+
+CLI Tooling Example
+^^^^^^^^^^^^^^^^^^^
+
+Synapse services and tooling assumes that IP and Port combinations registered with the AHA service are reachable.
+This example shows a way to connect to the Cortex from **outside** of the Kubernetes cluster without resolving service
+information via Aha. Communication between services inside of the cluster does not need to go through these steps.
+This does assume that your local environment has the Python synapse package available.
+
+First add a user to the Cortex:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl exec -it deployment/cortex00 -- python -m synapse.tools.service.moduser --add --admin true visi
+    Adding user: visi
+    ...setting admin: true
+
+Then we need to generate a user provisioning URL:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl exec -it deployment/aha00 -- python -m synapse.tools.aha.provision.user visi
+    one-time use URL: ssl://aha00.default.svc.cluster.local:27272/95e9d45d9b0f0b259026f6044a26f1de?certhash=e88f51ea894c9606fd610c4d46a46026fd25575d7f9851ea8b0ade4963207591
+
+Port-forward the AHA provisioning service to your local environment:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl port-forward service/aha00 27272:provisioning
+
+Run the enroll tool to create a user certificate pair and have it signed by the Aha service. We replace the service DNS
+name of ``aha00.default.svc.cluster.local`` with ``localhost`` in this example.
+
+.. highlight:: bash
+
+::
+
+    $ python -m synapse.tools.aha.enroll ssl://localhost:27272/95e9d45d9b0f0b259026f6044a26f1de?certhash=e88f51ea894c9606fd610c4d46a46026fd25575d7f9851ea8b0ade4963207591
+    Saved CA certificate: /home/visi/.syn/certs/cas/dev.synapse.crt
+    Saved user certificate: /home/visi/.syn/certs/users/visi@dev.synapse.crt
+    Updating known AHA servers
+
+The Aha service port-forward can be disabled, and replaced with a port-forward for the Cortex service:
+
+.. highlight:: bash
+
+::
+
+    kubectl port-forward service/cortex 27492:telepath
+
+Then connect to the Cortex via the Storm CLI, using the URL
+``ssl://visi@localhost:27492/?hostname=00.cortex.dev.synapse``.
+
+.. highlight:: bash
+
+::
+
+    $ python -m synapse.tools.storm "ssl://visi@localhost:27492/?hostname=00.cortex.dev.synapse"
+
+    Welcome to the Storm interpreter!
+
+    Local interpreter (non-storm) commands may be executed with a ! prefix:
+        Use !quit to exit.
+        Use !help to see local interpreter commands.
+
+    storm>
+
+The Storm CLI tool can now be used to run Storm commands. We can validate our work from earlier by running the Storm
+command ``aha.svc.list`` to list the services that are registered with the Aha service:
+
+.. highlight:: bash
+
+::
+
+    storm> aha.svc.list
+    Name                                          Leader Online Ready Host            Port
+    00.axon.dev.synapse                           true   true   true  10.244.0.10     38417
+    00.cortex.dev.synapse                         true   true   true  10.244.0.12     27492
+    00.jsonstor.dev.synapse                       true   true   true  10.244.0.11     45681
+    axon.dev.synapse                              true   true   true  10.244.0.10     38417
+    cortex.dev.synapse                            true   true   true  10.244.0.12     27492
+    jsonstor.dev.synapse                          true   true   true  10.244.0.11     45681
+
+Commercial Components
+^^^^^^^^^^^^^^^^^^^^^
+
+For Synapse-Enterprise users, deploying commercial components can follow a similar pattern. The following is an example
+of deploying Optic, the Synapse User Interface, as it is a common part of a Synapse deployment. This enables users to
+interact with Synapse via a web browser, instead of using the CLI tools. This example shows accessing the service via
+a port-forward. This example does not contain the full configuration settings you will need for a production deployment
+of Optic, please see :ref:`synapse-ui` for more information.
+
+.. note::
+
+    Optic is available as a part of the **Synapse Enterprise** commercial offering. This example assumes that the
+    Kubernetes cluster has a valid ``imagePullSecret`` named ``regcred`` which can access commercial images.
+
+The following ``optic.yaml`` can be used as the basis to deploy Optic.
+
+.. literalinclude:: ./kubernetes/optic.yaml
     :language: yaml
-    :lines: 273-607
+
+Before we deploy that, we need to create the Aha provisioning URL. We do this via ``kubectl exec``. That should look
+like the following:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl exec deployment/aha00 -- python -m synapse.tools.aha.provision.service 00.optic
+    one-time use URL: ssl://aha00.default.svc.cluster.local:27272/3f692cda9dfb152f74a8a0251165bcc4?certhash=09c8329ed29b89b77e0a2fdc23e64aea407ad4d7e71d67d3fea92ddd9466592f
+
+We want to copy that URL into the ``SYN_OPTIC_AHA_PROVISION`` environment variable, so that block looks like the
+following:
+
+.. highlight:: yaml
+
+::
+
+    - name: SYN_OPTIC_AHA_PROVISION
+      value: "ssl://aha00.default.svc.cluster.local:27272/3f692cda9dfb152f74a8a0251165bcc4?certhash=09c8329ed29b89b77e0a2fdc23e64aea407ad4d7e71d67d3fea92ddd9466592f"
+
+
+This can then be deployed via ``kubectl apply``:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl apply -f optic.yaml
+    persistentvolumeclaim/example-optic00 created
+    deployment.apps/optic00 created
+    service/optic created
+
+You can see the Optic logs as well. These show provisioning and listening for traffic, as well as the connection being
+made to the Axon, Cortex, and JSONStor services:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl logs --tail 30 -l app.kubernetes.io/instance=optic00
+    2023-03-08 17:32:40,149 [INFO] log level set to DEBUG [common.py:setlogging:MainThread:MainProcess]
+    2023-03-08 17:32:40,150 [DEBUG] Set config valu from envar: [SYN_OPTIC_CORTEX] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,150 [DEBUG] Set config valu from envar: [SYN_OPTIC_AXON] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,151 [DEBUG] Set config valu from envar: [SYN_OPTIC_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,152 [DEBUG] Set config valu from envar: [SYN_OPTIC_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,153 [INFO] Provisioning optic from AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2023-03-08 17:32:40,264 [DEBUG] Set config valu from envar: [SYN_OPTIC_CORTEX] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,265 [DEBUG] Set config valu from envar: [SYN_OPTIC_AXON] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,265 [DEBUG] Set config valu from envar: [SYN_OPTIC_HTTPS_PORT] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:40,266 [DEBUG] Set config valu from envar: [SYN_OPTIC_AHA_PROVISION] [config.py:setConfFromEnvs:MainThread:MainProcess]
+    2023-03-08 17:32:45,181 [INFO] Done provisioning optic AHA service. [cell.py:_bootCellProv:MainThread:MainProcess]
+    2023-03-08 17:32:45,247 [INFO] optic wwwroot: /usr/local/lib/python3.10/dist-packages/optic/site [app.py:initServiceStorage:MainThread:MainProcess]
+    2023-03-08 17:32:45,248 [WARNING] Waiting for remote jsonstor... [app.py:initJsonStor:MainThread:MainProcess]
+    2023-03-08 17:32:45,502 [INFO] Connected to JsonStor at [aha://jsonstor...] [app.py:initJsonStor:MainThread:MainProcess]
+    2023-03-08 17:32:45,504 [INFO] Waiting for connection to Cortex [app.py:_initOpticCortex:MainThread:MainProcess]
+    2023-03-08 17:32:45,599 [INFO] Connected to Cortex at [aha://cortex...] [app.py:_initOpticCortex:MainThread:MainProcess]
+    2023-03-08 17:32:45,930 [INFO] Connected to Axon at [aha://axon...] [app.py:onaxonlink:MainThread:MainProcess]
+    2023-03-08 17:32:45,937 [DEBUG] Email settings/server not configured or invalid. [app.py:initEmailApis:asyncio_0:MainProcess]
+    2023-03-08 17:32:45,975 [INFO] dmon listening: ssl://0.0.0.0:0?hostname=00.optic.default.svc.cluster.local&ca=default.svc.cluster.local [cell.py:initServiceNetwork:MainThread:MainProcess]
+    2023-03-08 17:32:45,976 [WARNING] NO CERTIFICATE FOUND! generating self-signed certificate. [cell.py:addHttpsPort:MainThread:MainProcess]
+    2023-03-08 17:32:47,773 [INFO] https listening: 4443 [cell.py:initServiceNetwork:MainThread:MainProcess]
+    2023-03-08 17:32:47,773 [INFO] ...optic API (telepath): ssl://0.0.0.0:0?hostname=00.optic.default.svc.cluster.local&ca=default.svc.cluster.local [cell.py:initFromArgv:MainThread:MainProcess]
+    2023-03-08 17:32:47,773 [INFO] ...optic API (https): 4443 [cell.py:initFromArgv:MainThread:MainProcess]
+
+Once Optic is connected, we will need to set a password for the user we previously created in order to log in. This can
+be done via ``kubectl exec``, setting the password for the user on the Cortex:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl exec -it deployment/cortex00 -- python -m synapse.tools.service.moduser --passwd secretPassword visi
+    Modifying user: visi
+    ...setting passwd: secretPassword
+
+Enable a port-forward to connect to the Optic service:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl port-forward service/optic 4443:https
+
+You can then use a Chrome browser to navigate to ``https://localhost:4443`` and you should be prompted with an Optic
+login screen. You can enter your username and password ( ``visi`` and ``secretPassword`` ) in order to login to Optic.
+
+Practical Considerations
+++++++++++++++++++++++++
+
+The following items should be considered for Kubernetes deployments intended for production use cases:
+
+  Healthchecks
+    These examples use large ``startupProbe`` failure values. Vertex recommends these large values, since service
+    updates may have automatic data migrations which they perform at startup, and services booted with
+    ``onboot:optimize`` (see :ref:`devops-task-onboot-optimize`) will delay startup to optimize their databases.
+    Both of these will be performed before a service has enabled any listeners which would respond to healthcheck
+    probes. The large value prevents a service from being terminated prior to a long running data migration or
+    database optimization completing.
+
+  Ingress and Load Balancing
+    The use of ``kubectl port-forward`` may not be sustainable in a production environment. It is common to use a form
+    of ingress controller or load balancer for external services to reach services such as the Cortex or Optic
+    applications. It is common for the Optic UI or the Cortex HTTP API to be exposed to end users since that often has
+    a simpler networking configuration than exposing Telepath services on Aha and the Cortex.
+
+  Log aggregation
+    Many Kubernetes clusters may perform some sort of log aggregation for the containers running in them. If your log
+    aggregation solution can parse JSON formatted container logs, you can set the ``SYN_LOG_STRUCT`` environment
+    variable to ``"true"`` to enable structured log output. See :ref:`devops-task-logging` for more information about that
+    option.
+
+  Node Selectors
+    These examples do not use any node selectors to bind pods to specific nodes or node types. Node selectors on the
+    podspec can be used to constrain different services to different types of nodes. For example, they can be used to
+    ensure the Cortex is deployed to a node which has been provisioned as a high memory node for that purpose.
+
+  PVC
+    The previous examples used relatively small volume claim sizes for demonstration purposes. A ``storageClass``
+    which can be dynamically resized will be helpful in the event of needing to grow the storage used by a deployment.
+    This is a common feature for managed Kubernetes instances.
+
+.. _orch-kubernetes-sysctl:
+
+Performance Tuning in Kubernetes
+++++++++++++++++++++++++++++++++
+
+It is common for Kubernetes to be executed in a managed environment, where an operator may not have direct access to
+the underlying hosts. In that scenario, applying the system configurations detailed in :ref:`devops-task-performance`
+may be difficult. The following example shows a DaemonSet which runs a privileged pod, that ensures that the desired
+``sysctl`` values are set on the host. You may need to modify this to meet any requirements which are specific to
+your deployment.
+
+The following ``sysctl.yaml`` can be used as the basis to deploy these modifications.
+
+.. literalinclude:: ./kubernetes/sysctl.yaml
+    :language: yaml
+
+
+This can be deployed via ``kubectl apply``. That will create the DaemonSet for you..
+
+.. highlight:: bash
+
+::
+
+    $ kubectl apply -f sysctl_dset.yaml
+    daemonset.apps/setsysctl created
+
+You can see the sysctl pods by running the following command:
+
+.. highlight:: bash
+
+::
+
+    $ kubectl get pods -l app.kubernetes.io/component=sysctl -o wide
 
 
 .. _autodoc-conf-aha:
@@ -769,6 +2664,11 @@ Cortex Configuration Options
 .. include:: autodocs/conf_cortex.rst
 
 .. _index:              ../index.html
-.. _Synapse-Backup: ../projects/backup/en/latest/
-.. _Synapse-S3: ../projects/s3/en/latest/
+.. _Synapse-Backup: ../../../projects/backup/en/latest/
+.. _Synapse-S3: ../../../projects/s3/en/latest/
 .. _hypergraph: https://en.wikipedia.org/wiki/Hypergraph
+.. _warnings: https://docs.python.org/3/library/warnings.html
+.. _strftime: https://docs.python.org/3/library/time.html#time.strftime
+.. _fullmatch: https://docs.python.org/3/library/re.html#re.fullmatch
+.. _curl: https://curl.se/
+.. _jq: https://github.com/jqlang/jq

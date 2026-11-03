@@ -3,12 +3,12 @@ import logging
 
 import regex
 
-import synapse.exc as s_exc
 import synapse.common as s_common
 
 import synapse.lib.scrape as s_scrape
 import synapse.lib.spooled as s_spooled
 import synapse.lib.stormtypes as s_stormtypes
+import synapse.lib.processpool as s_processpool
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class LibScrape(s_stormtypes.Lib):
         genMatches is a generic helper function for constructing scrape interfaces using pure Storm.
 
         It accepts the text, a regex pattern, and produce results that can easily be used to create
+        nodes.
 
         Notes:
             The pattern must have a named regular expression match for the key ``valu`` using the
@@ -71,7 +72,7 @@ class LibScrape(s_stormtypes.Lib):
                 $form="ps:name"
 
                 function scrape(text, form) {
-                        $ret = $lib.list()
+                        $ret = ()
                         for ($valu, $info) in $lib.scrape.genMatches($text, $re) {
                             $ret.append(($form, $valu, $info))
                         }
@@ -91,7 +92,7 @@ class LibScrape(s_stormtypes.Lib):
                        'desc': 'Regex flags to use (defaults to IGNORECASE).'},
                   ),
                   'returns': {'name': 'yields', 'type': 'list',
-                              'desc': ''}}}
+                              'desc': 'Yields a list of (value, info) tuples scraped from the text.'}}}
     )
     _storm_lib_path = ('scrape', )
 
@@ -108,10 +109,12 @@ class LibScrape(s_stormtypes.Lib):
         refang = await s_stormtypes.tobool(refang)
         unique = await s_stormtypes.tobool(unique)
         # Remove this in 3.0.0 since it is deprecated.
-        s_common.deprecated('$lib.scrape()')
+        s_common.deprecated('Directly calling $lib.scrape()')
         await self.runt.warnonce('$lib.scrape() is deprecated. Use $lib.scrape.ndefs().')
-        async with await s_spooled.Set.anit() as items:  # type: s_spooled.Set
-            for item in s_scrape.scrape(text, ptype=form, refang=refang, first=False):
+
+        core = self.runt.snap.core
+        async with await s_spooled.Set.anit(dirn=core.dirn, cell=core) as items:  # type: s_spooled.Set
+            async for item in s_scrape.scrapeAsync(text, ptype=form, refang=refang, first=False):
                 if unique:
                     if item in items:
                         continue
@@ -153,9 +156,9 @@ class LibScrape(s_stormtypes.Lib):
         if fangs:
             _fangs = {src: dst for (src, dst) in fangs}
             _fangre = s_scrape.genFangRegex(_fangs)
-            scrape_text, offsets = s_scrape.refang_text2(text, re=_fangre, fangs=_fangs)
+            scrape_text, offsets = await s_processpool.semafork(s_scrape.refang_text2, text, re=_fangre, fangs=_fangs)
 
-        for info in s_scrape.genMatches(scrape_text, regx, opts=opts):
+        async for info in s_scrape.genMatchesAsync(scrape_text, regx, opts=opts):
             valu = info.pop('valu')
 
             if _fangs and offsets:

@@ -1,6 +1,10 @@
 import io
 import os
+import csv
+import http
+import base64
 import shutil
+import struct
 import asyncio
 import hashlib
 import logging
@@ -14,6 +18,8 @@ import synapse.axon as s_axon
 import synapse.common as s_common
 import synapse.telepath as s_telepath
 
+import synapse.lib.coro as s_coro
+import synapse.lib.json as s_json
 import synapse.lib.certdir as s_certdir
 import synapse.lib.httpapi as s_httpapi
 import synapse.lib.msgpack as s_msgpack
@@ -27,16 +33,29 @@ bbuf = b'0123456' * 4793491
 abuf = b'asdfasdf'
 pbuf = b'pennywise'
 rbuf = b'robert gray'
+bin_buf = b'\xbb/$\xc0A\xf1\xbf\xbc\x00_\x82v4\xf6\xbd\x1b'
+
+# sample of a real world csv with a extended ascii character encoding in
+# one row which causes decoding errors.
+csv_badenc_b64 = 'Zm9vLTAxNjIsMSwiVGhlICIiYmFyIiIga2V5d29yZCBkb2VzIGEgdGhpb' \
+                 'mcuIiwiIiwiIgpmb28tMDE2MywyLCJtYWlsIGdvZXMgYnJycnJycnIiLG' \
+                 'JlZXAsImJvb3AiLCJh/GIiCmZvby0wMTY0LDEsImJpZyB3b3JkcyBzbWF' \
+                 'sbCB3b3JkcyIsIiIsIiIK'
+csv_badenc_buf = base64.b64decode(csv_badenc_b64)
 
 bbufhash = hashlib.sha256(bbuf).digest()
 asdfhash = hashlib.sha256(abuf).digest()
 emptyhash = hashlib.sha256(b'').digest()
 pennhash = hashlib.sha256(pbuf).digest()
 rgryhash = hashlib.sha256(rbuf).digest()
+newphash = s_common.buid('newp')
+csv_badenc_hash = hashlib.sha256(csv_badenc_buf).digest()
 
 fields = [
     {'name': 'file', 'sha256': s_common.ehex(asdfhash), 'filename': 'file'},
     {'name': 'zip_password', 'value': 'test'},
+    {'name': 'dict', 'value': {'foo': 'bar'}},
+    {'name': 'bytes', 'value': b'coolbytes'},
 ]
 
 asdfretn = (8, asdfhash)
@@ -78,7 +97,14 @@ class HttpPushFile(s_httpapi.StreamHandler):
 
         assert item['body'] == b'asdfasdf'
         assert item['filename'] == 'file'
+
+        item = files.get('bytes')[0]
+
+        assert item['body'] == b'coolbytes'
+        assert item['filename'] == 'bytes'
+
         assert args.get('zip_password') == [b'test']
+        assert args.get('dict') == [b'{"foo":"bar"}']
         self.sendRestRetn(self.gotsize)
 
 class AxonTest(s_t_utils.SynTest):
@@ -168,6 +194,8 @@ class AxonTest(s_t_utils.SynTest):
         async with await axon.upload() as fd:
             await fd.write(b'')
             self.eq(emptyretn, await fd.save())
+        self.true(await axon.has(emptyhash))
+        self.eq(0, await axon.size(emptyhash))
 
         info = await axon.metrics()
         self.eq(33554445, info.get('size:bytes'))
@@ -252,9 +280,14 @@ class AxonTest(s_t_utils.SynTest):
         (lsize, l256) = await axon.put(linesbuf)
         (jsize, j256) = await axon.put(jsonsbuf)
         (bsize, b256) = await axon.put(b'\n'.join((jsonsbuf, linesbuf)))
+        (binsize, bin256) = await axon.put(bin_buf)
 
         lines = [item async for item in axon.readlines(s_common.ehex(l256))]
         self.eq(('asdf', '', 'qwer'), lines)
+        lines = [item async for item in axon.readlines(s_common.ehex(bin256))]  # Default is errors=ignore
+        self.eq(lines, ['/$A\x00_v4\x1b'])
+        lines = [item async for item in axon.readlines(s_common.ehex(bin256), errors='replace')]
+        self.eq(lines, ['�/$�A�\x00_�v4��\x1b'])
         jsons = [item async for item in axon.jsonlines(s_common.ehex(j256))]
         self.eq(({'foo': 'bar'}, {'baz': 'faz'}), jsons)
         jsons = []
@@ -263,21 +296,354 @@ class AxonTest(s_t_utils.SynTest):
                 jsons.append(item)
         self.eq(({'foo': 'bar'}, {'baz': 'faz'}), jsons)
 
+        with self.raises(s_exc.BadDataValu):
+            lines = [item async for item in axon.readlines(s_common.ehex(bin256), errors=None)]
+
+        with self.raises(s_exc.NoSuchFile):
+            lines = [item async for item in axon.readlines(s_common.ehex(newphash))]
+
+        with self.raises(s_exc.NoSuchFile):
+            lines = [item async for item in axon.jsonlines(s_common.ehex(newphash))]
+
+        # readlines byte alignment test
+        csize = s_axon.CHUNK_SIZE
+        stuff = (csize - 3) * 'v'
+        lines = [stuff, '.ॐwords']
+        buf = '\n'.join(lines)
+        size, sha256 = await axon.put(buf.encode())
+        lines = [item async for item in axon.readlines(s_common.ehex(sha256))]
+        self.len(2, lines)
+        self.eq(lines[1], '.ॐwords')
+
+        # regular csv
+        data = '''John,Doe,120 jefferson st.,Riverside, NJ, 08075
+Jack,McGinnis,220 hobo Av.,Phila, PA,09119
+"John ""Da Man""",Repici,120 Jefferson St.,Riverside, NJ,08075
+"Stephen, aka the dude",Tyler,"7452 Terrace ""At the Plaza"" road",SomeTown,SD, 91234
+,Blankman,,SomeTown, SD, 00298
+"Joan ""the bone"", Anne",Jet,"9th, at Terrace plc",Desert City,CO,00123
+Bob,Smith,Little House at the end of Main Street,Gomorra,CA,12345'''
+        data = '\n'.join([data for _ in range(10)])
+        size, sha256 = await axon.put(data.encode())
+        rows = [row async for row in axon.csvrows(sha256)]
+        self.len(70, rows)
+        for row in rows:
+            self.len(6, row)
+        names = {row[0] for row in rows}
+        self.len(7, names)
+        enames = {'John', 'Jack', 'John "Da Man"', 'Stephen, aka the dude', '',
+                  'Joan "the bone", Anne', 'Bob'}
+        self.eq(names, enames)
+
+        evt = asyncio.Event()
+        origlink = s_axon.Axon._sha256ToLink
+        async def fakelink(self, sha256_, link):
+            link.onfini(evt.set)
+            if sha256_ == pennhash:
+                sha256_ = b'newp'
+            await origlink(self, sha256_, link)
+
+        newdata = '\n'.join([data for i in range(500)])
+        size, sha256 = await axon.put(newdata.encode())
+
+        with mock.patch('synapse.axon.Axon._sha256ToLink', fakelink):
+            async for row in axon.csvrows(sha256):
+                break
+            self.true(await s_coro.event_wait(evt, 5))
+
+            evt.clear()
+            async for row in axon.readlines(s_common.ehex(sha256)):
+                break
+            self.true(await s_coro.event_wait(evt, 5))
+
+            # make sure exceptions within sha256tolink get re-raised
+            with self.raises(s_exc.NoSuchFile):
+                await s_t_utils.alist(axon.csvrows(pennhash))
+
+            with self.raises(s_exc.NoSuchFile):
+                await s_t_utils.alist(axon.readlines(s_common.ehex(pennhash)))
+
+        # CSV with alternative delimiter
+        data = '''foo|bar|baz
+words|word|wrd'''
+        size, sha256 = await axon.put(data.encode())
+        rows = [row async for row in axon.csvrows(sha256, delimiter='|')]
+        self.len(2, rows)
+        for row in rows:
+            self.len(3, row)
+
+        # CSV With embedded newlines
+        data = '''i,s,nonce
+0,"foo
+bar baz",
+1,"foo
+bar baz",v
+2,"foo
+bar baz",vv
+'''
+        size, sha256 = await axon.put(data.encode())
+        rows = [row async for row in axon.csvrows(sha256)]
+        self.len(4, rows)
+        nlchunk = 'foo\nbar baz'
+        erows = [['i', 's', 'nonce'], ['0', nlchunk, ''], ['1', nlchunk, 'v'], ['2', nlchunk, 'vv'], ]
+        self.eq(rows, erows)
+
+        # CSV with bad dialect
+        with self.raises(s_exc.BadArg):
+            rows = [row async for row in axon.csvrows(sha256, dialect='newp')]
+
+        # Bad fmtparams
+        with self.raises(s_exc.BadArg) as cm:
+            rows = [row async for row in axon.csvrows(sha256, newp='newp')]
+
+        # From CPython Test_Csv.test_read_eof
+        eofbuf = '"a,'.encode()
+        size, eofsha256 = await axon.put(eofbuf)
+        with self.raises(s_exc.BadDataValu) as cm:
+            rows = [row async for row in axon.csvrows(eofsha256, strict=True)]
+        self.isin('unexpected end of data', cm.exception.get('mesg'))
+
+        # Python 3.11+ - csv handles null bytes in an acceptable fashion.
+        # See https://github.com/python/cpython/issues/71767 for discussion
+        rows = [row async for row in axon.csvrows(bin256)]
+        self.eq(rows, (('/$A\x00_v4\x1b',),))
+
+        with self.raises(s_exc.NoSuchFile):
+            lines = [item async for item in axon.csvrows(newphash)]
+
+        # Single column csv blob with byte alignment issues
+        fslm = csv.field_size_limit()
+        csize = s_axon.CHUNK_SIZE
+        buf = b''
+        while True:
+            buf = buf + (b'v' * fslm) + b'\n'
+            if csize - len(buf) < fslm:
+                break
+        rem = csize - len(buf)
+        buf = buf + b'v' * (rem - 3) + b'\n' + '.ॐwords'.encode()
+        size, sha256 = await axon.put(buf)
+        rows = [item async for item in axon.csvrows(sha256)]
+        self.len(129, rows)
+        for row in rows:
+            self.len(1, row)
+        self.eq(rows[-1], ['.ॐwords'])
+
+        # This is pulled from CPython's csv test suite to throw a CSV error.
+        size, sha256 = await axon.put('"a'.encode())
+        with self.raises(s_exc.BadDataValu) as cm:
+            rows = [row async for row in axon.csvrows(sha256, strict=True)]
+
+        # A csvfile with an extended ascii character in it
+        size, sha256 = await axon.put(csv_badenc_buf)
+        self.eq(sha256, csv_badenc_hash)
+        rows = [item async for item in axon.csvrows(sha256)]
+        self.len(3, rows)
+
+        erows = (('foo-0162', '1', 'The "bar" keyword does a thing.', '', ''),
+                 ('foo-0163', '2', 'mail goes brrrrrrr', 'beep', 'boop', 'ab'),
+                 ('foo-0164', '1', 'big words small words', '', ''),
+                 )
+        self.eq(rows, erows)
+
+        info = await axon.getCellInfo()
+        if info.get('features', {}).get('byterange') and not isinstance(axon, (s_telepath.Proxy, s_telepath.Client)):
+            logger.info(f'Running range test for {axon}')
+            # hand insert a genr to control offset sizes
+            def genr():
+                yield b'asdf'
+                yield b'qwer'
+                yield b'zxcv'
+
+            asdfbyts = b'asdfqwerzxcv'
+            sha256 = hashlib.sha256(asdfbyts).digest()
+            await axon.save(sha256, genr(), size=len(asdfbyts))
+
+            bytslist = [b async for b in axon.get(sha256, 0, size=2)]
+            self.eq(b'as', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 0, size=12)]
+            self.eq(b'asdfqwerzxcv', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 0, size=13)]
+            self.eq(b'asdfqwerzxcv', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 0, size=4)]
+            self.eq(b'asdf', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 2, size=4)]
+            self.eq(b'dfqw', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 2, size=6)]
+            self.eq(b'dfqwer', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 4, size=4)]
+            self.eq(b'qwer', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 8, size=4)]
+            self.eq(b'zxcv', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 3, size=6)]
+            self.eq(b'fqwerz', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 4, size=8)]
+            self.eq(b'qwerzxcv', b''.join(bytslist))
+            self.notin(b'', bytslist)
+
+            bytslist = [b async for b in axon.get(sha256, 11, size=6)]
+            self.eq(b'v', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 12, size=6)]
+            self.eq(b'', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 13, size=6)]
+            self.eq(b'', b''.join(bytslist))
+
+            with self.raises(s_exc.BadArg):
+                bytslist = [b async for b in axon.get(sha256, 1, size=-1)]
+
+            with self.raises(s_exc.BadArg):
+                bytslist = [b async for b in axon.get(sha256, -1, size=1)]
+
+            with self.raises(s_exc.BadArg):
+                bytslist = [b async for b in axon.get(sha256, 0, size=0)]
+
+        # test unpack
+        intdata = struct.pack('>QQQ', 1, 2, 3)
+        size, sha256 = await axon.put(intdata)
+        self.eq((1,), await axon.unpack(sha256, '>Q'))
+        self.eq((2,), await axon.unpack(sha256, '>Q', offs=8))
+        self.eq((3,), await axon.unpack(sha256, '>Q', offs=16))
+        self.eq((2, 3), await axon.unpack(sha256, '>QQ', offs=8))
+
+        fmt = 'Q' * 150_000
+        with self.raises(s_exc.BadArg) as cm:
+            await axon.unpack(sha256, '>' + fmt)
+        self.isin('Struct format would read too much data', cm.exception.get('mesg'))
+
+        with self.raises(s_exc.BadArg):
+            await axon.unpack(sha256, 'not a valid format')
+
+        with self.raises(s_exc.BadArg):
+            await axon.unpack(sha256, 123)
+
+        with self.raises(s_exc.BadDataValu):
+            await axon.unpack(sha256, '>Q', offs=24)
+
     async def test_axon_base(self):
-        async with self.getTestAxon() as axon:
-            self.isin('axon', axon.dmon.shared)
-            await self.runAxonTestBase(axon)
+        with self.getTestDir() as dirn:
+            async with self.getTestAxon(dirn=dirn) as axon:
+                self.eq(2, axon._getStorVers())
+                await self.runAxonTestBase(axon)
 
-            # test behavior for two concurrent uploads where the file exists once the lock is released
-            self.eq(bbufretn, await axon.put(bbuf))
-            self.true(await axon.has(bbufhash))
+                # test behavior for two concurrent uploads where the file exists once the lock is released
+                self.eq(bbufretn, await axon.put(bbuf))
+                self.true(await axon.has(bbufhash))
 
-            def emptygen():
-                if False:
-                    yield None
-                return
+                with self.raises(ValueError) as cm:
+                    async with axon.holdHashLock(bbufhash):
+                        raise ValueError('oops')
+                self.none(axon.hashlocks.get(bbufhash))
 
-            self.eq(bbufretn[0], await axon.save(bbufhash, emptygen()))
+                def emptygen():
+                    if False:
+                        yield None
+                    return
+
+                self.eq(bbufretn[0], await axon.save(bbufhash, emptygen(), size=bbufretn[0]))
+
+                # deleting a blob removes its offset index rows
+                byts = b'V' * 200
+                sha256 = hashlib.sha256(byts).digest()
+                await axon.save(sha256, [byts[:100], byts[100:]], 200)
+                self.len(2, list(axon.blobslab.scanKeysByPref(sha256, db=axon.blobs)))
+                self.len(2, list(axon.blobslab.scanKeysByPref(sha256, db=axon.offsets)))
+
+                self.true(await axon.del_(sha256))
+                self.len(0, list(axon.blobslab.scanKeysByPref(sha256, db=axon.blobs)))
+                self.len(0, list(axon.blobslab.scanKeysByPref(sha256, db=axon.offsets)))
+
+                await axon.save(sha256, [byts], 200)
+                self.len(1, list(axon.blobslab.scanKeysByPref(sha256, db=axon.offsets)))
+                retn = b''.join([chunk async for chunk in axon.get(sha256, offs=50, size=150)])
+                self.eq(byts[50:], retn)
+
+                # storage version 2 removes orphan and stale offset index rows
+                def i64(valu):
+                    return valu.to_bytes(8, 'big')
+
+                clean00 = b'\x01' * 32
+                orphan00 = b'\x02' * 32
+                stale00 = b'\x03' * 32
+                clean01 = b'\x04' * 32
+                missing00 = b'\x05' * 32
+                wrongval00 = b'\x06' * 32
+                orphan01 = b'\xff' * 32
+
+                stalebyts = bytes(range(200))
+
+                rows = (
+                    (clean00, (b'a' * 100, b'b' * 100), ((100, 0), (200, 1))),
+                    (orphan00, (), ((100, 0), (200, 1))),
+                    (stale00, (stalebyts,), ((100, 0), (150, 1), (300, 1))),
+                    (clean01, (b'c' * 10, b'd' * 10, b'e' * 10), ((10, 0), (20, 1), (30, 2))),
+                    (missing00, (b'f' * 10, b'g' * 10, b'h' * 10), ()),
+                    (wrongval00, (b'i' * 10, b'j' * 10), ((10, 1),)),
+                    (orphan01, (), ((50, 0),)),
+                )
+
+                for sha256, blobs, offsets in rows:
+                    if blobs:
+                        await axon.save(sha256, blobs, sum(len(b) for b in blobs))
+
+                    for offs, indx in offsets:
+                        axon.blobslab.put(sha256 + i64(offs), i64(indx), db=axon.offsets)
+
+                # missing rows before, between, and after the remaining rows
+                axon.blobslab.delete(missing00 + i64(10), db=axon.offsets)
+                axon.blobslab.delete(missing00 + i64(30), db=axon.offsets)
+
+                clean00rows = list(axon.blobslab.scanByPref(clean00, db=axon.offsets))
+                clean01rows = list(axon.blobslab.scanByPref(clean01, db=axon.offsets))
+
+                axon._setStorVers(1)
+
+            async with self.getTestAxon(dirn=dirn) as axon:
+
+                self.eq(2, axon._getStorVers())
+
+                shas = (clean00, orphan00, stale00, clean01, missing00, wrongval00, orphan01)
+                offsitems = [item for item in axon.blobslab.scanByFull(db=axon.offsets) if item[0][:32] in shas]
+                self.eq(offsitems, [
+                    (clean00 + i64(100), i64(0)),
+                    (clean00 + i64(200), i64(1)),
+                    (stale00 + i64(200), i64(0)),
+                    (clean01 + i64(10), i64(0)),
+                    (clean01 + i64(20), i64(1)),
+                    (clean01 + i64(30), i64(2)),
+                    (missing00 + i64(10), i64(0)),
+                    (missing00 + i64(20), i64(1)),
+                    (missing00 + i64(30), i64(2)),
+                    (wrongval00 + i64(10), i64(0)),
+                    (wrongval00 + i64(20), i64(1)),
+                ])
+
+                self.eq(clean00rows, list(axon.blobslab.scanByPref(clean00, db=axon.offsets)))
+                self.eq(clean01rows, list(axon.blobslab.scanByPref(clean01, db=axon.offsets)))
+
+                retn = b''.join([chunk async for chunk in axon.get(missing00, offs=5, size=20)])
+                self.eq(b'f' * 5 + b'g' * 10 + b'h' * 5, retn)
+
+                retn = b''.join([chunk async for chunk in axon.get(wrongval00, offs=5, size=10)])
+                self.eq(b'i' * 5 + b'j' * 5, retn)
+
+                retn = b''.join([chunk async for chunk in axon.get(stale00, offs=50, size=150)])
+                self.eq(stalebyts[50:], retn)
+
+                retn = b''.join([chunk async for chunk in axon.get(clean00, offs=50, size=100)])
+                self.eq(b'a' * 50 + b'b' * 50, retn)
+
+                retn = b''.join([chunk async for chunk in axon.get(clean01, offs=15, size=10)])
+                self.eq(b'd' * 5 + b'e' * 5, retn)
 
     async def test_axon_proxy(self):
         async with self.getTestAxon() as axon:
@@ -290,7 +656,18 @@ class AxonTest(s_t_utils.SynTest):
         async with self.getTestAxon() as axon:
             await self.runAxonTestHttp(axon)
 
-    async def runAxonTestHttp(self, axon):
+    async def runAxonTestHttp(self, axon, realaxon=None):
+        '''
+        Test Axon HTTP APIs.
+
+        Args:
+            axon: A cell that implements the axon http apis
+            realaxon: The actual axon cell; if None defaults to the axon arg
+        '''
+
+        if realaxon is None:
+            realaxon = axon
+
         host, port = await axon.addHttpsPort(0, host='127.0.0.1')
 
         newb = await axon.auth.addUser('newb')
@@ -305,33 +682,54 @@ class AxonTest(s_t_utils.SynTest):
         bbufhash_h = s_common.ehex(bbufhash)
         emptyhash_h = s_common.ehex(emptyhash)
 
+        # No auth - coverage
+        async with self.getHttpSess() as sess:
+            async with sess.get(f'{url_dl}/foobar') as resp:
+                self.eq(resp.status, http.HTTPStatus.UNAUTHORIZED)
+                info = await resp.json()
+                self.eq('NotAuthenticated', info.get('code'))
+            async with sess.head(f'{url_dl}/foobar') as resp:
+                self.eq(resp.status, http.HTTPStatus.UNAUTHORIZED)
+                # aiohttp ignores HEAD bodies
+            async with sess.delete(f'{url_dl}/foobar') as resp:
+                self.eq(resp.status, http.HTTPStatus.UNAUTHORIZED)
+                info = await resp.json()
+                self.eq('NotAuthenticated', info.get('code'))
+
         # Perms
         async with self.getHttpSess(auth=('newb', 'secret'), port=port) as sess:
 
             async with sess.get(f'{url_dl}/{asdfhash_h}') as resp:
-                self.eq(403, resp.status)
+                self.eq(resp.status, http.HTTPStatus.FORBIDDEN)
                 item = await resp.json()
                 self.eq('err', item.get('status'))
 
             async with sess.delete(f'{url_dl}/{asdfhash_h}') as resp:
-                self.eq(403, resp.status)
+                self.eq(resp.status, http.HTTPStatus.FORBIDDEN)
                 item = await resp.json()
                 self.eq('err', item.get('status'))
 
             async with sess.get(f'{url_hs}/{asdfhash_h}') as resp:
-                self.eq(403, resp.status)
+                self.eq(resp.status, http.HTTPStatus.FORBIDDEN)
                 item = await resp.json()
                 self.eq('err', item.get('status'))
+
+            async with sess.head(f'{url_dl}/{asdfhash_h}') as resp:
+                self.eq(resp.status, http.HTTPStatus.FORBIDDEN)
+                item = await resp.json()
 
             async with sess.post(url_de) as resp:
-                self.eq(403, resp.status)
+                self.eq(resp.status, http.HTTPStatus.FORBIDDEN)
                 item = await resp.json()
                 self.eq('err', item.get('status'))
 
-            async with sess.post(url_ul, data=abuf) as resp:
-                self.eq(403, resp.status)
-                item = await resp.json()
-                self.eq('err', item.get('status'))
+            # a denied upload does not start an upload in the Axon
+            with mock.patch.object(realaxon, 'upload', wraps=realaxon.upload) as upload:
+                async with sess.post(url_ul, data=abuf) as resp:
+                    self.eq(resp.status, http.HTTPStatus.FORBIDDEN)
+                    item = await resp.json()
+                    self.eq('err', item.get('status'))
+                upload.assert_not_called()
 
             # Stream file
             byts = io.BytesIO(bbuf)
@@ -348,85 +746,91 @@ class AxonTest(s_t_utils.SynTest):
         # Basic
         async with self.getHttpSess(auth=('newb', 'secret'), port=port) as sess:
             async with sess.get(f'{url_dl}/foobar') as resp:
-                self.eq(404, resp.status)
+                self.eq(resp.status, http.HTTPStatus.NOT_FOUND)
+                info = await resp.json()
+                self.eq('err', info.get('status'))
+                self.eq('BadArg', info.get('code'))
+                self.eq('Hash is not a SHA-256: foobar', info.get('mesg'))
 
             async with sess.get(f'{url_dl}/{asdfhash_h}') as resp:
-                self.eq(404, resp.status)
-                item = await resp.json()
-                self.eq('err', item.get('status'))
+                self.eq(resp.status, http.HTTPStatus.NOT_FOUND)
+                info = await resp.json()
+                self.eq('err', info.get('status'))
+                self.eq('NoSuchFile', info.get('code'))
+                self.eq(f'SHA-256 not found: {asdfhash_h}', info.get('mesg'))
 
             async with sess.get(f'{url_hs}/{asdfhash_h}') as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 self.false(item.get('result'))
 
             async with sess.post(url_ul, data=abuf) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 result = item.get('result')
                 self.eq(set(result.keys()), {'size', 'md5', 'sha1', 'sha256', 'sha512'})
                 self.eq(result.get('size'), asdfretn[0])
                 self.eq(result.get('sha256'), asdfhash_h)
-                self.true(await axon.has(asdfhash))
+                self.true(await realaxon.has(asdfhash))
 
             async with sess.get(f'{url_hs}/{asdfhash_h}') as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 self.true(item.get('result'))
 
             async with sess.put(url_ul, data=abuf) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 result = item.get('result')
                 self.eq(result.get('size'), asdfretn[0])
                 self.eq(result.get('sha256'), asdfhash_h)
-                self.true(await axon.has(asdfhash))
+                self.true(await realaxon.has(asdfhash))
 
             async with sess.get(f'{url_dl}/{asdfhash_h}') as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 self.eq(abuf, await resp.read())
 
             # Streaming upload
             byts = io.BytesIO(bbuf)
 
             async with sess.post(url_ul, data=byts) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 result = item.get('result')
                 self.eq(result.get('size'), bbufretn[0])
                 self.eq(result.get('sha256'), bbufhash_h)
-                self.true(await axon.has(bbufhash))
+                self.true(await realaxon.has(bbufhash))
 
             byts = io.BytesIO(bbuf)
 
             async with sess.put(url_ul, data=byts) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 result = item.get('result')
                 self.eq(result.get('size'), bbufretn[0])
                 self.eq(result.get('sha256'), bbufhash_h)
-                self.true(await axon.has(bbufhash))
+                self.true(await realaxon.has(bbufhash))
 
             byts = io.BytesIO(b'')
 
             async with sess.post(url_ul, data=byts) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 result = item.get('result')
                 self.eq(result.get('size'), emptyretn[0])
                 self.eq(result.get('sha256'), emptyhash_h)
-                self.true(await axon.has(emptyhash))
+                self.true(await realaxon.has(emptyhash))
 
             # Streaming download
             async with sess.get(f'{url_dl}/{bbufhash_h}') as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
 
                 byts = []
                 async for bytz in resp.content.iter_chunked(1024):
@@ -435,32 +839,160 @@ class AxonTest(s_t_utils.SynTest):
                 self.gt(len(byts), 1)
                 self.eq(bbuf, b''.join(byts))
 
+            # HEAD
+            async with sess.head(f'{url_dl}/{bbufhash_h}') as resp:
+                self.eq(resp.status, http.HTTPStatus.OK)
+                self.eq('33554437', resp.headers.get('content-length'))
+                self.none(resp.headers.get('content-range'))
+
+            async with sess.head(f'{url_dl}/foobar') as resp:
+                self.eq(resp.status, http.HTTPStatus.NOT_FOUND)
+                self.eq('0', resp.headers.get('content-length'))
+
             # DELETE method by sha256
+            async with sess.delete(f'{url_dl}/foobar') as resp:
+                self.eq(resp.status, http.HTTPStatus.NOT_FOUND)
+                info = await resp.json()
+                self.eq('err', info.get('status'))
+                self.eq('BadArg', info.get('code'))
+                self.eq('Hash is not a SHA-256: foobar', info.get('mesg'))
+
             async with sess.delete(f'{url_dl}/{asdfhash_h}') as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 self.true(item.get('result'))
 
             async with sess.delete(f'{url_dl}/{asdfhash_h}') as resp:
-                self.eq(404, resp.status)
+                self.eq(resp.status, http.HTTPStatus.NOT_FOUND)
                 item = await resp.json()
                 self.eq('err', item.get('status'))
 
             # test /api/v1/axon/file/del API
             data = {'sha256s': (asdfhash_h, asdfhash_h)}
             async with sess.post(url_de, json=data) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.OK)
                 item = await resp.json()
                 self.eq('ok', item.get('status'))
                 self.eq(((asdfhash_h, False), (asdfhash_h, False)), item.get('result'))
 
             data = {'newp': 'newp'}
             async with sess.post(url_de, json=data) as resp:
-                self.eq(200, resp.status)
+                self.eq(resp.status, http.HTTPStatus.BAD_REQUEST)
                 item = await resp.json()
                 self.eq('err', item.get('status'))
                 self.eq('SchemaViolation', item.get('code'))
+
+            info = await axon.getCellInfo()
+            if info.get('features', {}).get('byterange'):
+                # hand insert a genr to control offset sizes
+                def genr():
+                    yield b'asdf'
+                    yield b'qwer'
+                    yield b'zxcv'
+
+                asdfbyts = b'asdfqwerzxcv'
+                sha256 = hashlib.sha256(asdfbyts).digest()
+                await axon.save(sha256, genr(), size=len(asdfbyts))
+                shatext = s_common.ehex(sha256)
+
+                headers = {'range': 'bytes=2-4'}
+                async with sess.get(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('3', resp.headers.get('content-length'))
+                    self.eq('bytes 2-4/12', resp.headers.get('content-range'))
+                    buf = b''
+                    async for byts in resp.content.iter_chunked(1024):
+                        buf = buf + byts
+                    self.eq(buf, b'dfq')
+
+                headers = {'range': 'bytes=,2-'}
+                async with sess.get(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('10', resp.headers.get('content-length'))
+                    self.eq('bytes 2-11/12', resp.headers.get('content-range'))
+                    buf = b''
+                    async for byts in resp.content.iter_chunked(1024):
+                        buf = buf + byts
+                    self.eq(buf, b'dfqwerzxcv')
+
+                headers = {'range': 'bytes=0-11'}
+                async with sess.get(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('12', resp.headers.get('content-length'))
+                    self.eq('bytes 0-11/12', resp.headers.get('content-range'))
+                    buf = b''
+                    async for byts in resp.content.iter_chunked(1024):
+                        buf = buf + byts
+                    self.eq(buf, b'asdfqwerzxcv')
+
+                headers = {'range': 'bytes=10-11'}
+                async with sess.get(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('2', resp.headers.get('content-length'))
+                    self.eq('bytes 10-11/12', resp.headers.get('content-range'))
+                    buf = b''
+                    async for byts in resp.content.iter_chunked(1024):
+                        buf = buf + byts
+                    self.eq(buf, b'cv')
+
+                headers = {'range': 'bytes=11-11'}
+                async with sess.get(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('1', resp.headers.get('content-length'))
+                    self.eq('bytes 11-11/12', resp.headers.get('content-range'))
+                    buf = b''
+                    async for byts in resp.content.iter_chunked(1024):
+                        buf = buf + byts
+                    self.eq(buf, b'v')
+
+                headers = {'range': 'bytes=2-4,8-11'}
+                async with sess.get(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('3', resp.headers.get('content-length'))
+                    self.eq('bytes 2-4/12', resp.headers.get('content-range'))
+                    buf = b''
+                    async for byts in resp.content.iter_chunked(1024):
+                        buf = buf + byts
+                    self.eq(buf, b'dfq')
+
+                # HEAD tests
+                headers = {'range': 'bytes=2-4'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('3', resp.headers.get('content-length'))
+                    self.eq('bytes 2-4/12', resp.headers.get('content-range'))
+
+                headers = {'range': 'bytes=10-11'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('2', resp.headers.get('content-length'))
+                    self.eq('bytes 10-11/12', resp.headers.get('content-range'))
+
+                headers = {'range': 'bytes=11-11'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.PARTIAL_CONTENT)
+                    self.eq('1', resp.headers.get('content-length'))
+                    self.eq('bytes 11-11/12', resp.headers.get('content-range'))
+
+                # TODO - In python 3.13+ this can be HTTPStatus.RANGE_NOT_SATISFIABLE
+                # Reading past blobsize isn't valid HTTP
+                headers = {'range': 'bytes=10-20'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+
+                headers = {'range': 'bytes=11-12'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+
+                headers = {'range': 'bytes=20-40'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+
+                # Negative size
+                headers = {'range': 'bytes=20-4'}
+                async with sess.head(f'{url_dl}/{shatext}', headers=headers) as resp:
+                    self.eq(resp.status, http.HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
 
     async def test_axon_perms(self):
         async with self.getTestAxon() as axon:
@@ -470,18 +1002,42 @@ class AxonTest(s_t_utils.SynTest):
             aurl = f'tcp://user:test@127.0.0.1:{port}/axon'
             async with await s_telepath.openurl(aurl) as prox:  # type: s_axon.AxonApi
                 # Ensure the user can't do things with bytes they don't have permissions too.
-                await self.agenraises(s_exc.AuthDeny, prox.get(asdfhash))
-                await self.asyncraises(s_exc.AuthDeny, prox.has(asdfhash))
-                await self.asyncraises(s_exc.AuthDeny, prox.hashset(asdfhash))
-                await self.agenraises(s_exc.AuthDeny, prox.hashes(0))
-                await self.agenraises(s_exc.AuthDeny, prox.history(0))
-                await self.asyncraises(s_exc.AuthDeny, prox.del_(asdfhash))
-                await self.asyncraises(s_exc.AuthDeny, prox.dels((asdfhash,)))
-                await self.asyncraises(s_exc.AuthDeny, prox.wants((asdfhash,)))
-                await self.asyncraises(s_exc.AuthDeny, prox.put(abuf))
-                await self.asyncraises(s_exc.AuthDeny, prox.puts((abuf,)))
-                await self.asyncraises(s_exc.AuthDeny, prox.upload())
-                await self.asyncraises(s_exc.AuthDeny, prox.metrics())
+                with self.raises(s_exc.AuthDeny):
+                    await s_t_utils.alist(prox.get(asdfhash))
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.has(asdfhash)
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.hashset(asdfhash)
+
+                with self.raises(s_exc.AuthDeny):
+                    await s_t_utils.alist(prox.hashes(0))
+
+                with self.raises(s_exc.AuthDeny):
+                    await s_t_utils.alist(prox.history(0))
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.del_(asdfhash)
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.dels((asdfhash,))
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.wants((asdfhash,))
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.put(abuf)
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.puts((abuf,))
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.upload()
+
+                with self.raises(s_exc.AuthDeny):
+                    await prox.metrics()
+
                 # now add rules and run the test suite
                 await user.addRule((True, ('health',)))
                 await user.addRule((True, ('axon', 'get',)))
@@ -528,10 +1084,14 @@ class AxonTest(s_t_utils.SynTest):
                 self.eq(True, resp['ok'])
                 self.eq(200, resp['code'])
                 self.eq(8, resp['size'])
+                self.eq('OK', resp['reason'])
                 self.eq('application/octet-stream', resp['headers']['Content-Type'])
 
                 resp = await proxy.wget(f'http://visi:secret@127.0.0.1:{port}/api/v1/axon/files/by/sha256/{sha2}')
                 self.false(resp['ok'])
+                self.eq(-1, resp['code'])
+                self.isin('Exception occurred during request: ClientOSError: [Errno 104]', resp['reason'])
+                self.isinstance(resp['err'], tuple)
 
                 async def timeout(self):
                     await asyncio.sleep(2)
@@ -544,8 +1104,20 @@ class AxonTest(s_t_utils.SynTest):
         conf = {'http:proxy': 'socks5://user:pass@127.0.0.1:1'}
         async with self.getTestAxon(conf=conf) as axon:
             async with axon.getLocalProxy() as proxy:
-                resp = await proxy.wget('http://vertex.link')
-                self.isin('Can not connect to proxy 127.0.0.1:1', resp.get('mesg', ''))
+                resp = await proxy.wget('http://vertex.link/')
+                self.false(resp.get('ok'))
+                self.isin('connect to proxy 127.0.0.1:1', resp.get('mesg', ''))
+
+                resp = await proxy.wget('http://vertex.link/', proxy=None)
+                self.false(resp.get('ok'))
+                self.isin('connect to proxy 127.0.0.1:1', resp.get('mesg', ''))
+
+            resp = await proxy.wget('vertex.link')
+            self.false(resp.get('ok'))
+            self.isin('InvalidUrlClientError: vertex.link', resp.get('mesg', ''))
+
+            with self.raises(s_exc.BadArg):
+                await proxy.wget('http://vertex.link', proxy=1.1)
 
     async def test_axon_wput(self):
 
@@ -565,6 +1137,7 @@ class AxonTest(s_t_utils.SynTest):
                 resp = await proxy.wput(sha256, f'https://127.0.0.1:{port}/api/v1/pushfile', method='PUT', ssl=False)
                 self.eq(True, resp['ok'])
                 self.eq(200, resp['code'])
+                self.eq('OK', resp['reason'])
 
             opts = {'vars': {'sha256': s_common.ehex(sha256)}}
             q = f'return($lib.axon.wput($sha256, "https://127.0.0.1:{port}/api/v1/pushfile", ssl=(0)))'
@@ -572,29 +1145,43 @@ class AxonTest(s_t_utils.SynTest):
             self.eq(True, resp['ok'])
             self.eq(200, resp['code'])
 
-            opts = {'vars': {'sha256': s_common.ehex(s_common.buid())}}
-            resp = await core.callStorm(q, opts=opts)
-            self.eq(False, resp['ok'])
-            self.isin('Axon does not contain the requested file.', resp.get('mesg'))
-
-            q = f'''
-            $fields = $lib.list(
-                $lib.dict(name=file, sha256=$sha256, filename=file),
-                $lib.dict(name=zip_password, value=test)
-            )
-            $resp = $lib.inet.http.post("https://127.0.0.1:{port}/api/v1/pushfile",
-                                        fields=$fields, ssl_verify=(0))
-            return($resp)
+            jsonq = f'''$resp = $lib.axon.wput($sha256, "https://127.0.0.1:{port}/api/v1/pushfile", ssl=(0))
+            return ( $lib.json.save($resp) )
             '''
-            opts = {'vars': {'sha256': s_common.ehex(sha256)}}
-            resp = await core.callStorm(q, opts=opts)
-            self.true(resp['ok'])
+            resp = await core.callStorm(jsonq, opts=opts)
+            self.isinstance(resp, str)
+            resp = s_json.loads(resp)
+            self.eq(True, resp['ok'])
             self.eq(200, resp['code'])
 
             opts = {'vars': {'sha256': s_common.ehex(s_common.buid())}}
             resp = await core.callStorm(q, opts=opts)
+            self.eq(False, resp['ok'])
+            self.eq(-1, resp['code'])
+            self.isin('Axon does not contain the requested file.', resp.get('mesg'))
+            self.isin('Exception occurred during request: NoSuchFile', resp.get('reason'))
+            self.isinstance(resp.get('err'), tuple)
+
+            q = f'''
+            $fields = ([
+                {{'name':'file', 'sha256':$sha256, 'filename':'file'}},
+                {{'name':'zip_password', 'value':'test'}},
+                {{'name':'dict', 'value':{{'foo':'bar'}} }},
+                {{'name':'bytes', 'value':$bytes}}
+            ])
+            $resp = $lib.inet.http.post("https://127.0.0.1:{port}/api/v1/pushfile",
+                                        fields=$fields, ssl_verify=(0))
+            return($resp)
+            '''
+            opts = {'vars': {'sha256': s_common.ehex(sha256), 'bytes': b'coolbytes'}}
+            resp = await core.callStorm(q, opts=opts)
+            self.true(resp['ok'])
+            self.eq(200, resp['code'])
+
+            opts = {'vars': {'sha256': s_common.ehex(s_common.buid()), 'bytes': ''}}
+            resp = await core.callStorm(q, opts=opts)
             self.false(resp['ok'])
-            self.isin('Axon does not contain the requested file.', resp.get('err'))
+            self.isin('Axon does not contain the requested file.', resp.get('reason'))
 
             async with axon.getLocalProxy() as proxy:
                 resp = await proxy.postfiles(fields, f'https://127.0.0.1:{port}/api/v1/pushfile', ssl=False)
@@ -603,10 +1190,52 @@ class AxonTest(s_t_utils.SynTest):
 
         conf = {'http:proxy': 'socks5://user:pass@127.0.0.1:1'}
         async with self.getTestAxon(conf=conf) as axon:
+
+            axon.addHttpApi('/api/v1/pushfile', HttpPushFile, {'cell': axon})
+
+            async with await axon.upload() as fd:
+                await fd.write(b'asdfasdf')
+                size, sha256 = await fd.save()
+
+            host, port = await axon.addHttpsPort(0, host='127.0.0.1')
+
             async with axon.getLocalProxy() as proxy:
                 resp = await proxy.postfiles(fields, f'https://127.0.0.1:{port}/api/v1/pushfile', ssl=False)
-                self.false(resp['ok'])
-                self.isin('Can not connect to proxy 127.0.0.1:1', resp.get('err', ''))
+                self.false(resp.get('ok'))
+                self.isin('connect to proxy 127.0.0.1:1', resp.get('reason'))
+
+                resp = await proxy.postfiles(fields, f'https://127.0.0.1:{port}/api/v1/pushfile', ssl=False, proxy=None)
+                self.false(resp.get('ok'))
+                self.isin('connect to proxy 127.0.0.1:1', resp.get('reason'))
+
+            resp = await proxy.wput(sha256, 'vertex.link')
+            self.false(resp.get('ok'))
+            self.isin('InvalidUrlClientError: vertex.link', resp.get('mesg', ''))
+
+            resp = await proxy.postfiles(fields, 'vertex.link')
+            self.false(resp.get('ok'))
+            self.isin('InvalidUrlClientError: vertex.link', resp.get('reason'))
+
+            # Bypass the Axon proxy configuration from Storm
+            url = axon.getLocalUrl()
+            async with self.getTestCore(conf={'axon': url}) as core:
+                q = f'''
+                $resp = $lib.inet.http.post("https://127.0.0.1:{port}/api/v1/pushfile",
+                                            fields=$fields, ssl_verify=(0))
+                return($resp)
+                '''
+                resp = await core.callStorm(q, opts={'vars': {'fields': fields}})
+                self.false(resp.get('ok'))
+                self.isin('connect to proxy 127.0.0.1:1', resp.get('reason'))
+
+                q = f'''
+                $resp = $lib.inet.http.post("https://127.0.0.1:{port}/api/v1/pushfile",
+                                            fields=$fields, ssl_verify=(0), proxy=$lib.false)
+                return($resp)
+                '''
+                resp = await core.callStorm(q, opts={'vars': {'fields': fields}})
+                self.true(resp.get('ok'))
+                self.eq(resp.get('code'), 200)
 
     async def test_axon_tlscapath(self):
 
@@ -645,7 +1274,7 @@ class AxonTest(s_t_utils.SynTest):
 
                 resp = await axon.postfiles(fields, url)
                 self.false(resp.get('ok'))
-                self.isin('unable to get local issuer certificate', resp.get('err'))
+                self.isin('unable to get local issuer certificate', resp.get('reason'))
 
             conf = {'auth:passwd': 'root', 'tls:ca:dir': tlscadir}
             async with self.getTestAxon(dirn=dirn, conf=conf) as axon:
@@ -663,3 +1292,53 @@ class AxonTest(s_t_utils.SynTest):
 
                 resp = await axon.postfiles(fields, url)
                 self.true(resp.get('ok'))
+
+    async def test_axon_blob_v00_v01(self):
+
+        async with self.getRegrAxon('blobv00-blobv01') as axon:
+
+            sha256 = hashlib.sha256(b'asdfqwerzxcv').digest()
+            offsitems = list(axon.blobslab.scanByFull(db=axon.offsets))
+            self.eq(offsitems, (
+                (sha256 + (4).to_bytes(8, 'big'), (0).to_bytes(8, 'big')),
+                (sha256 + (8).to_bytes(8, 'big'), (1).to_bytes(8, 'big')),
+                (sha256 + (12).to_bytes(8, 'big'), (2).to_bytes(8, 'big')),
+            ))
+
+            bytslist = [b async for b in axon.get(sha256, 0, size=4)]
+            self.eq(b'asdf', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 2, size=4)]
+            self.eq(b'dfqw', b''.join(bytslist))
+
+            bytslist = [b async for b in axon.get(sha256, 2, size=6)]
+            self.eq(b'dfqwer', b''.join(bytslist))
+
+            metrics = await axon.metrics()
+            self.eq(metrics, {'size:bytes': 12, 'file:count': 1})
+
+            self.eq(2, axon._getStorVers())
+
+    async def test_axon_mirror(self):
+
+        async with self.getTestAha() as aha:
+
+            axon00dirn = s_common.gendir(aha.dirn, 'tmp', 'axon00')
+            axon01dirn = s_common.gendir(aha.dirn, 'tmp', 'axon01')
+
+            waiter = aha.waiter(2, 'aha:svcadd')
+
+            axon00url = await aha.addAhaSvcProv('00.axon', {'https:port': None})
+            axon01url = await aha.addAhaSvcProv('01.axon', {'https:port': None, 'mirror': '00.axon'})
+
+            axon00 = await aha.enter_context(await s_axon.Axon.anit(axon00dirn, conf={'aha:provision': axon00url}))
+            (size, sha256) = await axon00.put(b'visi')
+            self.false(await axon00._axonFileAdd(sha256, size, {}))
+
+            self.len(2, await waiter.wait(timeout=6))
+
+            axon01 = await aha.enter_context(await s_axon.Axon.anit(axon01dirn, conf={'aha:provision': axon01url}))
+            self.eq(4, await axon01.size(sha256))
+
+            (size, sha256) = await axon01.put(b'vertex')
+            self.eq(await axon00.size(sha256), await axon01.size(sha256))

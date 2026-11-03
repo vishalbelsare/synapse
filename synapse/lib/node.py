@@ -8,6 +8,7 @@ import synapse.common as s_common
 import synapse.lib.chop as s_chop
 import synapse.lib.time as s_time
 import synapse.lib.layer as s_layer
+import synapse.lib.msgpack as s_msgpack
 import synapse.lib.stormtypes as s_stormtypes
 
 logger = logging.getLogger(__name__)
@@ -57,35 +58,32 @@ class Node:
         '''
         Return a dictionary that translates the node's bylayer dict to a primitive.
         '''
-        ndef = self.bylayer.get('ndef')
-        tags = {t: l for (t, l) in self.bylayer.get('tags', {}).items()}
-        props = {p: l for (p, l) in self.bylayer.get('props', {}).items()}
-        tagprops = {p: l for (p, l) in self.bylayer.get('tagprops', {}).items()}
-        return {'ndef': ndef, 'props': props, 'tags': tags, 'tagprops': tagprops}
+        return s_msgpack.deepcopy(self.bylayer)
 
     def __repr__(self):
         return f'Node{{{self.pack()}}}'
 
-    async def addEdge(self, verb, n2iden):
+    async def addEdge(self, verb, n2iden, extra=None):
         if self.form.isrunt:
             mesg = f'Edges cannot be used with runt nodes: {self.form.full}'
-            raise s_exc.IsRuntForm(mesg=mesg, form=self.form.full)
+            exc = s_exc.IsRuntForm(mesg=mesg, form=self.form.full)
+            if extra is not None:
+                exc = extra(exc)
+            raise exc
 
         async with self.snap.getNodeEditor(self) as editor:
             return await editor.addEdge(verb, n2iden)
 
-    async def delEdge(self, verb, n2iden):
+    async def delEdge(self, verb, n2iden, extra=None):
+        if self.form.isrunt:
+            mesg = f'Edges cannot be used with runt nodes: {self.form.full}'
+            exc = s_exc.IsRuntForm(mesg=mesg, form=self.form.full)
+            if extra is not None:
+                exc = extra(exc)
+            raise exc
 
-        if not s_common.isbuidhex(n2iden):
-            mesg = f'delEdge() got an invalid node iden: {n2iden}'
-            raise s_exc.BadArg(mesg=mesg)
-
-        nodeedits = (
-            (self.buid, self.form.name, (
-                (s_layer.EDIT_EDGE_DEL, (verb, n2iden), ()),
-            )),
-        )
-        await self.snap.applyNodeEdits(nodeedits)
+        async with self.snap.getNodeEditor(self) as editor:
+            return await editor.delEdge(verb, n2iden)
 
     async def iterEdgesN1(self, verb=None):
         async for edge in self.snap.iterNodeEdgesN1(self.buid, verb=verb):
@@ -94,6 +92,10 @@ class Node:
     async def iterEdgesN2(self, verb=None):
         async for edge in self.snap.iterNodeEdgesN2(self.buid, verb=verb):
             yield edge
+
+    async def iterEdgeVerbs(self, n2buid):
+        async for verb in self.snap.iterEdgeVerbs(self.buid, n2buid):
+            yield verb
 
     async def storm(self, runt, text, opts=None, path=None):
         '''
@@ -177,10 +179,12 @@ class Node:
             if prop is None:
                 return None
 
-            if prop.modl.form(prop.type.name) is None:
+            if prop.modl.form(prop.type.name) is not None:
+                buid = s_common.buid((prop.type.name, valu))
+            elif prop.type.name == 'ndef' or 'ndef' in prop.type.info.get('bases'):
+                buid = s_common.buid(valu)
+            else:
                 return None
-
-            buid = s_common.buid((prop.type.name, valu))
 
             step = cache.get(buid, s_common.novalu)
             if step is s_common.novalu:
@@ -203,23 +207,18 @@ class Node:
 
             embdnode = retn.get(nodepath)
             if embdnode is None:
-                embdnode = retn[nodepath] = {}
-                embdnode['*'] = s_common.ehex(node.buid)
+                iden = node.iden()
+                # TODO deprecate / remove use of * once we can minver optic
+                embdnode = retn[nodepath] = {
+                    '*': iden,
+                    '$iden': iden,
+                    '$form': node.form.name,
+                }
 
             for relp in relprops:
                 embdnode[relp] = node.props.get(relp)
 
         return retn
-
-    async def seen(self, tick, source=None):
-        '''
-        Update the .seen interval and optionally a source specific seen node.
-        '''
-        await self.set('.seen', tick)
-
-        if source is not None:
-            seen = await self.snap.addNode('meta:seen', (source, self.ndef))
-            await seen.set('.seen', tick)
 
     def getNodeRefs(self):
         '''
@@ -251,6 +250,13 @@ class Node:
             for item in valu:
                 retn.append((name, (dest, item)))
 
+        for name in refs.get('ndefarray', ()):
+            if (valu := self.props.get(name)) is None:
+                continue
+
+            for item in valu:
+                retn.append((name, item))
+
         return retn
 
     async def set(self, name, valu, init=False):
@@ -277,8 +283,8 @@ class Node:
 
         if self.form.isrunt:
             if prop.info.get('ro'):
-                mesg = 'Cannot set read-only props on runt nodes'
-                raise s_exc.IsRuntForm(mesg=mesg, form=self.form.full, prop=name, valu=valu)
+                mesg = f'Cannot set read-only props on runt nodes: {s_common.trimText(repr(valu))}'
+                raise s_exc.IsRuntForm(mesg=mesg, form=self.form.full, prop=name)
 
             await self.snap.core.runRuntPropSet(self, prop, valu)
             return True
@@ -345,8 +351,7 @@ class Node:
         if not edits:
             return False
 
-        await self.snap.applyNodeEdit((self.buid, self.form.name, edits))
-        self.props.pop(name, None)
+        await self.snap.applyNodeEdit((self.buid, self.form.name, edits), nodecache={self.buid: self})
         return True
 
     def repr(self, name=None, defv=None):
@@ -486,15 +491,13 @@ class Node:
             raise s_exc.IsRuntForm(mesg='Cannot delete tags from runt nodes.',
                                    form=self.form.full, tag=tag)
 
-        curv = self.tags.get(name, s_common.novalu)
-        if curv is s_common.novalu:
-            return ()
-
         pref = name + '.'
+        exists = self.tags.get(name, s_common.novalu) is not s_common.novalu
 
         todel = [(len(t), t) for t in self.tags.keys() if t.startswith(pref)]
 
-        if len(path) > 1:
+        # only prune when we're actually deleting a tag
+        if len(path) > 1 and exists:
 
             parent = '.'.join(path[:-1])
 
@@ -530,7 +533,8 @@ class Node:
             edits.append((s_layer.EDIT_TAG_DEL, (subtag, None), ()))
 
         edits.extend(self._getTagPropDel(name))
-        edits.append((s_layer.EDIT_TAG_DEL, (name, None), ()))
+        if exists:
+            edits.append((s_layer.EDIT_TAG_DEL, (name, None), ()))
 
         return edits
 
@@ -541,7 +545,7 @@ class Node:
         edits = await self._getTagDelEdits(tag, init=init)
         if edits:
             nodeedit = (self.buid, self.form.name, edits)
-            await self.snap.applyNodeEdit(nodeedit)
+            await self.snap.applyNodeEdit(nodeedit, nodecache={self.buid: self})
 
     def _getTagPropDel(self, tag):
 
@@ -602,7 +606,7 @@ class Node:
             (s_layer.EDIT_TAGPROP_DEL, (tag, name, None, prop.type.stortype), ()),
         )
 
-        await self.snap.applyNodeEdit((self.buid, self.form.name, edits))
+        await self.snap.applyNodeEdit((self.buid, self.form.name, edits), nodecache={self.buid: self})
 
     async def delete(self, force=False):
         '''
@@ -617,17 +621,15 @@ class Node:
             * delete all the tags (bottom up)
                 * fire onDelTag() handlers
                 * delete tag properties from storage
-                * log tag:del splices
 
             * delete all secondary properties
                 * fire onDelProp handler
                 * delete secondary property from storage
-                * log prop:del splices
 
             * delete the primary property
                 * fire onDel handlers for the node
                 * delete primary property from storage
-                * log node:del splices
+
         '''
 
         formname, formvalu = self.ndef
@@ -659,12 +661,26 @@ class Node:
                 return await self.snap._raiseOnStrict(s_exc.CantDelNode, mesg, form=formname,
                                                       iden=self.iden())
 
+            async for edge in self.iterEdgesN2():
+
+                if self.iden() == edge[1]:
+                    continue
+
+                mesg = 'Other nodes still have light edges to this node.'
+                return await self.snap._raiseOnStrict(s_exc.CantDelNode, mesg, form=formname,
+                                                      iden=self.iden())
+
         edits = []
         for tag in tags:
             edits.extend(await self._getTagDelEdits(tag, init=True))
 
         for name in self.props.keys():
             edits.extend(await self._getPropDelEdits(name, init=True))
+
+        # Only remove nodedata if we're in a layer that doesn't have the full node
+        if self.snap.wlyr.iden != self.bylayer['ndef']:
+            async for name in self.iterDataKeys():
+                edits.append((s_layer.EDIT_NODEDATA_DEL, (name, None), ()))
 
         edits.append(
             (s_layer.EDIT_NODE_DEL, (formvalu, self.form.type.stortype), ()),
@@ -689,6 +705,8 @@ class Node:
             await protonode.setData(name, valu)
 
     async def popData(self, name):
+        s_layer.reqValidNodeDataName(name)
+
         retn = await self.snap.getNodeData(self.buid, name)
 
         edits = (
@@ -702,14 +720,23 @@ class Node:
         async for item in self.snap.iterNodeData(self.buid):
             yield item
 
+    async def iterDataKeys(self):
+        async for name in self.snap.iterNodeDataKeys(self.buid):
+            yield name
+
 class Path:
     '''
     A path context tracked through the storm runtime.
     '''
-    def __init__(self, vars, nodes):
+    def __init__(self, vars, nodes, links=None):
 
         self.node = None
         self.nodes = nodes
+
+        if links is not None:
+            self.links = links
+        else:
+            self.links = []
 
         if len(nodes):
             self.node = nodes[-1]
@@ -725,6 +752,7 @@ class Path:
             'node': self.node,
         }
 
+        self.display = None
         self.metadata = {}
 
     def getVar(self, name, defv=s_common.novalu):
@@ -760,24 +788,27 @@ class Path:
         self.metadata[name] = valu
 
     async def pack(self, path=False):
-        ret = dict(self.metadata)
-        if ret:
-            ret = await s_stormtypes.toprim(ret)
+        info = await s_stormtypes.toprim(dict(self.metadata))
         if path:
-            ret['nodes'] = [node.iden() for node in self.nodes]
-        return ret
+            info['nodes'] = [node.iden() for node in self.nodes]
 
-    def fork(self, node):
+        return info
+
+    def fork(self, node, link):
+
+        links = list(self.links)
+        if self.node is not None and link is not None:
+            links.append((self.node.iden(), link))
 
         nodes = list(self.nodes)
         nodes.append(node)
 
-        path = Path(self.vars.copy(), nodes)
+        path = Path(self.vars.copy(), nodes, links=links)
 
         return path
 
     def clone(self):
-        path = Path(copy.copy(self.vars), copy.copy(self.nodes))
+        path = Path(copy.copy(self.vars), copy.copy(self.nodes), copy.copy(self.links))
         path.frames = [v.copy() for v in self.frames]
         return path
 
@@ -881,6 +912,7 @@ def _tagscommon(pode, leafonly):
     # brute force rather than build a tree.  faster in small sets.
     for tag, val in sorted((t for t in pode[1]['tags'].items()), reverse=True, key=lambda x: len(x[0])):
         look = tag + '.'
+        val = tuple(val)
         if (leafonly or val == (None, None)) and any([r.startswith(look) for r in retn]):
             continue
         retn.append(tag)
@@ -1010,6 +1042,7 @@ def reprTag(pode, tag):
     valu = pode[1]['tags'].get(tag)
     if valu is None:
         return None
+    valu = tuple(valu)
     if valu == (None, None):
         return ''
     mint = s_time.repr(valu[0])

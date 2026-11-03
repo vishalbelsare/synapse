@@ -1,8 +1,25 @@
+import asyncio
+
 import synapse.exc as s_exc
 import synapse.common as s_common
 
+import synapse.lib.node as s_node
+import synapse.lib.time as s_time
 import synapse.lib.cache as s_cache
+import synapse.lib.layer as s_layer
+import synapse.lib.storm as s_storm
 import synapse.lib.stormtypes as s_stormtypes
+
+RISK_HASVULN_VULNPROPS = (
+    'hardware',
+    'host',
+    'item',
+    'org',
+    'person',
+    'place',
+    'software',
+    'spec',
+)
 
 stormcmds = [
     {
@@ -123,7 +140,7 @@ stormcmds = [
             init {
 
                 $ok = $lib.true
-                $lib.print("Checking the cortex for 3.0.0 upgrade readiness...")
+                $lib.print("Checking the cortex for model flag day readiness...")
 
                 $locks = $lib.model.deprecated.locks()
 
@@ -186,7 +203,7 @@ class LibModelTags(s_stormtypes.Lib):
         Examples:
             Create a tag model for the ``cno.cve`` tag::
 
-                $regx = ($lib.null, $lib.null, "[0-9]{4}", "[0-9]{5}")
+                $regx = ([null, null, "[0-9]{4}", "[0-9]{5}"])
                 $lib.model.tags.set(cno.cve, regex, $regx)''',
          'type': {'type': 'function', '_funcname': '_setTagModel',
                   'args': (
@@ -251,10 +268,12 @@ class LibModelTags(s_stormtypes.Lib):
         self.runt.confirm(('model', 'tag', 'set'))
         return await self.runt.snap.core.delTagModel(tagname)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _getTagModel(self, tagname):
         tagname = await s_stormtypes.tostr(tagname)
         return await self.runt.snap.core.getTagModel(tagname)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _listTagModel(self):
         return await self.runt.snap.core.listTagModel()
 
@@ -283,32 +302,32 @@ class LibModel(s_stormtypes.Lib):
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The name of the type to retrieve.', },
                   ),
-                  'returns': {'type': ['storm:model:type', 'null'],
-                              'desc': 'The ``storm:model:type`` instance if the type if present on the form or null.',
+                  'returns': {'type': ['model:type', 'null'],
+                              'desc': 'The ``model:type`` instance if the type if present on the form or null.',
                               }}},
         {'name': 'prop', 'desc': 'Get a prop object by name.',
          'type': {'type': 'function', '_funcname': '_methProp',
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The name of the prop to retrieve.', },
                   ),
-                  'returns': {'type': ['storm:model:property', 'null'],
-                              'desc': 'The ``storm:model:property`` instance if the type if present or null.',
+                  'returns': {'type': ['model:property', 'null'],
+                              'desc': 'The ``model:property`` instance if the type if present or null.',
                               }}},
         {'name': 'form', 'desc': 'Get a form object by name.',
          'type': {'type': 'function', '_funcname': '_methForm',
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The name of the form to retrieve.', },
                   ),
-                  'returns': {'type': ['storm:model:form', 'null'],
-                              'desc': 'The ``storm:model:form`` instance if the form is present or null.',
+                  'returns': {'type': ['model:form', 'null'],
+                              'desc': 'The ``model:form`` instance if the form is present or null.',
                               }}},
         {'name': 'tagprop', 'desc': 'Get a tag property object by name.',
          'type': {'type': 'function', '_funcname': '_methTagProp',
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The name of the tag prop to retrieve.', },
                   ),
-                  'returns': {'type': ['storm:model:tagprop', 'null'],
-                              'desc': 'The ``storm:model:tagprop`` instance if the tag prop if present or null.',
+                  'returns': {'type': ['model:tagprop', 'null'],
+                              'desc': 'The ``model:tagprop`` instance of the tag prop if present or null.',
                               }}},
     )
 
@@ -325,25 +344,33 @@ class LibModel(s_stormtypes.Lib):
         }
 
     @s_cache.memoizemethod(size=100)
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methType(self, name):
+        name = await s_stormtypes.tostr(name)
         type_ = self.model.type(name)
         if type_ is not None:
             return ModelType(type_)
 
     @s_cache.memoizemethod(size=100)
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methProp(self, name):
+        name = await s_stormtypes.tostr(name)
         prop = self.model.prop(name)
         if prop is not None:
             return ModelProp(prop)
 
     @s_cache.memoizemethod(size=100)
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methForm(self, name):
+        name = await s_stormtypes.tostr(name)
         form = self.model.form(name)
         if form is not None:
             return ModelForm(form)
 
     @s_cache.memoize(size=100)
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methTagProp(self, name):
+        name = await s_stormtypes.tostr(name)
         tagprop = self.model.getTagProp(name)
         if tagprop is not None:
             return ModelTagProp(tagprop)
@@ -360,14 +387,14 @@ class ModelForm(s_stormtypes.Prim):
                   'args': (
                       {'name': 'name', 'type': 'str', 'desc': 'The property to retrieve.', },
                   ),
-                  'returns': {'type': ['storm:model:property', 'null'],
-                              'desc': 'The ``storm:model:property`` instance if the property if present on the form or null.'
+                  'returns': {'type': ['model:property', 'null'],
+                              'desc': 'The ``model:property`` instance if the property if present on the form or null.'
                               }}},
         {'name': 'type', 'desc': 'Get the Type for the form.',
          'type': {'type': 'ctor', '_ctorfunc': '_ctorFormType',
-                  'returns': {'type': 'storm:model:type'}}},
+                  'returns': {'type': 'model:type'}}},
     )
-    _storm_typename = 'storm:model:form'
+    _storm_typename = 'model:form'
     def __init__(self, form, path=None):
 
         s_stormtypes.Prim.__init__(self, form, path=path)
@@ -387,10 +414,15 @@ class ModelForm(s_stormtypes.Prim):
     def _ctorFormType(self, path=None):
         return ModelType(self.valu.type, path=path)
 
-    def _getFormProp(self, name):
+    @s_stormtypes.stormfunc(readonly=True)
+    async def _getFormProp(self, name):
+        name = await s_stormtypes.tostr(name)
         prop = self.valu.prop(name)
         if prop is not None:
             return ModelProp(prop)
+
+    def value(self):
+        return self.valu.pack()
 
 @s_stormtypes.registry.registerType
 class ModelProp(s_stormtypes.Prim):
@@ -402,12 +434,12 @@ class ModelProp(s_stormtypes.Prim):
         {'name': 'full', 'desc': 'The full name of the Property.', 'type': 'str', },
         {'name': 'form', 'desc': 'Get the Form for the Property.',
          'type': {'type': 'ctor', '_ctorfunc': '_ctorPropForm',
-                  'returns': {'type': ['storm:model:form', 'null']}}},
+                  'returns': {'type': ['model:form', 'null']}}},
         {'name': 'type', 'desc': 'Get the Type for the Property.',
          'type': {'type': 'ctor', '_ctorfunc': '_ctorPropType',
-                  'returns': {'type': 'storm:model:type'}}},
+                  'returns': {'type': 'model:type'}}},
     )
-    _storm_typename = 'storm:model:property'
+    _storm_typename = 'model:property'
     def __init__(self, prop, path=None):
 
         s_stormtypes.Prim.__init__(self, prop, path=path)
@@ -429,6 +461,9 @@ class ModelProp(s_stormtypes.Prim):
 
         return ModelForm(self.valu.form, path=path)
 
+    def value(self):
+        return self.valu.pack()
+
 @s_stormtypes.registry.registerType
 class ModelTagProp(s_stormtypes.Prim):
     '''
@@ -438,9 +473,9 @@ class ModelTagProp(s_stormtypes.Prim):
         {'name': 'name', 'desc': 'The name of the Tag Property.', 'type': 'str', },
         {'name': 'type', 'desc': 'Get the Type for the Tag Property.',
          'type': {'type': 'ctor', '_ctorfunc': '_ctorTagPropType',
-                  'returns': {'type': 'storm:model:type'}}},
+                  'returns': {'type': 'model:type'}}},
     )
-    _storm_typename = 'storm:model:tagprop'
+    _storm_typename = 'model:tagprop'
     def __init__(self, tagprop, path=None):
 
         s_stormtypes.Prim.__init__(self, tagprop, path=path)
@@ -454,6 +489,9 @@ class ModelTagProp(s_stormtypes.Prim):
     def _ctorTagPropType(self, path=None):
         return ModelType(self.valu.type, path=path)
 
+    def value(self):
+        return self.valu.pack()
+
 @s_stormtypes.registry.registerType
 class ModelType(s_stormtypes.Prim):
     '''
@@ -462,6 +500,8 @@ class ModelType(s_stormtypes.Prim):
     _storm_locals = (
         {'name': 'name', 'desc': 'The name of the Type.', 'type': 'str', },
         {'name': 'stortype', 'desc': 'The storetype of the Type.', 'type': 'int', },
+        {'name': 'opts', 'desc': 'The options for the Type.', 'type': 'dict', },
+        {'name': 'mutable', 'desc': 'True if the type is mutable.', 'type': 'boolean', },
         {'name': 'repr', 'desc': 'Get the repr of a value for the Type.',
          'type': {'type': 'function', '_funcname': '_methRepr',
                   'args': (
@@ -475,28 +515,39 @@ class ModelType(s_stormtypes.Prim):
                   ),
                   'returns': {'desc': 'A tuple of the normed value and its information dictionary.', 'type': 'list'}}},
     )
-    _storm_typename = 'storm:model:type'
+    _storm_typename = 'model:type'
 
     def __init__(self, valu, path=None):
         s_stormtypes.Prim.__init__(self, valu, path=path)
         self.locls.update(self.getObjLocals())
         self.locls.update({'name': valu.name,
-                           'norm': self._methNorm,
-                           'repr': self._methRepr,
+                           'opts': valu.opts,
                            'stortype': valu.stortype,
+                           'mutable': valu.ismutable,
                            })
 
+    def getObjLocals(self):
+        return {
+            'norm': self._methNorm,
+            'repr': self._methRepr,
+        }
+
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methRepr(self, valu):
         nval = self.valu.norm(valu)
         return self.valu.repr(nval[0])
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methNorm(self, valu):
         return self.valu.norm(valu)
+
+    def value(self):
+        return self.valu.getTypeDef()
 
 @s_stormtypes.registry.registerLib
 class LibModelEdge(s_stormtypes.Lib):
     '''
-    A Storm Library for interacting with light edges and manipulating their key-value attributes.
+    A Storm Library for interacting with light edges and manipulating their key-value attributes. This Library is deprecated.
     '''
     _storm_locals = (
         {'name': 'get', 'desc': 'Get the key-value data for a given Edge verb.',
@@ -532,7 +583,7 @@ class LibModelEdge(s_stormtypes.Lib):
     # Note: The use of extprops in hive paths in this class is an artifact of the
     # original implementation which used extended property language which had a
     # very bad cognitive overload with the cortex extended properties, but we
-    # dont' want to change underlying data. epiphyte 20200703
+    # don't want to change underlying data. epiphyte 20200703
 
     # restrict list of keys which we allow to be set/del through this API.
     validedgekeys = (
@@ -541,6 +592,7 @@ class LibModelEdge(s_stormtypes.Lib):
     hivepath = ('cortex', 'model', 'edges')
 
     _storm_lib_path = ('model', 'edge')
+    _storm_lib_deprecation = {'eolvers': 'v3.0.0'}
 
     def __init__(self, runt, name=()):
         s_stormtypes.Lib.__init__(self, runt, name)
@@ -559,17 +611,21 @@ class LibModelEdge(s_stormtypes.Lib):
             if vverb == verb:
                 return
 
-        raise s_exc.NoSuchName(mesg=f'No such edge verb in the current view', name=verb)
+        raise s_exc.NoSuchName(mesg='No such edge verb in the current view', name=verb)
 
     async def _chkKeyName(self, key):
         if key not in self.validedgekeys:
-            raise s_exc.NoSuchProp(mesg=f'The requested key is not valid for light edge metadata.',
+            raise s_exc.NoSuchProp(mesg='The requested key is not valid for light edge metadata.',
                                    name=key)
 
+    @s_stormtypes.stormfunc(readonly=True)
     def _methValidKeys(self):
+        s_common.deprecated('model.edge.validkeys', curv='2.165.0')
         return self.validedgekeys
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methEdgeGet(self, verb):
+        s_common.deprecated('model.edge.get', curv='2.165.0')
         verb = await s_stormtypes.tostr(verb)
         await self._chkEdgeVerbInView(verb)
 
@@ -577,6 +633,7 @@ class LibModelEdge(s_stormtypes.Lib):
         return await self.runt.snap.core.getHiveKey(path) or {}
 
     async def _methEdgeSet(self, verb, key, valu):
+        s_common.deprecated('model.edge.set', curv='2.165.0')
         verb = await s_stormtypes.tostr(verb)
         await self._chkEdgeVerbInView(verb)
 
@@ -592,6 +649,7 @@ class LibModelEdge(s_stormtypes.Lib):
         await self.runt.snap.core.setHiveKey(path, kvdict)
 
     async def _methEdgeDel(self, verb, key):
+        s_common.deprecated('model.edge.del', curv='2.165.0')
         verb = await s_stormtypes.tostr(verb)
         await self._chkEdgeVerbInView(verb)
 
@@ -603,12 +661,14 @@ class LibModelEdge(s_stormtypes.Lib):
 
         oldv = kvdict.pop(key, None)
         if oldv is None:
-            raise s_exc.NoSuchProp(mesg=f'Key is not set for this edge verb',
+            raise s_exc.NoSuchProp(mesg='Key is not set for this edge verb',
                                    verb=verb, name=key)
 
         await self.runt.snap.core.setHiveKey(path, kvdict)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _methEdgeList(self):
+        s_common.deprecated('model.edge.list', curv='2.165.0')
         retn = []
         async for verb in self.runt.snap.view.getEdgeVerbs():
             path = self.hivepath + (verb, 'extprops')
@@ -654,3 +714,1167 @@ class LibModelDeprecated(s_stormtypes.Lib):
         todo = s_common.todo('setDeprLock', name, locked)
         gatekeys = ((self.runt.user.iden, ('model', 'deprecated', 'lock'), None),)
         await self.runt.dyncall('cortex', todo, gatekeys=gatekeys)
+
+class MigrationEditorMixin:
+    '''
+    Mixin helpers for migrating data within an editor context.
+    '''
+
+    async def copyData(self, src, proto, overwrite=False):
+
+        async for name in src.iterDataKeys():
+            if overwrite or not await proto.hasData(name):
+                self.runt.layerConfirm(('node', 'data', 'set', name))
+                valu = await src.getData(name)
+                await proto.setData(name, valu)
+
+    async def copyEdges(self, editor, src, proto):
+
+        verbs = set()
+
+        async for (verb, n2iden) in src.iterEdgesN1():
+
+            if verb not in verbs:
+                self.runt.layerConfirm(('node', 'edge', 'add', verb))
+                verbs.add(verb)
+
+            if await self.runt.snap.getNodeByBuid(s_common.uhex(n2iden)) is not None:
+                await proto.addEdge(verb, n2iden)
+
+        dstiden = proto.iden()
+
+        async for (verb, n1iden) in src.iterEdgesN2():
+
+            if verb not in verbs:
+                self.runt.layerConfirm(('node', 'edge', 'add', verb))
+                verbs.add(verb)
+
+            n1proto = await editor.getNodeByBuid(s_common.uhex(n1iden))
+            if n1proto is not None:
+                await n1proto.addEdge(verb, dstiden)
+
+    async def copyTags(self, src, proto, overwrite=False):
+
+        for name, valu in src.tags.items():
+            self.runt.layerConfirm(('node', 'tag', 'add', *name.split('.')))
+            await proto.addTag(name, valu=valu)
+
+        for tagname, tagprops in src.tagprops.items():
+            for propname, valu in tagprops.items():
+                if overwrite or not proto.hasTagProp(tagname, propname):
+                    await proto.setTagProp(tagname, propname, valu) # use tag perms
+
+    async def copyExtProps(self, src, proto):
+
+        form = src.form
+
+        for name, valu in src.props.items():
+            prop = form.props.get(name)
+            if not prop.isext:
+                continue
+
+            await proto.set(name, valu)
+
+@s_stormtypes.registry.registerLib
+class LibModelMigration(s_stormtypes.Lib, MigrationEditorMixin):
+    '''
+    A Storm library containing migration tools.
+    '''
+    _storm_locals = (
+        {'name': 'copyData', 'desc': 'Copy node data from the src node to the dst node.',
+         'type': {'type': 'function', '_funcname': '_methCopyData',
+                  'args': (
+                      {'name': 'src', 'type': 'node', 'desc': 'The node to copy data from.', },
+                      {'name': 'dst', 'type': 'node', 'desc': 'The node to copy data to.', },
+                      {'name': 'overwrite', 'type': 'boolean', 'default': False,
+                       'desc': 'Copy data even if the key exists on the destination node.', },
+                  ),
+                  'returns': {'type': 'null', }}},
+        {'name': 'copyEdges', 'desc': 'Copy edges from the src node to the dst node.',
+         'type': {'type': 'function', '_funcname': '_methCopyEdges',
+                  'args': (
+                      {'name': 'src', 'type': 'node', 'desc': 'The node to copy edges from.', },
+                      {'name': 'dst', 'type': 'node', 'desc': 'The node to copy edges to.', },
+                  ),
+                  'returns': {'type': 'null', }}},
+        {'name': 'copyTags', 'desc': 'Copy tags, tag timestamps, and tag props from the src node to the dst node.',
+         'type': {'type': 'function', '_funcname': '_methCopyTags',
+                  'args': (
+                      {'name': 'src', 'type': 'node', 'desc': 'The node to copy tags from.', },
+                      {'name': 'dst', 'type': 'node', 'desc': 'The node to copy tags to.', },
+                      {'name': 'overwrite', 'type': 'boolean', 'default': False,
+                       'desc': 'Copy tag property value even if the property exists on the destination node.', },
+                  ),
+                  'returns': {'type': 'null', }}},
+        {'name': 'copyExtProps', 'desc': 'Copy extended properties from the src node to the dst node.',
+         'type': {'type': 'function', '_funcname': '_methCopyExtProps',
+                  'args': (
+                      {'name': 'src', 'type': 'node', 'desc': 'The node to copy extended props from.', },
+                      {'name': 'dst', 'type': 'node', 'desc': 'The node to copy extended props to.', },
+                  ),
+                  'returns': {'type': 'null', }}},
+        {'name': 'fuse', 'desc': '''
+            Merge one node into another node of the same form, then delete the source node.
+
+            This operates on the whole Cortex rather than the current view. Every layer is
+            processed, so after the fuse the source node no longer exists in any view.
+
+            The following are transferred from src to dst. dst is the survivor, so its
+            existing value wins wherever both nodes hold a conflicting value:
+
+            - Secondary properties (dst values win on conflict).
+            - Extended properties (dst values win on conflict).
+            - Tags (additive; two intervals are unioned, and an interval on dst is never
+              replaced by an unbounded tag on src).
+            - Tag properties (dst values win on conflict).
+            - Light edges (additive; both N1 and N2 edges are moved to dst).
+            - Node data (dst values win on conflict).
+
+            The following special cases apply regardless of the conflict policy:
+
+            - The .created property on dst is always preserved.
+            - Interval-typed properties and tag properties, and the .seen interval, are
+              always unioned as (min(start), max(end)) rather than one value winning.
+            - Read-only secondary properties are never copied from src. A read-only property
+              restates the node's own primary property rather than being data src can hand
+              over, so after the fuse it must describe dst. Where dst's type derives it, it is
+              set from dst's own value. Where dst's type derives it one way - a guid form
+              built from a tuple of its inputs, such as
+              ``it:mitre:attack:data:component``, keeps those inputs as read-only properties
+              because nothing can recover them from the guid - it is left alone, since src's
+              value would name something dst's own guid is not built from.
+
+              One consequence is worth noting: a read-only property a form populates from a
+              callback rather than from normalization, such as the ``inet:passwd``
+              md5/sha1/sha256 hashes, is not recomputed either, because a fuse writes to
+              layers directly and runs no form callbacks. This only applies to a layer in
+              which the fuse creates dst, since dst retains its own read-only properties in
+              the layer it was created in.
+            - Inbound references (props on other nodes which point at src) are rewritten to
+              point at dst. This includes form-typed, ndef-typed, and array-typed properties.
+              A read-only comp-form sub-property which references src causes that comp form
+              node to be renamed, which is applied as a further fuse. Where a comp form
+              embeds src in more than one of its read-only sub-properties, every one of them
+              is remapped by that single rename, so the renamed node never keeps a slot
+              naming a node the fuse deleted. Those renames are all computed before any edit
+              is applied, so if one of them cannot be re-normalized the fuse is refused and
+              nothing is changed.
+            - A read-only secondary property which is not a comp sub-property is rewritten in
+              place. The referring node keeps its own primary property, so that read-only
+              property will no longer match the value it was derived from.
+            - A reference src holds to itself, whether a property or a light edge, follows the
+              node and becomes a reference dst holds to itself.
+
+            Requirements and restrictions:
+
+            - The caller must be a global admin.
+            - src and dst must be the same form.
+            - src and dst may not be runt nodes.
+
+            Layer behavior:
+
+            Each property, tag, tag property, light edge and node data value is written to the
+            same layer it was already stored in, so a fuse does not move data between layers.
+            One consequence is that property merges only happen within a layer. Where src and
+            dst hold the same property in different layers, the value visible in any given view
+            is decided by that view's normal layer precedence.
+
+            Read-only and mirrored layers cannot be written to. Those layers are skipped and a
+            warning is emitted for each one which held any of src's data, because that data
+            remains and will still make src visible in any view which includes that layer.
+
+            Concurrency:
+
+            The edits which make up a fuse are computed by reading every layer, and are then
+            applied by Cortex wide operations which carry them.
+
+            Those reads are not serialized against other writes, so a write to src can land
+            between the reads and the apply. That write is not detected and is not reported: a
+            fuse is responsible for executing the merge it was asked to make, not for policing
+            edits other callers make to src while it runs, the same way an ordinary concurrent
+            property write is never flagged as having lost a race to another writer. Running a
+            fuse during a maintenance window, as recommended below, avoids this entirely.
+
+            A fuse is not transactional. The edits are written with one call per layer, and
+            fusing a heavily referenced node is applied in several operations rather than one,
+            so a failure part way through can leave some of the fuse applied. Nothing is
+            removed from src until dst holds it and the references to src have been repointed,
+            so an interruption cannot lose data or leave a reference pointing at a node which
+            no longer exists. Re-running fuse() with the same arguments completes it.
+
+            There is no limit on how many edits a fuse may make. A fuse of a very heavily
+            referenced node takes longer and spans more operations, but is not refused.
+
+            Notes:
+
+            - Triggers do not fire for the edits a fuse makes. A fuse rewrites the same data
+              across every layer in the Cortex rather than making an analytical change in one
+              view, so there is no single view whose triggers are the right ones to run.
+            - A light edge between src and dst becomes a self-edge on dst after the fuse.
+            - Node objects which other running queries already hold for src become stale, so
+              running a fuse during a maintenance window is recommended.
+        ''',
+         'type': {'type': 'function', '_funcname': '_methFuse',
+                  'args': (
+                      {'name': 'src', 'type': 'node', 'desc': 'The node to merge from (will be deleted).', },
+                      {'name': 'dst', 'type': 'node', 'desc': 'The node to merge into (will be kept).', },
+                  ),
+                  'returns': {'type': 'null', }}},
+        {'name': 'loop', 'desc': '''
+            Run a migration callback once for every view, and optionally for every layer which is
+            not the write layer of a view, in the Cortex.
+
+            Callbacks are embedded Storm queries (``${ ... }``) or query strings, rather than Storm
+            functions. Variables from the calling scope, including any captured by an embedded
+            query, are not available to them, and nodes are not passed in. Messages from
+            ``$lib.print()``, ``$lib.warn()``, ``$lib.fire()`` and ``$lib.csv.emit()`` in a callback
+            are passed through to the caller.
+
+            - The ``onview`` callback runs in each view, and can use ``$lib.view.get()`` to access it.
+            - The optional ``onlayer`` callback runs in the calling view, with ``$layer`` set to the
+              iden of that layer, and can use ``$lib.layer.get($layer)`` to access it. It only runs
+              for layers which are not the write layer of a view, such as a layer which is only
+              lower in the layer stack of a view, or a layer in no view, since ``onview`` already
+              migrated each view's write layer.
+
+            Each pass runs ``onview`` for every view, with parent views before their children, or
+            children before their parents when ``reverse`` is true, then ``onlayer`` for every layer
+            which is not the write layer of a view. The ``reverse`` option does not change the order
+            of ``onlayer``. A view or layer created by a callback is picked up by a further pass, and
+            passes repeat until one finds nothing new. A view created by a callback is visited after
+            the views already in the pass, so a view forked during a ``reverse`` loop runs after its
+            parent. Each view and layer is visited at most once.
+
+            The loop does not fail because a view or layer changed underneath it. It emits a
+            warning naming the view or layer and continues with the next one when:
+
+            - A view or layer is deleted before its callback runs, or while its callback runs.
+            - A layer, or the write layer of a view, is read-only. These are skipped unless
+              ``readonly`` is true, which is intended for migrations which only lift nodes.
+            - A layer, or the write layer of a view, becomes read-only while its callback runs.
+
+            Any other error raised by a callback is raised to the caller.
+
+            The caller must be a global admin.
+
+            Examples:
+                Replace a tag on nodes in every view and print each layer which is not the write
+                layer of a view::
+
+                    $lib.model.migration.loop(
+                        ${ inet:fqdn#old.tag [ -#old.tag +#new.tag ] },
+                        onlayer=${ $lib.print(`migrating layer {$layer}`) },
+                    )
+            ''',
+         'type': {'type': 'function', '_funcname': '_methLoop',
+                  'args': (
+                      {'name': 'onview', 'type': ['str', 'storm:query'],
+                       'desc': 'A Storm query to run in each view.', },
+                      {'name': 'onlayer', 'type': ['null', 'str', 'storm:query'], 'default': None,
+                       'desc': 'A Storm query to run for each layer which is not the write layer of a view, '
+                               'with ``$layer`` set to the layer iden.', },
+                      {'name': 'readonly', 'type': 'boolean', 'default': False,
+                       'desc': 'Include read-only layers, and views with a read-only write layer, '
+                               'rather than skipping them with a warning.', },
+                      {'name': 'reverse', 'type': 'boolean', 'default': False,
+                       'desc': 'Run ``onview`` for child views before their parents.', },
+                  ),
+                  'returns': {'type': 'null', }}},
+    )
+    _storm_lib_path = ('model', 'migration')
+
+    def getObjLocals(self):
+        return {
+            'copyData': self._methCopyData,
+            'copyEdges': self._methCopyEdges,
+            'copyTags': self._methCopyTags,
+            'copyExtProps': self._methCopyExtProps,
+            'fuse': self._methFuse,
+            'loop': self._methLoop,
+        }
+
+    async def _methCopyData(self, src, dst, overwrite=False):
+
+        if not isinstance(src, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyData() source argument must be a node.')
+        if not isinstance(dst, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyData() dest argument must be a node.')
+
+        overwrite = await s_stormtypes.tobool(overwrite)
+
+        async with self.runt.snap.getEditor() as editor:
+            proto = editor.loadNode(dst)
+            await self.copyData(src, proto, overwrite=overwrite)
+
+    async def _methCopyEdges(self, src, dst):
+
+        if not isinstance(src, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyEdges() source argument must be a node.')
+        if not isinstance(dst, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyEdges() dest argument must be a node.')
+
+        snap = self.runt.snap
+
+        async with snap.getEditor() as editor:
+            proto = editor.loadNode(dst)
+            await self.copyEdges(editor, src, proto)
+
+    async def _methCopyTags(self, src, dst, overwrite=False):
+
+        if not isinstance(src, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyTags() source argument must be a node.')
+        if not isinstance(dst, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyTags() dest argument must be a node.')
+
+        overwrite = await s_stormtypes.tobool(overwrite)
+
+        snap = self.runt.snap
+
+        async with snap.getEditor() as editor:
+            proto = editor.loadNode(dst)
+            await self.copyTags(src, proto, overwrite=overwrite)
+
+    async def _methCopyExtProps(self, src, dst):
+
+        if not isinstance(src, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyExtProps() source argument must be a node.')
+        if not isinstance(dst, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.copyExtProps() dest argument must be a node.')
+
+        snap = self.runt.snap
+
+        async with snap.getEditor() as editor:
+            proto = editor.loadNode(dst)
+            await self.copyExtProps(src, proto)
+
+    async def _methFuse(self, src, dst):
+
+        self.runt.reqAdmin(mesg='$lib.model.migration.fuse() requires global admin.')
+
+        if not isinstance(src, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.fuse() src argument must be a node.')
+
+        if not isinstance(dst, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.fuse() dst argument must be a node.')
+
+        # TODO - 3.0.0: with form inheritance, relax to allow fusing compatible (parent/child) forms.
+        if src.form is not dst.form:
+            raise s_exc.BadArg(mesg='$lib.model.migration.fuse() requires src and dst to share the same form.')
+
+        if src.form.isrunt:
+            raise s_exc.IsRuntForm(mesg='$lib.model.migration.fuse() cannot fuse runt nodes.',
+                                   form=src.form.full)
+
+        if src.buid == dst.buid:
+            await self.runt.warn('$lib.model.migration.fuse() src and dst are the same node, skipping.')
+            return
+
+        runt = self.runt
+        core = runt.snap.core
+
+        srcndef = src.ndef
+        dstndef = dst.ndef
+
+        result = await core.fuseNodes(srcndef, dstndef, runt.user.iden)
+
+        # A fuse is computed and applied down in the Cortex, with no Storm runtime to warn
+        # into, so the warnings are collected and emitted out here.
+        for mesg in result.get('warnings', ()):
+            await runt.warn(mesg, log=False)
+
+        # Node objects this snap is holding may now be stale
+        await runt.snap.clearCache()
+
+        failed = result.get('failed')
+        if failed:
+            mesg = '$lib.model.migration.fuse() failed to apply edits to some layers: '
+            mesg += ', '.join([f'{iden} ({errm})' for iden, errm in failed])
+            raise s_exc.SynErr(mesg=mesg, layers=[iden for iden, _ in failed])
+
+    async def _methLoop(self, onview, onlayer=None, readonly=False, reverse=False):
+
+        self.runt.reqAdmin(mesg='$lib.model.migration.loop() requires global admin.')
+
+        if onview is None:
+            raise s_exc.BadArg(mesg='$lib.model.migration.loop() requires an onview query.')
+
+        readonly = await s_stormtypes.tobool(readonly)
+        reverse = await s_stormtypes.tobool(reverse)
+
+        runt = self.runt
+        core = runt.snap.core
+
+        async def getQuery(valu):
+
+            text = await s_stormtypes.tostr(valu, noneok=True)
+            if text is None:
+                return None
+
+            return await runt.getStormQuery(text)
+
+        async def runQuery(query, snap, opts=None):
+
+            # not a sub-runtime, so the caller's variables are not visible
+            async with await s_storm.Runtime.anit(query, snap, user=runt.user, opts=opts) as subr:
+                subr.debug = runt.debug
+                subr.asroot = runt.asroot
+                subr.readonly = runt.readonly
+
+                if subr.snap is not runt.snap:
+                    subr.snap._warnonce_keys = runt.snap._warnonce_keys
+                    for evnt in ('print', 'warn', 'storm:fire', 'csv:row'):
+                        await subr.enter_context(subr.snap.onWith(evnt, runt.snap.dist))
+
+                async for _ in subr.execute():
+                    await asyncio.sleep(0)
+
+        def getDesc(iden, name):
+            if name is None:
+                return iden
+
+            return f'{iden} ({name})'
+
+        def isWriteLayer(iden):
+            if iden in wlyrs:
+                return True
+
+            return any(view.layers[0].iden == iden for view in core.views.values())
+
+        viewq = await getQuery(onview)
+        layrq = await getQuery(onlayer)
+
+        seen = set()
+        wlyrs = set()
+
+        while True:
+
+            found = False
+
+            vdefs = await core.getViewDefs(deporder=True)
+            if reverse:
+                vdefs.reverse()
+
+            for vdef in vdefs:
+
+                iden = vdef.get('iden')
+                if iden in seen:
+                    continue
+
+                seen.add(iden)
+                found = True
+
+                desc = getDesc(iden, vdef.get('name'))
+
+                view = core.views.get(iden)
+                if view is None or view.isfini:
+                    await runt.warn(f'View {desc} was deleted before it could be migrated.')
+                    continue
+
+                wlyrs.add(view.layers[0].iden)
+
+                wasro = view.layers[0].readonly
+                if wasro and not readonly:
+                    await runt.warn(f'View {desc} has a read-only write layer and was skipped.')
+                    continue
+
+                try:
+                    await runQuery(viewq, await view.snap(runt.user))
+
+                except s_exc.SynErr as e:
+
+                    view = core.views.get(iden)
+                    if view is None or view.isfini:
+                        await runt.warn(f'View {desc} was deleted while being migrated.')
+                        continue
+
+                    if isinstance(e, s_exc.IsReadOnly) and not wasro and view.layers[0].readonly:
+                        await runt.warn(f'View {desc} became read-only while being migrated.')
+                        continue
+
+                    raise
+
+            if layrq is not None:
+
+                for layr in list(core.listLayers()):
+
+                    iden = layr.iden
+                    if iden in seen or isWriteLayer(iden):
+                        continue
+
+                    seen.add(iden)
+                    found = True
+
+                    desc = getDesc(iden, layr.layrinfo.get('name'))
+
+                    layr = core.layers.get(iden)
+                    if layr is None or layr.isfini:
+                        await runt.warn(f'Layer {desc} was deleted before it could be migrated.')
+                        continue
+
+                    wasro = layr.readonly
+                    if wasro and not readonly:
+                        await runt.warn(f'Layer {desc} is read-only and was skipped.')
+                        continue
+
+                    opts = {'vars': {'layer': iden}}
+
+                    try:
+                        await runQuery(layrq, runt.snap, opts)
+
+                    except s_exc.SynErr as e:
+
+                        layr = core.layers.get(iden)
+                        if layr is None or layr.isfini:
+                            await runt.warn(f'Layer {desc} was deleted while being migrated.')
+                            continue
+
+                        if isinstance(e, s_exc.IsReadOnly) and not wasro and layr.readonly:
+                            await runt.warn(f'Layer {desc} became read-only while being migrated.')
+                            continue
+
+                        raise
+
+            if not found:
+                break
+
+@s_stormtypes.registry.registerLib
+class LibModelMigrations(s_stormtypes.Lib, MigrationEditorMixin):
+    '''
+    A Storm library for selectively migrating nodes in the current view.
+    '''
+    _storm_locals = (
+        {'name': 'riskHasVulnToVulnerable', 'desc': '''
+            Create a risk:vulnerable node from the provided risk:hasvuln node.
+
+            Edits will be made to the risk:vulnerable node in the current write layer.
+
+            If multiple vulnerable properties are set on the risk:hasvuln node
+            multiple risk:vulnerable nodes will be created (each with a unique guid).
+            Otherwise, a single risk:vulnerable node will be created with the same guid
+            as the provided risk:hasvuln node. Extended properties will not be migrated.
+
+            Tags, tag properties, edges, and node data will be copied
+            to the risk:vulnerable node. However, existing tag properties and
+            node data will not be overwritten.
+        ''',
+        'type': {'type': 'function', '_funcname': '_riskHasVulnToVulnerable',
+                 'args': (
+                      {'name': 'n', 'type': 'node', 'desc': 'The risk:hasvuln node to migrate.'},
+                      {'name': 'nodata', 'type': 'boolean', 'default': False,
+                       'desc': 'Do not copy nodedata to the risk:vulnerable node.'},
+                 ),
+                 'returns': {'type': 'list', 'desc': 'A list of idens for the risk:vulnerable nodes.'}}},
+        {'name': 'inetSslCertToTlsServerCert', 'desc': '''
+            Create a inet:tls:servercert node from the provided inet:ssl:cert node.
+
+            Edits will be made to the inet:tls:servercert node in the current write layer.
+
+            Tags, tag properties, edges, and node data will be copied
+            to the inet:tls:servercert node. However, existing tag properties and
+            node data will not be overwritten.
+        ''',
+        'type': {'type': 'function', '_funcname': '_storm_query',
+                 'args': (
+                      {'name': 'n', 'type': 'node', 'desc': 'The inet:ssl:cert node to migrate.'},
+                      {'name': 'nodata', 'type': 'boolean', 'default': False,
+                       'desc': 'Do not copy nodedata to the inet:tls:servercert node.'},
+                 ),
+                 'returns': {'type': 'node', 'desc': 'The newly created inet:tls:servercert node.'}}},
+        {'name': 'inetServiceMessageClientAddress', 'desc': '''
+            Migrate the :client:address property to :client on inet:service:message nodes.
+
+            Edits will be made to the inet:service:message node in the current write layer.
+
+            If the :client:address property is set and the :client property is not set,
+            the :client property will be set with the :client:address value. If both
+            properties are set, the value will be moved into nodedata under the key
+            'migration:inet:service:message:address'.
+        ''',
+        'type': {'type': 'function', '_funcname': '_storm_query',
+                 'args': (
+                      {'name': 'n', 'type': 'node', 'desc': 'The inet:sevice:message node to migrate.'},
+                 ),
+                 'returns': {'type': 'null'}}},
+        {'name': 'inetServiceInstanceToPlatform', 'desc': '''
+            Create an inet:service:platform node from the provided inet:service:instance node.
+
+            Edits will be made in the current write layer.
+
+            The inet:service:platform node is created with the same guid as the
+            inet:service:instance node and its :parent property is set to the
+            :platform of the instance. If the :platform of the instance has the same
+            guid as the instance, :parent is not set and a warning is emitted.
+            The :owner and :app properties are stored in node data under the keys
+            'migration:inet:service:instance:owner' and
+            'migration:inet:service:instance:app'. Extended properties on the
+            inet:service:instance node are not copied to the inet:service:platform node.
+
+            Tags, tag properties, edges, and node data will be copied
+            to the inet:service:platform node. However, existing tag properties and
+            node data will not be overwritten.
+
+            Nodes in the current view which reference the instance using a
+            :instance or :service:instance property are updated to use the
+            :platform or :service:platform property instead. If that property is
+            already set to a platform other than the new platform or the :parent,
+            the existing value is kept and the instance is stored in node data
+            under the key 'migration:<form>:<prop>'. Extended properties are only
+            updated if a matching inet:service:platform property exists.
+
+            The inet:service:instance node is not deleted and may be removed
+            once the migration has been verified.
+        ''',
+        'type': {'type': 'function', '_funcname': '_storm_query',
+                 'args': (
+                      {'name': 'n', 'type': 'node', 'desc': 'The inet:service:instance node to migrate.'},
+                      {'name': 'nodata', 'type': 'boolean', 'default': False,
+                       'desc': 'Do not copy nodedata to the inet:service:platform node.'},
+                 ),
+                 'returns': {'type': 'node', 'desc': 'The inet:service:platform node.'}}},
+
+    )
+    _storm_lib_path = ('model', 'migration', 's')
+    _storm_query = '''
+        function inetSslCertToTlsServerCert(n, nodata=(false)) {
+            $form = $n.form()
+            if ($form != 'inet:ssl:cert') {
+                $mesg = `$lib.model.migration.s.inetSslCertToTlsServerCert() only accepts inet:ssl:cert nodes, not {$form}`
+                $lib.raise(BadArg, $mesg)
+            }
+
+            $server = $n.props.server
+            $sha256 = { yield $n -> file:bytes -> hash:sha256 }
+
+            if $sha256 {
+
+                yield $lib.gen.inetTlsServerCertByServerAndSha256($server, $sha256)
+
+            } else {
+
+                // File doesn't have a :sha256, try to lift/create a crypto:x509:node based on the file link
+                $crypto = { yield $n -> file:bytes -> crypto:x509:cert:file }
+                if (not $crypto) {
+                    $crypto = {[ crypto:x509:cert=($n.props.file,) :file=$n.props.file ]}
+                }
+
+                [ inet:tls:servercert=($server, $crypto) ]
+
+            }
+
+            [ .seen ?= $n.props.".seen" ]
+
+            $lib.model.migration.copyTags($n, $node, overwrite=(false))
+            $lib.model.migration.copyEdges($n, $node)
+            if (not $nodata) {
+                $lib.model.migration.copyData($n, $node, overwrite=(false))
+            }
+
+            return($node)
+        }
+
+        function inetServiceMessageClientAddress(n) {
+            $form = $n.form()
+            if ($form != 'inet:service:message') {
+                $mesg = `$lib.model.migration.s.inetServiceMessageClientAddress() only accepts inet:service:message nodes, not {$form}`
+                $lib.raise(BadArg, $mesg)
+            }
+
+            if (not $n.props.'client:address') { return() }
+
+            yield $n
+
+            if :client {
+                $node.data.set(migration:inet:service:message:client:address, :client:address)
+            } else {
+                [ :client = :client:address ]
+            }
+
+            [ -:client:address ]
+
+            return()
+        }
+
+        function inetServiceInstanceToPlatform(n, nodata=(false)) {
+            if (not $n.isform(inet:service:instance)) {
+                $mesg = `$lib.model.migration.s.inetServiceInstanceToPlatform() only accepts inet:service:instance nodes, not {$n.form()}`
+                $lib.raise(BadArg, $mesg)
+            }
+
+            $iden = $n.value()
+            $parent = $n.props.platform
+
+            $plat = {[ inet:service:platform=$iden ]}
+
+            if ($parent = $iden) {
+                $lib.warn(`The :platform of inet:service:instance={$iden} has the same guid as the instance, so :parent was not set on the inet:service:platform.`)
+            } elif ($parent != null) {
+                $plat.props.set(parent, $parent)
+            }
+
+            for $name in (id, url, name, desc, period, status, creator, tenant, ".seen") {
+                $valu = $n.props.$name
+                if ($valu != null) { $plat.props.set($name, $valu) }
+            }
+
+            for $name in (owner, app) {
+                $valu = $n.props.$name
+                if ($valu != null) { $plat.data.set(`migration:inet:service:instance:{$name}`, $valu) }
+            }
+
+            $lib.model.migration.copyTags($n, $plat, overwrite=(false))
+            $lib.model.migration.copyEdges($n, $plat)
+            if (not $nodata) {
+                $lib.model.migration.copyData($n, $plat, overwrite=(false))
+            }
+
+            yield $n <- *
+
+            $refform = $node.form()
+            for ($name, $valu) in $node.props {
+                if ($valu != $iden) { continue }
+
+                if ($lib.model.prop(`{$refform}:{$name}`).type.name != 'inet:service:instance') { continue }
+
+                $pname = $lib.regex.replace('instance$', 'platform', $name)
+                $pprop = $lib.model.prop(`{$refform}:{$pname}`)
+                if ($pprop = null or $pprop.type.name != 'inet:service:platform') { continue }
+
+                $curv = $node.props.$pname
+                if ($curv = null or $curv = $parent or $curv = $iden) {
+                    $node.props.set($pname, $iden)
+                } else {
+                    $node.data.set(`migration:{$refform}:{$name}`, $valu)
+                }
+
+                $node.props.set($name, $lib.undef)
+            }
+
+            fini { return($plat) }
+        }
+    '''
+
+    def getObjLocals(self):
+        return {
+            'riskHasVulnToVulnerable': self._riskHasVulnToVulnerable,
+        }
+
+    async def _riskHasVulnToVulnerable(self, n, nodata=False):
+
+        nodata = await s_stormtypes.tobool(nodata)
+
+        if not isinstance(n, s_node.Node):
+            raise s_exc.BadArg(mesg='$lib.model.migration.s.riskHasVulnToVulnerable() argument must be a node.')
+
+        if n.form.name != 'risk:hasvuln':
+            mesg = f'$lib.model.migration.s.riskHasVulnToVulnerable() only accepts risk:hasvuln nodes, not {n.form.name}'
+            raise s_exc.BadArg(mesg=mesg)
+
+        retidens = []
+
+        if not (vuln := n.get('vuln')):
+            return retidens
+
+        props = {
+            'vuln': vuln,
+        }
+
+        links = {prop: valu for prop in RISK_HASVULN_VULNPROPS if (valu := n.get(prop)) is not None}
+
+        match len(links):
+            case 0:
+                return retidens
+            case 1:
+                guid = n.ndef[1]
+            case _:
+                guid = None
+
+        riskvuln = self.runt.model.form('risk:vulnerable')
+
+        self.runt.layerConfirm(riskvuln.addperm)
+        self.runt.confirmPropSet(riskvuln.props['vuln'])
+        self.runt.confirmPropSet(riskvuln.props['node'])
+
+        if seen := n.get('.seen'):
+            self.runt.confirmPropSet(riskvuln.props['.seen'])
+            props['.seen'] = seen
+
+        async with self.runt.snap.getEditor() as editor:
+
+            for prop, valu in links.items():
+
+                pguid = guid if guid is not None else s_common.guid((guid, prop))
+                pprops = props | {'node': (n.form.props[prop].type.name, valu)}
+
+                proto = await editor.addNode('risk:vulnerable', pguid, props=pprops)
+                retidens.append(proto.iden())
+
+                await self.copyTags(n, proto, overwrite=False)
+                await self.copyEdges(editor, n, proto)
+
+                if not nodata:
+                    await self.copyData(n, proto, overwrite=False)
+
+        return retidens
+
+class LibModelMigrationsQueue(s_stormtypes.Lib):
+    '''
+    Base class for the model migration queue helper libraries.
+
+    Subclasses set ``queuename`` to select which migration queue they operate on.
+    '''
+    queuename = None
+
+    _storm_locals = (
+        {'name': 'listNodes', 'desc': 'Yield queued nodes.',
+         'type': {'type': 'function', '_funcname': '_methListNodes',
+                  'args': (
+                      {'name': 'form', 'type': 'str', 'default': None,
+                       'desc': 'Only yield entries matching the specified form.'},
+                      {'name': 'source', 'type': 'str', 'default': None,
+                       'desc': 'Only yield entries that were seen by the specified source.'},
+                      {'name': 'offset', 'type': 'int', 'default': 0,
+                       'desc': 'Skip this many entries.'},
+                      {'name': 'size', 'type': 'int', 'default': None,
+                       'desc': 'Only yield up to this many entries.'},
+                  ),
+                  'returns': {'name': 'yields', 'type': 'list',
+                              'desc': 'A tuple of (offset, form, valu, sources) values for the specified node.', }}},
+        {'name': 'printNode', 'desc': 'Print detailed queued node information.',
+         'type': {'type': 'function', '_funcname': '_methPrintNode',
+                  'args': (
+                      {'name': 'offset', 'type': 'int', 'desc': 'The offset of the queued node to print.'},
+                  ),
+                  'returns': {'type': 'null'}}},
+        {'name': 'repairNode', 'desc': 'Repair a queued node.',
+         'type': {'type': 'function', '_funcname': '_methRepairNode',
+                  'args': (
+                      {'name': 'offset', 'type': 'str', 'desc': 'The node queue offset to repair.'},
+                      {'name': 'newvalu', 'type': 'any', 'desc': 'The new (corrected) node value.'},
+                      {'name': 'remove', 'type': 'boolean', 'default': False,
+                       'desc': 'Specify whether to delete the repaired node from the queue.'},
+                  ),
+                  'returns': {'type': 'dict', 'desc': 'The queue node information'}}},
+    )
+
+    def getObjLocals(self):
+        return {
+            'listNodes': self._methListNodes,
+            'printNode': self._methPrintNode,
+            'repairNode': self._methRepairNode,
+        }
+
+    async def _hasCoreQueue(self, name):
+        try:
+            await self.runt.snap.core.getCoreQueue(name)
+            return True
+        except s_exc.NoSuchName:
+            return False
+
+    async def _implListNodes(self, form=None, source=None, offset=0, size=None):
+        form = await s_stormtypes.tostr(form, noneok=True)
+        source = await s_stormtypes.tostr(source, noneok=True)
+        offset = await s_stormtypes.toint(offset)
+        size = await s_stormtypes.toint(size, noneok=True)
+
+        if not await self._hasCoreQueue(self.queuename):
+            await self.runt.printf(f'Queue {self.queuename} not found, no nodes to list.')
+            return
+
+        nodes = self.runt.snap.core.coreQueueGets(self.queuename, offs=offset, cull=False, size=size)
+        async for offs, node in nodes:
+            if form is not None and node['formname'] != form:
+                continue
+
+            if source is not None and source not in node['sources']:
+                continue
+
+            yield (offs, node['formname'], node['formvalu'], node['sources'])
+
+    async def _implPrintNode(self, offset):
+        offset = await s_stormtypes.toint(offset)
+
+        if not await self._hasCoreQueue(self.queuename):
+            await self.runt.printf(f'Queue {self.queuename} not found, no nodes to print.')
+            return
+
+        node = await self.runt.snap.core.coreQueueGet(self.queuename, offs=offset, cull=False)
+        if not node:
+            await self.runt.warn(f'Queued node with offset {offset} not found.')
+            return
+
+        node = node[1]
+
+        await self.runt.printf(f'{node["formname"]}={repr(node["formvalu"])}')
+
+        for layriden, sode in node['sodes'].items():
+            await self.runt.printf(f'  layer: {layriden}')
+
+            for propname, propvalu in sode.get('props', {}).items():
+                if propname == '.seen':
+                    mintime, maxtime = propvalu[0]
+                    mindt = s_time.repr(mintime)
+                    maxdt = s_time.repr(maxtime)
+                    await self.runt.printf(f'    .seen = ({mindt}, {maxdt})')
+                else:
+                    await self.runt.printf(f'    :{propname} = {propvalu[0]}')
+
+            for tagname, tagvalu in sode.get('tags', {}).items():
+                if tagvalu == (None, None):
+                    await self.runt.printf(f'    #{tagname}')
+                else:
+                    mintime, maxtime = tagvalu
+                    mindt = s_time.repr(mintime)
+                    maxdt = s_time.repr(maxtime)
+                    await self.runt.printf(f'    #{tagname} = ({mindt}, {maxdt})')
+
+            for tagprop, tagpropvalu in sode.get('tagprops', {}).items():
+                for prop, valu in tagpropvalu.items():
+                    await self.runt.printf(f'    #{tagprop}:{prop} = {valu[0]}')
+
+        if sources := node['sources']:
+            await self.runt.printf(f'  sources: {sorted(sources)}')
+
+        if noderefs := node['refs']:
+            await self.runt.printf('  refs:')
+
+            for layriden, reflist in noderefs.items():
+                await self.runt.printf(f'    layer: {layriden}')
+                for iden, refinfo in reflist:
+                    form, prop, _, _, isro = refinfo
+                    mesg = f'      - {form}:{prop} (iden: {iden})'
+                    if isro:
+                        # repairNode() cannot re-point a read-only property, so the
+                        # referring node was removed and queued under its own entry.
+                        mesg += ' (read-only, repair separately)'
+                    await self.runt.printf(mesg)
+
+        n1edges = node['n1edges']
+        n2edges = node['n2edges']
+
+        if n1edges or n2edges:
+            await self.runt.printf('  edges:')
+
+        for layriden, edges in n1edges.items():
+            for verb, iden in edges:
+                await self.runt.printf(f'    -({verb})> {iden}')
+
+        for layriden, edges in n2edges.items():
+            for verb, iden, n2form in edges:
+                await self.runt.printf(f'    <({verb})- {iden}')
+
+    async def _repairNode(self, offset, newvalu):
+        item = await self.runt.snap.core.coreQueueGet(self.queuename, offset, cull=False)
+        if item is None:
+            await self.runt.warn(f'Queued node with offset {offset} not found.')
+            return False
+
+        node = item[1]
+
+        nodeform = node['formname']
+        form = self.runt.snap.core.model.form(nodeform)
+
+        norm, info = form.type.norm(newvalu)
+
+        buid = s_common.buid((nodeform, norm))
+
+        nodeedits = {}
+
+        for layriden in node['layers']:
+            nodeedits.setdefault(layriden, {})
+
+            layer = self.runt.snap.core.getLayer(layriden)
+            if layer is None: # pragma: no cover
+                await self.runt.warn(f'Layer does not exist to recreate node: {layriden}.')
+                return False
+
+        await self.runt.printf(f'Repairing node at offset {offset} from {node["formvalu"]} -> {norm}')
+
+        # Create the node in the right layers
+        for layriden in node['layers']:
+            nodeedits[layriden][buid] = (
+                buid, nodeform, [
+                (s_layer.EDIT_NODE_ADD, (norm, form.type.stortype), ()),
+            ])
+
+            for propname, propvalu in info.get('subs', {}).items():
+                prop = form.prop(propname)
+                if prop is None:
+                    continue
+
+                stortype = prop.type.stortype
+
+                nodeedits[layriden][buid][2].append(
+                    (s_layer.EDIT_PROP_SET, (propname, propvalu, None, stortype), ()),
+                )
+
+        for layriden, sode in node['sodes'].items():
+            nodeedits.setdefault(layriden, {})
+            nodeedits[layriden].setdefault(buid, (buid, nodeform, []))
+
+            for propname, propvalu in sode.get('props', {}).items():
+                propvalu, stortype = propvalu
+
+                nodeedits[layriden][buid][2].append(
+                    (s_layer.EDIT_PROP_SET, (propname, propvalu, None, stortype), ()),
+                )
+
+            for tagname, tagvalu in sode.get('tags', {}).items():
+                nodeedits[layriden][buid][2].append(
+                    (s_layer.EDIT_TAG_SET, (tagname, tagvalu, None), ()),
+                )
+
+            for tagprop, tagpropvalu in sode.get('tagprops', {}).items():
+                for propname, propvalu in tagpropvalu.items():
+                    propvalu, stortype = propvalu
+                    nodeedits[layriden][buid][2].append(
+                        (s_layer.EDIT_TAGPROP_SET, (tagname, propname, propvalu, None, stortype), ()),
+                    )
+
+        for layriden, data in node['nodedata'].items():
+            nodeedits.setdefault(layriden, {})
+            nodeedits[layriden].setdefault(buid, (buid, nodeform, []))
+
+            for name, valu in data:
+                nodeedits[layriden][buid][2].append(
+                    (s_layer.EDIT_NODEDATA_SET, (name, valu, None), ()),
+                )
+
+        for layriden, edges in node['n1edges'].items():
+            nodeedits.setdefault(layriden, {})
+            nodeedits[layriden].setdefault(buid, (buid, nodeform, []))
+
+            for verb, iden in edges:
+                nodeedits[layriden][buid][2].append(
+                    (s_layer.EDIT_EDGE_ADD, (verb, iden), ()),
+                )
+
+        for layriden, edges in node['n2edges'].items():
+            n1iden = s_common.ehex(buid)
+
+            for verb, iden, n2form in edges:
+                n2buid = s_common.uhex(iden)
+
+                nodeedits.setdefault(layriden, {})
+                nodeedits[layriden].setdefault(n2buid, (n2buid, n2form, []))
+
+                nodeedits[layriden][n2buid][2].append(
+                    (s_layer.EDIT_EDGE_ADD, (verb, n1iden), ()),
+                )
+
+        for layriden, reflist in node['refs'].items():
+            layer = self.runt.snap.core.getLayer(layriden)
+            if layer is None:
+                continue
+
+            for iden, refinfo in reflist:
+                refform, refprop, reftype, isarray, isro = refinfo
+
+                if isro:
+                    continue
+
+                refbuid = s_common.uhex(iden)
+
+                nodeedits.setdefault(layriden, {})
+                nodeedits[layriden].setdefault(refbuid, (refbuid, refform, []))
+
+                if reftype == 'ndef':
+                    propvalu = (nodeform, norm)
+                else:
+                    propvalu = norm
+
+                stortype = self.runt.snap.core.model.type(reftype).stortype
+
+                if isarray:
+
+                    sode = await layer.getStorNode(refbuid)
+                    if not sode:
+                        continue
+
+                    props = sode.get('props', {})
+
+                    curv, _ = props.get(refprop, (None, None))
+                    _curv = curv
+
+                    if _curv is None:
+                        _curv = []
+
+                    newv = list(_curv).copy()
+                    newv.append(propvalu)
+
+                    nodeedits[layriden][refbuid][2].append(
+                        (s_layer.EDIT_PROP_SET, (refprop, newv, curv, stortype | s_layer.STOR_FLAG_ARRAY), ()),
+                    )
+
+                else:
+
+                    nodeedits[layriden][refbuid][2].append(
+                        (s_layer.EDIT_PROP_SET, (refprop, propvalu, None, stortype), ()),
+                    )
+
+        meta = {'time': s_common.now(), 'user': self.runt.snap.core.auth.rootuser.iden}
+
+        # Process all layer edits as a single batch
+        for layriden, edits in nodeedits.items():
+            layer = self.runt.snap.core.getLayer(layriden)
+            if layer is None: # pragma: no cover
+                continue
+
+            await layer.storNodeEditsNoLift(list(edits.values()), meta)
+
+        return True
+
+    async def _implRepairNode(self, offset, newvalu, remove=False):
+        ok = False
+
+        if not await self._hasCoreQueue(self.queuename):
+            await self.runt.printf(f'Queue {self.queuename} not found, no nodes to repair.')
+            return False
+
+        try:
+            ok = await self._repairNode(offset, newvalu)
+        except s_exc.SynErr as exc: # pragma: no cover
+            mesg = exc.get('mesg')
+            await self.runt.warn(f'Error when restoring node {offset}: {mesg}')
+
+        if ok and remove:
+            await self.runt.printf(f'Removing queued node: {offset}.')
+            await self.runt.snap.core.coreQueuePop(self.queuename, offset)
+
+        return ok
+
+
+@s_stormtypes.registry.registerLib
+class LibModelMigrations_0_2_31(LibModelMigrationsQueue):
+    '''
+    A Storm library with helper functions for the 0.2.31 model it:sec:cpe migration.
+    '''
+    queuename = 'model_0_2_31:nodes'
+    _storm_lib_path = ('model', 'migration', 's', 'model_0_2_31')
+
+    async def _methListNodes(self, form=None, source=None, offset=0, size=None):
+        async for item in self._implListNodes(form=form, source=source, offset=offset, size=size):
+            yield item
+
+    async def _methPrintNode(self, offset):
+        return await self._implPrintNode(offset)
+
+    async def _methRepairNode(self, offset, newvalu, remove=False):
+        return await self._implRepairNode(offset, newvalu, remove=remove)
+
+@s_stormtypes.registry.registerLib
+class LibModelMigrations_0_2_37(LibModelMigrationsQueue):
+    '''
+    A Storm library with helper functions for the 0.2.37 model bank identifier migration.
+    '''
+    queuename = 'model_0_2_37:nodes'
+    _storm_lib_path = ('model', 'migration', 's', 'model_0_2_37')
+
+    async def _methListNodes(self, form=None, source=None, offset=0, size=None):
+        async for item in self._implListNodes(form=form, source=source, offset=offset, size=size):
+            yield item
+
+    async def _methPrintNode(self, offset):
+        return await self._implPrintNode(offset)
+
+    async def _methRepairNode(self, offset, newvalu, remove=False):
+        return await self._implRepairNode(offset, newvalu, remove=remove)

@@ -1,13 +1,11 @@
-import sys
-import asyncio
 import logging
 import warnings
-import contextlib
 
 import synapse.exc as s_exc
 import synapse.common as s_common
 import synapse.telepath as s_telepath
 
+import synapse.lib.cmd as s_cmd
 import synapse.lib.cmdr as s_cmdr
 import synapse.lib.version as s_version
 
@@ -47,19 +45,10 @@ async def main(argv):  # pragma: no cover
         print('usage: python -m synapse.tools.cmdr <url> [<single quoted command>]')
         return 1
 
-    s_common.setlogging(logger, 'WARNING')
-
-    path = s_common.getSynPath('telepath.yaml')
-    async with contextlib.AsyncExitStack() as ctx:
-
-        telefini = await s_telepath.loadTeleEnv(path)
-        if telefini is not None:
-            ctx.push_async_callback(telefini)
-
+    async with s_telepath.withTeleEnv():
         await _main(argv)
-
     return 0
 
 if __name__ == '__main__':  # pragma: no cover
     warnings.filterwarnings("default", category=PendingDeprecationWarning)
-    sys.exit(asyncio.run(main(sys.argv[1:])))
+    s_cmd.exitmain(main, logconf={'level': 'WARNING'})

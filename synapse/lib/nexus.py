@@ -12,11 +12,24 @@ import synapse.common as s_common
 import synapse.telepath as s_telepath
 
 import synapse.lib.base as s_base
+import synapse.lib.scope as s_scope
+import synapse.lib.queue as s_queue
+import synapse.lib.msgpack as s_msgpack
 
 logger = logging.getLogger(__name__)
 
+leaderversion = 'Leader is a higher version than we are.'
+
 # As a mirror follower, amount of time before giving up on a write request
 FOLLOWER_WRITE_WAIT_S = 30.0
+# As a mirror, amount of time to wait for a connection to the leader before entering
+# read-only mode and cancelling tasks waiting on responses.
+FOLLOWER_CONNECT_WAIT_S = 60.0
+
+mirrordisconnect = f'Unable to connect to leader for {FOLLOWER_CONNECT_WAIT_S}s.'
+
+WINDOW_MAXSIZE = 10_000
+YIELD_PREFIX = b'\x92\xa8t2:yield\x81\xa4retn\x92\xc3\x92'
 
 class RegMethType(type):
     '''
@@ -72,22 +85,33 @@ class ChangeDist(s_base.Base):
 
 class NexsRoot(s_base.Base):
 
-    async def __anit__(self, dirn: str, donexslog: bool = True, map_async=False):
+    async def __anit__(self, cell):
 
         await s_base.Base.__anit__(self)
 
         # avoid import cycle
-        import synapse.lib.lmdbslab as s_lmdbslab
         import synapse.lib.multislabseqn as s_multislabseqn
 
-        self.dirn = dirn
+        self.cell = cell
+        self.dirn = cell.dirn
         self.client = None
         self.started = False
-        self.celliden = None
-        self.donexslog = donexslog
-        self.applylock = asyncio.Lock()
+        self.celliden = self.cell.iden
+        self.readonly = False
+        self.writeholds = set()
+
+        self.applytask = None
+        self.issuewait = False
+
+        self.ready = asyncio.Event()
+        self.donexslog = self.cell.conf.get('nexslog:en')
+
+        self.miruplink = asyncio.Event()
+        self._mirready = asyncio.Event()  # for testing
 
         self._mirrors: List[ChangeDist] = []
+        self._linkmirrors: List[s_queue.Window] = []
+
         self._nexskids: Dict[str, 'Pusher'] = {}
 
         # Used to match pending follower write requests with the responses arriving on the log
@@ -98,8 +122,8 @@ class NexsRoot(s_base.Base):
 
         logpath = s_common.genpath(self.dirn, 'slabs', 'nexuslog')
 
-        self.map_async = map_async
-        self.nexsslab = await s_lmdbslab.Slab.anit(path, map_async=map_async)
+        self.nexsslab = await cell._initSlabFile(path)
+
         self.nexshot = await self.nexsslab.getHotCount('nexs:indx')
 
         if fresh:
@@ -112,8 +136,7 @@ class NexsRoot(s_base.Base):
         elif vers != 2:
             raise s_exc.BadStorageVersion(mesg=f'Got nexus log version {vers}.  Expected 2.  Accidental downgrade?')
 
-        slabopts = {'map_async': map_async}
-        self.nexslog = await s_multislabseqn.MultiSlabSeqn.anit(logpath, slabopts=slabopts)
+        self.nexslog = await s_multislabseqn.MultiSlabSeqn.anit(logpath, cell=cell)
 
         # just in case were previously configured differently
         logindx = self.nexslog.index()
@@ -124,6 +147,11 @@ class NexsRoot(s_base.Base):
         self.nexslog.setIndex(maxindx)
 
         async def fini():
+            for wind in self._linkmirrors:
+                await wind.fini()
+
+            for dist in self._mirrors:
+                await dist.fini()
 
             for futu in self._futures.values():  # pragma: no cover
                 futu.cancel()
@@ -132,6 +160,9 @@ class NexsRoot(s_base.Base):
             await self.nexslog.fini()
 
         self.onfini(fini)
+
+    def getNexsKids(self):
+        return list(self._nexskids.values())
 
     async def _migrateV1toV2(self, nexspath, logpath):
         '''
@@ -172,7 +203,7 @@ class NexsRoot(s_base.Base):
             shutil.rmtree(fn)
 
         os.makedirs(fn, exist_ok=True)
-        logger.warning(f'Moving existing nexslog')
+        logger.warning('Moving existing nexslog')
         try:
             os.replace(nexspath, fn)
         except OSError as e:  # pragma: no cover
@@ -181,7 +212,8 @@ class NexsRoot(s_base.Base):
 
         # Open a fresh slab where the old one used to be
         logger.warning(f'Re-opening fresh nexslog slab at {nexspath} for nexshot')
-        self.nexsslab = await s_lmdbslab.Slab.anit(nexspath, map_async=self.map_async)
+        self.nexsslab = await self.cell._initSlabFile(nexspath)
+
         self.nexshot = await self.nexsslab.getHotCount('nexs:indx')
 
         logger.warning('Copying nexs:indx data from migrated slab to the fresh nexslog')
@@ -190,12 +222,25 @@ class NexsRoot(s_base.Base):
             olddb = self.nexsslab.initdb('nexs:indx')
             self.nexsslab.dropdb(olddb)
             db = newslab.initdb('nexs:indx')
-            newslab.copydb('nexs:indx', self.nexsslab, destdbname='nexs:indx')
+            await newslab.copydb('nexs:indx', self.nexsslab, destdbname='nexs:indx')
             newslab.dropdb(db)
 
         self.nexshot.set('version', 2)
 
         logger.warning('...Nexus log migration complete')
+
+    async def getNexsInfo(self):
+        ret = {
+            'indx': await self.index(),
+            'ready': self.ready.is_set(),
+            'uplink:ready': self.miruplink.is_set(),
+            'readonly': self.readonly,
+            # This is a list of dictionaries so that we can populate metadata
+            # in the future if we want to do so.
+            'holds': sorted([{'reason': hold} for hold in self.writeholds],
+                                key=lambda x: x.get('reason'))
+        }
+        return ret
 
     @contextlib.contextmanager
     def _getResponseFuture(self, iden=None):
@@ -214,7 +259,7 @@ class NexsRoot(s_base.Base):
 
     async def enNexsLog(self):
 
-        async with self.applylock:
+        async with self.cell.nexslock:
 
             if self.donexslog:
                 return
@@ -250,20 +295,58 @@ class NexsRoot(s_base.Base):
             raise
 
         except Exception:
-            logger.exception('Exception while replaying log')
+            logger.exception(f'Exception while replaying log: {s_common.trimText(repr(indxitem))}')
 
-    async def issue(self, nexsiden, event, args, kwargs, meta=None):
+    async def addWriteHold(self, reason):
+
+        self.readonly = True
+
+        if reason not in self.writeholds:
+            logger.error(f'Entering Read-Only Mode: {reason}')
+            self.writeholds.add(reason)
+            return True
+
+        return False
+
+    async def delWriteHold(self, reason):
+
+        if reason in self.writeholds:
+
+            self.writeholds.remove(reason)
+
+            if not self.writeholds:
+                self.readonly = False
+
+            return True
+
+        return False
+
+    def reqNotReadOnly(self):
+
+        if not self.readonly:
+            return
+
+        # sets have stable order like dicts, so use the first message...
+        for reason in self.writeholds:
+            raise s_exc.IsReadOnly(mesg=reason)
+
+        mesg = 'Unable to issue Nexus events when readonly is set.'
+        raise s_exc.IsReadOnly(mesg=mesg)
+
+    async def issue(self, nexsiden, event, args, kwargs, meta=None, wait=True):
         '''
         If I'm not a follower, mutate, otherwise, ask the leader to make the change and wait for the follower loop
         to hand me the result through a future.
         '''
-        assert self.started, 'Attempt to issue before nexsroot is started'
-
         # pick up a reference to avoid race when we eventually can promote
         client = self.client
 
         if client is None:
-            return await self.eat(nexsiden, event, args, kwargs, meta)
+            return await self.eat(nexsiden, event, args, kwargs, meta, wait=wait)
+
+        # check here because we shouldn't be sending an edit upstream if we
+        # are in readonly mode because the mirror sync will never complete.
+        self.reqNotReadOnly()
 
         try:
             await client.waitready(timeout=FOLLOWER_WRITE_WAIT_S)
@@ -274,22 +357,103 @@ class NexsRoot(s_base.Base):
         if meta is None:
             meta = {}
 
-        # If this issue came from a downstream mirror, just in case I'm forwarding to upstream mirror,
-        # make my response iden the same as what's coming from downstream
+        # If this issue came from a downstream mirror, just forward the request
+        if 'resp' in meta:
+            if self.issuewait:
+                await client.issue(nexsiden, event, args, kwargs, meta, wait=False)
+            else:
+                await client.issue(nexsiden, event, args, kwargs, meta)
+            return
 
-        with self._getResponseFuture(iden=meta.get('resp')) as (iden, futu):
+        with self._getResponseFuture() as (iden, futu):
             meta['resp'] = iden
-            await client.issue(nexsiden, event, args, kwargs, meta)
-            return await asyncio.wait_for(futu, timeout=FOLLOWER_WRITE_WAIT_S)
+            if self.issuewait:
+                await client.issue(nexsiden, event, args, kwargs, meta, wait=False)
+            else:
+                await client.issue(nexsiden, event, args, kwargs, meta)
+            return await futu
 
-    async def eat(self, nexsiden, event, args, kwargs, meta):
+    async def eat(self, nexsiden, event, args, kwargs, meta, wait=True):
         '''
         Actually mutate for the given nexsiden instance.
         '''
         if meta is None:
             meta = {}
 
-        return await self._eat((nexsiden, event, args, kwargs, meta))
+        await self.cell.nexslock.acquire()
+
+        if self.isfini:
+            self.cell.nexslock.release()
+            raise s_exc.IsFini(mesg=f'Nexus has been shutdown, cannot propose {s_common.trimText(str((nexsiden, event, args, kwargs, meta)))}')
+
+        try:
+            if (nexus := self._nexskids.get(nexsiden)) is None:
+                mesg = f'No Nexus Pusher with iden {nexsiden} {event=} args={s_common.trimText(repr(args))} ' \
+                       f'kwargs={s_common.trimText(repr(kwargs))}'
+                raise s_exc.NoSuchIden(mesg=mesg, iden=nexsiden, event=event)
+
+            if event not in nexus._nexshands:
+                mesg = f'No event handler for event {event} args={s_common.trimText(repr(args))} ' \
+                       f'kwargs={s_common.trimText(repr(kwargs))}'
+                raise s_exc.NoSuchName(mesg=mesg, iden=nexsiden, event=event)
+
+            self.reqNotReadOnly()
+
+            # Keep a reference to the shielded task to ensure it isn't GC'd
+            self.applytask = asyncio.create_task(self._eat((nexsiden, event, args, kwargs, meta)))
+
+            # Clone the current scope to the applytask, so that log events in the scope
+            # would have access to any user / sess values which have been set.
+            s_scope.clone(self.applytask)
+
+        except:
+            self.cell.nexslock.release()
+            raise
+
+        if wait:
+            return await asyncio.shield(self.applytask)
+
+    async def _eat(self, item, indx=None):
+
+        try:
+            if self.isfini:
+                raise s_exc.IsFini(mesg=f'Nexus has been shutdown, cannot apply {s_common.trimText(str(item))}')
+
+            if self.donexslog:
+                saveindx, packitem = await self.nexslog.addWithPackRetn(item, indx=indx)
+
+                if self._linkmirrors:
+                    tupl = (saveindx, YIELD_PREFIX + s_msgpack.en(saveindx) + packitem)
+                    for wind in tuple(self._linkmirrors):
+                        await wind.put(tupl)
+
+                if self._mirrors:
+                    for dist in tuple(self._mirrors):
+                        dist.update()
+
+            else:
+                saveindx = self.nexshot.get('nexs:indx')
+                if indx is not None and indx > saveindx:  # pragma: no cover
+                    saveindx = self.nexshot.set('nexs:indx', indx)
+
+                self.nexshot.inc('nexs:indx')
+
+            return (saveindx, await self._apply(saveindx, item))
+
+        finally:
+            self.cell.nexslock.release()
+
+    async def _apply(self, indx, mesg):
+
+        nexsiden, event, args, kwargs, _ = mesg
+
+        nexus = self._nexskids[nexsiden]
+        func, passitem = nexus._nexshands[event]
+
+        if passitem:
+            return await func(nexus, *args, nexsitem=(indx, mesg), **kwargs)
+
+        return await func(nexus, *args, **kwargs)
 
     async def index(self):
         if self.donexslog:
@@ -320,43 +484,23 @@ class NexsRoot(s_base.Base):
 
         return True
 
-    async def _eat(self, item, indx=None):
-
-        if self.donexslog:
-            saveindx = await self.nexslog.add(item, indx=indx)
-            [dist.update() for dist in tuple(self._mirrors)]
-
-        else:
-            saveindx = self.nexshot.get('nexs:indx')
-            if indx is not None and indx > saveindx:  # pragma: no cover
-                saveindx = self.nexshot.set('nexs:indx', indx)
-
-            self.nexshot.inc('nexs:indx')
-
-        return (saveindx, await self._apply(saveindx, item))
-
-    async def _apply(self, indx, mesg):
-
-        nexsiden, event, args, kwargs, _ = mesg
-
-        nexus = self._nexskids[nexsiden]
-        func, passitem = nexus._nexshands[event]
-
-        async with self.applylock:
-            if passitem:
-                return await func(nexus, *args, nexsitem=(indx, mesg), **kwargs)
-
-            return await func(nexus, *args, **kwargs)
-
-    async def iter(self, offs: int) -> AsyncIterator[Any]:
+    async def iter(self, offs: int, tellready=False, wait=True) -> AsyncIterator[Any]:
         '''
-        Returns an iterator of change entries in the log
+        Returns an iterator of change entries in the log.
+
+        Notes:
+            If this method is being called in the context of a Telepath call,
+            it will directly send messages to the scope "link" object when it
+            has caught up to the realtime change window; instead of yielding
+            them as a generator. This is an optimization to avoid duplication
+            of msgpack'ing the same object over and over again as the number
+            of mirrors increases.
         '''
         if not self.donexslog:
             return
 
         if self.isfini:
-            raise s_exc.IsFini()
+            raise s_exc.IsFini(mesg='Nexus has been shutdown, cannot iterate changes.')
 
         maxoffs = offs
 
@@ -366,11 +510,47 @@ class NexsRoot(s_base.Base):
             maxoffs = item[0] + 1
             yield item
 
-        async with self.getChangeDist(maxoffs) as dist:
-            async for item in dist:
-                if self.isfini:
-                    raise s_exc.IsFini()
-                yield item
+        if tellready:
+            yield None
+
+        if not wait:
+            return
+
+        if (link := s_scope.get('link')) is None:
+            async with self.getChangeDist(maxoffs) as dist:
+                async for item in dist:
+                    yield item
+
+        else:
+            async with self.getMirrorWindow() as wind:
+
+                # Ensure we are caught up after grabbing a window
+                sync = True
+
+                async for item in self.nexslog.iter(maxoffs):
+                    maxoffs = item[0] + 1
+                    yield item
+
+                async for offs, item in wind:
+                    if sync:
+                        if offs < maxoffs:
+                            continue
+                        sync = False
+
+                    await link.send(item)
+
+    @contextlib.asynccontextmanager
+    async def getMirrorWindow(self):
+        async with await s_queue.Window.anit(maxsize=WINDOW_MAXSIZE, clearonfini=True) as wind:
+
+            async def fini():
+                self._linkmirrors.remove(wind)
+
+            wind.onfini(fini)
+
+            self._linkmirrors.append(wind)
+
+            yield wind
 
     @contextlib.asynccontextmanager
     async def getChangeDist(self, offs: int) -> AsyncIterator[ChangeDist]:
@@ -386,19 +566,40 @@ class NexsRoot(s_base.Base):
 
             yield dist
 
-    async def startup(self, mirurl, celliden=None):
-
-        self.celliden = celliden
+    async def startup(self):
 
         if self.client is not None:
             await self.client.fini()
+            await self.delWriteHold(mirrordisconnect)
+
+        self._mirready.clear()
 
         self.client = None
+
+        mirurl = self.cell.conf.get('mirror')
+
+        await self.setNexsReady(mirurl is None)
+
         if mirurl is not None:
             self.client = await s_telepath.Client.anit(mirurl, onlink=self._onTeleLink)
             self.onfini(self.client)
+            self.client.schedCoro(self.connectTimeout())
 
         self.started = True
+
+    async def isNexsReady(self):
+        return self.ready.is_set()
+
+    async def setNexsReady(self, status):
+
+        if status:
+            self.ready.set()
+        else:
+            self.ready.clear()
+
+        # TODO maybe bump clients if status True -> False?
+        # (or fire a timer that if we're not back to ready soon bump them?)
+        await self._tellAhaReady(status)
 
     async def promote(self):
 
@@ -407,39 +608,103 @@ class NexsRoot(s_base.Base):
             mesg = 'promote() called on non-mirror nexsroot'
             raise s_exc.BadConfValu(mesg=mesg)
 
-        await self.startup(None)
+        await self.startup()
+
+    async def connectTimeout(self):
+        try:
+            await s_common.wait_for(self.miruplink.wait(), FOLLOWER_CONNECT_WAIT_S)
+
+        except asyncio.TimeoutError:
+            await self.addWriteHold(mirrordisconnect)
+
+            for futu in list(self._futures.values()):
+                futu.set_exception(s_exc.LinkErr(mesg=mirrordisconnect))
 
     async def _onTeleLink(self, proxy):
-        self.client.schedCoro(self.runMirrorLoop(proxy))
+        self.miruplink.set()
+        await self.delWriteHold(mirrordisconnect)
+
+        def onfini():
+            self.miruplink.clear()
+            self.issuewait = False
+
+            if self.client is not None and not self.client.isfini:
+                self.client.schedCoro(self.connectTimeout())
+
+        proxy.onfini(onfini)
+        proxy.schedCoro(self.runMirrorLoop(proxy))
 
     async def runMirrorLoop(self, proxy):
 
-        cellinfo = await proxy.getCellInfo()
-        features = cellinfo.get('features', {})
-        if features.get('dynmirror'):
-            await proxy.readyToMirror()
+        cellinfo = None
+        try:
+            cellinfo = await proxy.getCellInfo()
+            features = cellinfo.get('features', {})
+            if features.get('dynmirror'):
+                await proxy.readyToMirror()
 
-        if self.celliden is not None:
-            if self.celliden != await proxy.getCellIden():
-                logger.error('remote cell has different iden!  Aborting mirror sync')
-                await proxy.fini()
-                await self.fini()
+            self.issuewait = bool(features.get('issuewait'))
+
+            synvers = cellinfo['synapse']['version']
+            cellvers = cellinfo['cell']['version']
+            if cellvers > self.cell.VERSION:
+                logger.error('Leader is a higher version than we are. Mirrors must be updated first. Entering read-only mode.')
+                await self.addWriteHold(leaderversion)
+                # this will fire again on reconnect...
                 return
+
+            # When we reconnect and the leader version has become ok...
+            await self.delWriteHold(leaderversion)
+
+            if self.celliden is not None:
+                if self.celliden != await proxy.getCellIden():
+                    logger.error('remote cell has different iden!  Aborting mirror sync')
+                    await proxy.fini()
+                    await self.fini()
+                    return
+
+        except Exception as exc:
+            logger.exception(f'Unknown error during mirror loop startup: {exc}')
+            await proxy.fini()
 
         while not proxy.isfini:
 
+            if cellinfo:
+                ahaname = cellinfo.get('cell').get('aha', {}).get('name')
+                if ahaname:
+                    logger.info(f'Mirror communicating with aha service {ahaname}')
+
             try:
 
+                if self.readonly:
+                    await self.waitfini(timeout=2)
+                    continue
+
                 offs = self.nexslog.index()
-                genr = proxy.getNexusChanges(offs)
+
+                opts = {}
+                if synvers >= (2, 95, 0):
+                    opts['tellready'] = True
+
+                genr = proxy.getNexusChanges(offs, **opts)
                 async for item in genr:
 
                     if proxy.isfini:  # pragma: no cover
                         break
 
+                    if self.readonly:
+                        break
+
+                    # with tellready we move to ready=true when we get a None
+                    if item is None:
+                        logger.info(f'Entering realtime change window for syncing data at offset={offs}')
+                        await self.setNexsReady(True)
+                        self._mirready.set()
+                        continue
+
                     offs, args = item
-                    if offs != self.nexslog.index():  # pragma: no cover
-                        logger.error('mirror desync')
+                    if offs != self.nexslog.index():
+                        logger.error(f'Local Nexus offset is out of sync from remote cell! Aborting mirror sync. Local offs={self.nexslog.index()}, Remote {offs=}')
                         await self.fini()
                         return
 
@@ -450,13 +715,13 @@ class NexsRoot(s_base.Base):
                     try:
                         retn = await self.eat(*args)
 
-                    except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                        raise
-
                     except Exception as e:
                         if respfutu is not None:
                             assert not respfutu.done()
-                            respfutu.set_exception(e)
+
+                            # the head of the traceback is our own still running frame
+                            # and the caller may clear the frames of the traceback it gets.
+                            respfutu.set_exception(e.with_traceback(e.__traceback__.tb_next))
                         else:  # pragma: no cover
                             logger.exception(e)
 
@@ -464,11 +729,36 @@ class NexsRoot(s_base.Base):
                         if respfutu is not None:
                             respfutu.set_result(retn)
 
-            except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
-                raise
+            except s_exc.LinkShutDown:
+                logger.warning('mirror loop: leader closed the connection.')
 
-            except Exception:  # pragma: no cover
-                logger.exception('error in mirror loop')
+            except Exception as exc:  # pragma: no cover
+                logger.exception(f'error in mirror loop: {exc}')
+
+        # If we've left the mirror loop for some reason, we no longer know if we
+        # will be in the realtime window or not. So we should try to set the ready
+        # value to false and clear our internal flag.
+        if not self.isfini:
+            await self.setNexsReady(not self.cell.conf.get('mirror'))
+
+    async def _tellAhaReady(self, status):
+
+        if self.cell.ahaclient is None:
+            return
+
+        try:
+            await self.cell.ahaclient.waitready(timeout=5)
+            proxy = await self.cell.ahaclient.proxy(timeout=5)
+            ahainfo = await proxy.getCellInfo()
+            ahavers = ahainfo['synapse']['version']
+            if self.cell.ahasvcname is not None and ahavers >= (2, 95, 0):
+                await proxy.modAhaSvcInfo(self.cell.ahasvcname, {'ready': status})
+
+        except asyncio.CancelledError:  # pragma: no cover  TODO:  remove once >= py 3.8 only
+            raise
+
+        except Exception as e: # pragma: no cover
+            logger.exception(f'Error trying to set aha ready: {status}')
 
 class Pusher(s_base.Base, metaclass=RegMethType):
     '''
@@ -499,8 +789,20 @@ class Pusher(s_base.Base, metaclass=RegMethType):
             assert prev is not None, f'Failed removing {self.nexsiden}'
 
         self.onfini(onfini)
-
         self.nexsroot = nexsroot
+
+    async def modNexsRoot(self, ctor):
+
+        kids = [self]
+        if self.nexsroot is not None:
+            kids = self.nexsroot.getNexsKids()
+            await self.nexsroot.fini()
+
+        nexsroot = await ctor()
+
+        [kid.setNexsRoot(nexsroot) for kid in kids]
+
+        await nexsroot.startup()
 
     @classmethod
     def onPush(cls, event: str, passitem=False) -> Callable:

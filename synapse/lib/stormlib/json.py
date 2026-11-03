@@ -1,25 +1,25 @@
 import copy
-import json
 import asyncio
 import logging
 
 import synapse.exc as s_exc
 
-import synapse.lib.coro as s_coro
+import synapse.lib.json as s_json
 import synapse.lib.config as s_config
 import synapse.lib.stormtypes as s_stormtypes
+import synapse.lib.processpool as s_processpool
 
 logger = logging.getLogger(__name__)
 
 def runJsSchema(schema, item, use_default=True):
-    # This is a target function for s_coro.spawn
-    func = s_config.getJsValidator(schema, use_default=use_default)
+    # This is a target function for multiprocessing
+    func = s_config.getJsValidator(schema, use_default=use_default, handlers=None)
     resp = func(item)
     return resp
 
 def compileJsSchema(schema, use_default=True):
-    # This is a target function for s_coro.spawn
-    _ = s_config.getJsValidator(schema, use_default=use_default)
+    # This is a target function for multiprocessing
+    _ = s_config.getJsValidator(schema, use_default=use_default, handlers=None)
     return True
 
 @s_stormtypes.registry.registerType
@@ -27,7 +27,7 @@ class JsonSchema(s_stormtypes.StormType):
     '''
     A JsonSchema validation object for use in validating data structures in Storm.
     '''
-    _storm_typename = 'storm:json:schema'
+    _storm_typename = 'json:schema'
     _storm_locals = (
         {'name': 'schema',
          'desc': 'The schema belonging to this object.',
@@ -62,14 +62,16 @@ class JsonSchema(s_stormtypes.StormType):
             'validate': self._validate,
         }
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _schema(self):
         return copy.deepcopy(self.schema)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _validate(self, item):
         item = await s_stormtypes.toprim(item)
 
         try:
-            result = await s_coro.spawn((runJsSchema, (self.schema, item), {'use_default': self.use_default}))
+            result = await s_processpool.semafork(runJsSchema, self.schema, item, use_default=self.use_default)
         except s_exc.SchemaViolation as e:
             return False, {'mesg': e.get('mesg')}
         else:
@@ -91,6 +93,7 @@ class JsonLib(s_stormtypes.Lib):
          'type': {'type': 'function', '_funcname': '_jsonSave',
                   'args': (
                       {'name': 'item', 'type': 'any', 'desc': 'The item to be serialized as a JSON string.', },
+                      {'name': 'indent', 'type': 'boolean', 'desc': 'Indent serialized data with two spaces.', 'default': False},
                   ),
                   'returns': {'type': 'str', 'desc': 'The JSON serialized object.', }}},
         {'name': 'schema', 'desc': 'Get a JS schema validation object.',
@@ -100,7 +103,7 @@ class JsonLib(s_stormtypes.Lib):
                       {'name': 'use_default', 'type': 'boolean', 'default': True,
                        'desc': 'Whether to insert default schema values into the validated data structure.'},
                   ),
-                  'returns': {'type': 'storm:json:schema',
+                  'returns': {'type': 'json:schema',
                               'desc': 'A validation object that can be used to validate data structures.'}}},
     )
     _storm_lib_path = ('json',)
@@ -112,28 +115,30 @@ class JsonLib(s_stormtypes.Lib):
             'schema': self._jsonSchema,
         }
 
-    async def _jsonSave(self, item):
+    @s_stormtypes.stormfunc(readonly=True)
+    async def _jsonSave(self, item, indent=False):
+        indent = await s_stormtypes.tobool(indent)
+
         try:
             item = await s_stormtypes.toprim(item)
-            return json.dumps(item)
-        except Exception as e:
+        except Exception:
             mesg = f'Argument is not JSON compatible: {item}'
             raise s_exc.MustBeJsonSafe(mesg=mesg)
 
+        return s_json.dumps(item, indent=indent).decode()
+
+    @s_stormtypes.stormfunc(readonly=True)
     async def _jsonLoad(self, text):
         text = await s_stormtypes.tostr(text)
-        try:
-            return json.loads(text, strict=True)
-        except Exception as e:
-            mesg = f'Text is not valid JSON: {text}'
-            raise s_exc.BadJsonText(mesg=mesg)
+        return s_json.loads(text)
 
+    @s_stormtypes.stormfunc(readonly=True)
     async def _jsonSchema(self, schema, use_default=True):
-        schema = await s_stormtypes.toprim(schema)
+        schema = await s_stormtypes.toprim(schema, use_list=True)
         use_default = await s_stormtypes.tobool(use_default)
         # We have to ensure that we have a valid schema for making the object.
         try:
-            await s_coro.spawn((compileJsSchema, (schema,), {'use_default': use_default}))
+            await s_processpool.semafork(compileJsSchema, schema, use_default=use_default)
         except asyncio.CancelledError:  # pragma: no cover
             raise
         except Exception as e:

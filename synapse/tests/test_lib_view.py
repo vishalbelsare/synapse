@@ -1,28 +1,43 @@
 import asyncio
 import collections
+import unittest.mock as mock
 
 import synapse.exc as s_exc
 import synapse.common as s_common
 
+import synapse.lib.coro as s_coro
 import synapse.lib.time as s_time
+import synapse.lib.const as s_const
 
 import synapse.tests.utils as s_t_utils
 from synapse.tests.utils import alist
 
+HOOKPUT = '$lib.queue.gen(hooks).put(($name, $lib.auth.users.get().name, $lib.view.get().iden))'
+HOOKPOP = '''
+    $retn = ()
+    $queue = $lib.queue.gen(hooks)
+    for ($offs, $item) in $queue.gets(wait=(false)) { $retn.append($item) }
+    if $retn { $queue.cull($offs) }
+    return($retn)
+'''
+
 class ViewTest(s_t_utils.SynTest):
 
-    async def test_view_nomerge(self):
+    async def test_view_protected(self):
         async with self.getTestCore() as core:
             view = await core.callStorm('return($lib.view.get().fork().iden)')
             opts = {'view': view}
 
             await core.nodes('[ ou:org=* ]', opts=opts)
-            await core.nodes('$lib.view.get().set(nomerge, $lib.true)', opts=opts)
+            await core.nodes('$lib.view.get().set(protected, $lib.true)', opts=opts)
 
             with self.raises(s_exc.CantMergeView):
                 await core.nodes('$lib.view.get().merge()', opts=opts)
 
-            await core.nodes('$lib.view.get().set(nomerge, $lib.false)', opts=opts)
+            with self.raises(s_exc.CantDelView):
+                await core.nodes('$lib.view.del($lib.view.get().iden)', opts=opts)
+
+            await core.nodes('$lib.view.get().set(protected, $lib.false)', opts=opts)
             await core.nodes('$lib.view.get().merge()', opts=opts)
 
             self.len(1, await core.nodes('ou:org'))
@@ -30,6 +45,50 @@ class ViewTest(s_t_utils.SynTest):
             # mop up some coverage issues
             with self.raises(s_exc.BadOptValu):
                 await core.view.setViewInfo('hehe', 10)
+
+        async with self.getTestCore() as core:
+            # Delete this block when nomerge is removed
+            view = await core.callStorm('return($lib.view.get().fork().iden)')
+            opts = {'view': view}
+
+            # Setting/getting nomerge should be redirected to protected
+            getnomerge = 'return($lib.view.get().get(nomerge))'
+            setnomerge = '$lib.view.get().set(nomerge, $valu)'
+
+            getprotected = 'return($lib.view.get().get(protected))'
+            setprotected = '$lib.view.get().set(protected, $valu)'
+
+            nomerge = await core.callStorm(getnomerge, opts=opts)
+            protected = await core.callStorm(getprotected, opts=opts)
+            self.false(nomerge)
+            self.false(protected)
+
+            opts['vars'] = {'valu': True}
+            await core.callStorm(setnomerge, opts=opts)
+
+            nomerge = await core.callStorm(getnomerge, opts=opts)
+            protected = await core.callStorm(getprotected, opts=opts)
+            self.true(nomerge)
+            self.true(protected)
+
+            opts['vars'] = {'valu': False}
+            await core.callStorm(setprotected, opts=opts)
+
+            nomerge = await core.callStorm(getnomerge, opts=opts)
+            protected = await core.callStorm(getprotected, opts=opts)
+            self.false(nomerge)
+            self.false(protected)
+
+    async def test_view_nomerge_migration(self):
+        async with self.getRegrCore('cortex-defaults-v2') as core:
+            view = core.getView('0df16dd693c74109da0d58ab87ba768a')
+            self.none(view.info.get('nomerge'))
+            self.true(view.info.get('protected'))
+
+            with self.raises(s_exc.CantMergeView):
+                await core.callStorm('return($lib.view.get(0df16dd693c74109da0d58ab87ba768a).merge())')
+            with self.raises(s_exc.CantDelView):
+                await core.callStorm('return($lib.view.del(0df16dd693c74109da0d58ab87ba768a))')
 
     async def test_view_set_parent(self):
 
@@ -45,10 +104,13 @@ class ViewTest(s_t_utils.SynTest):
             layr02 = await core.addLayer()
             vdef02 = {'layers': [layr02['iden']]}
             view02 = core.getView((await core.addView(vdef=vdef02))['iden'])
+            view03 = await core.callStorm('$view=$lib.view.get($view02).fork() return ( $view.iden )',
+                                          opts={'vars': {'view02': view02.iden}})
 
             # test the storm APIs for setting view parent
             opts = {'vars': {'base': view02.iden, 'fork': view00.iden}}
-            await core.stormlist('$lib.view.get($fork).set(parent, $base)', opts=opts)
+            msgs = await core.stormlist('$lib.view.get($fork).set(parent, $base)', opts=opts)
+            self.stormHasNoWarnErr(msgs)
 
             # test that merging selected nodes works correctly
             self.len(0, await view02.nodes('inet:fqdn=vertex.link'))
@@ -61,8 +123,13 @@ class ViewTest(s_t_utils.SynTest):
             self.len(1, await view00.nodes('#bar'))
             self.len(1, await view01.nodes('#bar'))
 
-            # test that the API prevents you from setting view parent that's already set
+            # setting the parent value the the existing value is okay
             opts = {'vars': {'base': view02.iden, 'fork': view00.iden}}
+            msgs = await core.stormlist('$lib.view.get($fork).set(parent, $base)', opts=opts)
+            self.stormHasNoWarnErr(msgs)
+
+            # test that the API prevents you from setting view parent that's already set
+            opts = {'vars': {'base': view03, 'fork': view00.iden}}
             msgs = await core.stormlist('$lib.view.get($fork).set(parent, $base)', opts=opts)
             self.stormIsInErr('You may not set parent on a view which already has one', msgs)
 
@@ -95,8 +162,8 @@ class ViewTest(s_t_utils.SynTest):
             await core.auth.addUser('visi')
             await core.addTagProp('score', ('int', {}), {})
 
-            self.len(1, await alist(core.eval('test:int=8 +#faz')))
-            self.len(2, await alist(core.eval('test:int=9 test:int=10')))
+            self.eq(1, await core.count('test:int=8 +#faz'))
+            self.eq(2, await core.count('test:int=9 test:int=10'))
             self.eq(3, (await core.getFormCounts()).get('test:int'))
 
             # Fork the main view
@@ -139,8 +206,8 @@ class ViewTest(s_t_utils.SynTest):
             # Add a node back
             await self.agenlen(1, view2.eval('[ test:int=12 ]'))
 
-            # Add a bunch of nodes to require chunking of splices when merging
-            for i in range(1000):
+            # Add a bunch of test nodes to the view.
+            for i in range(20):
                 await self.agenlen(1, view2.eval('[test:int=$val]', opts={'vars': {'val': i + 1000}}))
 
             # Add prop that will only exist in the child
@@ -172,17 +239,24 @@ class ViewTest(s_t_utils.SynTest):
             # Forker and forkee have their layer configuration frozen
             tmplayr = await core.addLayer()
             tmpiden = tmplayr['iden']
-            await self.asyncraises(s_exc.ReadOnlyLayer, core.view.addLayer(tmpiden))
-            await self.asyncraises(s_exc.ReadOnlyLayer, view2.addLayer(tmpiden))
-            await self.asyncraises(s_exc.ReadOnlyLayer, core.view.setLayers([tmpiden]))
-            await self.asyncraises(s_exc.ReadOnlyLayer, view2.setLayers([tmpiden]))
+            with self.raises(s_exc.ReadOnlyLayer):
+                await core.view.addLayer(tmpiden)
+
+            with self.raises(s_exc.ReadOnlyLayer):
+                await view2.addLayer(tmpiden)
+
+            with self.raises(s_exc.BadArg):
+                await view2.setLayers([tmpiden])
 
             # You can't merge a non-forked view
-            await self.asyncraises(s_exc.SynErr, view2.core.view.merge())
+            with self.raises(s_exc.SynErr):
+                await view2.core.view.merge()
 
             # You can't merge if the parent's write layer is readonly
             view2.parent.layers[0].readonly = True
-            await self.asyncraises(s_exc.ReadOnlyLayer, view2.merge())
+            with self.raises(s_exc.ReadOnlyLayer):
+                await view2.merge()
+
             view2.parent.layers[0].readonly = False
 
             vdef3 = await view2.fork()
@@ -190,17 +264,25 @@ class ViewTest(s_t_utils.SynTest):
             view3 = core.getView(view3_iden)
 
             # You can't delete a view or merge it if it has children
-            await self.asyncraises(s_exc.SynErr, view2.merge())
-            await self.asyncraises(s_exc.SynErr, view2.core.delView(view2.iden))
-            await self.asyncraises(s_exc.SynErr, view2.core.delView(view2.iden))
+            with self.raises(s_exc.SynErr):
+                await view2.merge()
+
+            with self.raises(s_exc.SynErr):
+                await view2.core.delView(view2.iden)
+
+            with self.raises(s_exc.SynErr):
+                await view2.core.delView(view2.iden)
+
             layr = await core.addLayer()
             layriden = layr['iden']
-            await self.asyncraises(s_exc.SynErr, view2.addLayer(layriden))
+            with self.raises(s_exc.SynErr):
+                await view2.addLayer(layriden)
+
             await view3.core.delView(view3.iden)
 
             async with core.getLocalProxy(user='visi') as prox:
                 with self.raises(s_exc.AuthDeny):
-                    await prox.eval('test:int=12', opts={'view': view2.iden}).list()
+                    await prox.count('test:int=12', opts={'view': view2.iden})
 
             # The parent count is correct
             self.eq(4, (await core.view.getFormCounts()).get('test:int'))
@@ -210,7 +292,7 @@ class ViewTest(s_t_utils.SynTest):
             await view2.wipeLayer()
 
             # The parent counts includes all the nodes that were merged
-            self.eq(1005, (await core.view.getFormCounts()).get('test:int'))
+            self.eq(25, (await core.view.getFormCounts()).get('test:int'))
 
             # A node added to the child is now present in the parent
             nodes = await core.nodes('test:int=12')
@@ -240,19 +322,383 @@ class ViewTest(s_t_utils.SynTest):
             self.len(2, await core.nodes('test:int -(refs)> *'))
 
             # The child count includes all the nodes in the view
-            self.eq(1005, (await view2.getFormCounts()).get('test:int'))
+            self.eq(25, (await view2.getFormCounts()).get('test:int'))
 
             # The child can see nodes that got merged
             nodes = await view2.nodes('test:int=12')
             self.len(1, nodes)
             nodes = await view2.nodes('test:int=1000')
             self.len(1, nodes)
+            nodes = await view2.nodes('test:int=1019')
+            self.len(1, nodes)
 
             await core.delView(view2.iden)
             await core.view.addLayer(layriden)
 
             # But not the same layer twice
-            await self.asyncraises(s_exc.DupIden, core.view.addLayer(layriden))
+            with self.raises(s_exc.DupIden):
+                await core.view.addLayer(layriden)
+
+            # Nodes with a large number of edge edits may be chunked by iterLayerNodeEdits
+            await core.nodes('[ test:str=foo ] for $i in $lib.range(102) {[ test:int=$i ]}')
+
+            vdef2 = await core.view.fork()
+            opts = {'view': vdef2['iden']}
+            await core.nodes('[ test:str=foo +(refs)> { for $i in $lib.range(102) { test:int=$i } } ]', opts=opts)
+
+            strt = core.nexsroot.nexslog.index()
+            await core.nodes('$lib.view.get().merge()', opts=opts)
+
+            self.len(102, await core.nodes('test:str=foo -(refs)> test:int'))
+
+            edits = [edit async for edit in core.nexsroot.nexslog.iter(strt)]
+            self.len(1, edits)
+
+            nodeedit = edits[0][1][2][0]
+
+            # We should have two chunks of edits for the same buid due to the number of edges
+            self.eq(nodeedit[0][0], nodeedit[1][0])
+            self.len(100, nodeedit[0][2])
+            self.len(2, nodeedit[1][2])
+
+            await core.nodes('[ test:str=lowertag +#a.b=2020]')
+
+            vdef2 = await core.view.fork()
+            opts = {'view': vdef2['iden']}
+            await core.nodes('test:str=lowertag [ +#a.b.c ]', opts=opts)
+
+            retn = await core.callStorm('test:str=lowertag return($node.getStorNodes())', opts=opts)
+
+            # Only leaf tag is added in our top layer
+            self.isin('a.b.c', retn[0].get('tags'))
+            self.notin('a.b', retn[0].get('tags'))
+
+            self.isin('a.b', retn[1].get('tags'))
+
+            # view hooks run as root in the view for each lifecycle event
+            hookuser = await core.auth.addUser('hookuser')
+            await hookuser.setAdmin(True)
+
+            async def addhook(name, htype, storm, enabled=True):
+                hdef = {'name': name, 'type': htype, 'storm': storm, 'enabled': enabled, 'creator': hookuser.iden}
+                return (await core.addViewHook(hdef)).get('iden')
+
+            created = await addhook('created', 'created', f'$name=created {HOOKPUT} $lib.view.get().set(desc, hooked)')
+            merging = await addhook('merging', 'merging', f'$name=merging {HOOKPUT}')
+            deleted = await addhook('deleted', 'deleted', f'$name=deleted {HOOKPUT}')
+            await addhook('disabled', 'created', f'$name=disabled {HOOKPUT}', enabled=False)
+
+            self.eq([], await core.callStorm(HOOKPOP))
+
+            # the returned view definition includes changes made by created hooks
+            forkiden, desc = await core.callStorm('$f = $lib.view.get().fork() return(($f.iden, $f.get(desc)))')
+            self.eq('hooked', desc)
+            self.eq([('created', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            await core.nodes('[ test:str=hookmerge ]', opts={'view': forkiden})
+            await core.callStorm('$lib.view.get().merge()', opts={'view': forkiden})
+            self.len(1, await core.nodes('test:str=hookmerge'))
+            self.eq([('merging', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            await core.callStorm('$lib.view.del($iden)', opts={'vars': {'iden': forkiden}})
+            self.none(core.getView(forkiden))
+            self.eq([('deleted', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            vdef = await core.view.fork()
+            self.eq('hooked', vdef.get('desc'))
+            forkiden = vdef.get('iden')
+            self.eq([('created', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            await core.delViewWithLayer(forkiden)
+            self.none(core.getView(forkiden))
+            self.eq([('deleted', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            # merging and deleted hook exceptions abort and leave the view intact
+            await core.modViewHook(merging, {'storm': '$lib.raise(HookFail, nomerge)'})
+            await core.modViewHook(deleted, {'storm': '$lib.raise(HookFail, nodel)'})
+
+            forkiden = (await core.view.fork()).get('iden')
+            forkview = core.getView(forkiden)
+            self.eq([('created', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            await core.nodes('[ test:str=hookfail ]', opts={'view': forkiden})
+            with self.raises(s_exc.StormRaise):
+                await core.callStorm('$lib.view.get().merge()', opts={'view': forkiden})
+
+            self.len(0, await core.nodes('test:str=hookfail'))
+            self.len(1, await core.nodes('test:str=hookfail', opts={'view': forkiden}))
+            self.len(1, await core.nodes('[ test:str=hookfail2 ]', opts={'view': forkiden}))
+
+            with self.raises(s_exc.StormRaise):
+                await core.delView(forkiden)
+
+            self.nn(core.getView(forkiden))
+
+            with self.raises(s_exc.StormRaise):
+                await core.delViewWithLayer(forkiden)
+
+            self.nn(core.getView(forkiden))
+            self.nn(core.getLayer(forkview.layers[0].iden))
+
+            # the main view is rejected before any deleted hooks run
+            with self.raises(s_exc.SynErr) as cm:
+                await core.callStorm('$lib.view.del($lib.view.get().iden)')
+            self.eq('Cannot delete the main view', cm.exception.get('mesg'))
+
+            with self.raises(s_exc.SynErr) as cm:
+                await core.delViewWithLayer(core.view.iden)
+            self.eq('Cannot delete the main view', cm.exception.get('mesg'))
+            self.nn(core.getView(core.view.iden))
+
+            # a view with children is rejected before any deleted hooks run
+            childiden = (await forkview.fork()).get('iden')
+            self.eq([('created', 'root', childiden)], await core.callStorm(HOOKPOP))
+            with self.raises(s_exc.SynErr) as cm:
+                await core.callStorm('$lib.view.del($iden)', opts={'vars': {'iden': forkiden}})
+            self.eq('Cannot delete a view that has children', cm.exception.get('mesg'))
+            self.nn(core.getView(forkiden))
+            await core.delView(childiden, hooks=False)
+
+            # hooks=False skips the raising deleted hook
+            skipiden = (await core.view.fork()).get('iden')
+            self.eq([('created', 'root', skipiden)], await core.callStorm(HOOKPOP))
+            await core.delView(skipiden, hooks=False)
+            self.none(core.getView(skipiden))
+
+            skipiden = (await core.view.fork()).get('iden')
+            skiplayr = core.getView(skipiden).layers[0].iden
+            self.eq([('created', 'root', skipiden)], await core.callStorm(HOOKPOP))
+            await core.delViewWithLayer(skipiden, hooks=False)
+            self.none(core.getView(skipiden))
+            self.none(core.getLayer(skiplayr))
+            self.eq([], await core.callStorm(HOOKPOP))
+
+            # cancelling a merge during a slow merging hook cancels the task running the hooks
+            await core.modViewHook(merging, {'storm': f'$name=merging {HOOKPUT} $lib.time.sleep(30)'})
+
+            task = core.schedCoro(core.callStorm('$lib.view.get().merge()', opts={'view': forkiden}))
+            popq = 'return($lib.queue.gen(hooks).pop(wait=(true)))'
+            self.eq(('merging', 'root', forkiden), (await core.callStorm(popq))[1])
+
+            task.cancel()
+            with self.raises(asyncio.CancelledError):
+                await task
+
+            self.eq([], [t for t in s_coro.bgtasks if t.get_coro().__name__ == '_execViewHooks'])
+            self.len(0, await core.nodes('test:str=hookfail'))
+
+            # killing the task of a slow merging hook aborts the merge
+            async def killhook(storm):
+                synts = [t for t in core.boss.ps() if t.info.get('query') == storm]
+                self.len(1, synts)
+                await synts[0].kill()
+
+            slowmerge = f'$name=merging {HOOKPUT} $lib.time.sleep(30)'
+            task = core.schedCoro(core.callStorm('$lib.view.get().merge()', opts={'view': forkiden}))
+            self.eq(('merging', 'root', forkiden), (await core.callStorm(popq))[1])
+
+            await killhook(slowmerge)
+            with self.raises(s_exc.SynErr) as cm:
+                await task
+            self.eq(f'A merging view hook in view {forkiden} was cancelled.', cm.exception.get('mesg'))
+
+            self.len(0, await core.nodes('test:str=hookfail'))
+            self.len(1, await core.nodes('test:str=hookfail', opts={'view': forkiden}))
+
+            # killing the task of a slow deleted hook aborts the delete
+            slowdel = f'$name=deleted {HOOKPUT} $lib.time.sleep(30)'
+            await core.modViewHook(deleted, {'storm': slowdel})
+
+            task = core.schedCoro(core.delView(forkiden))
+            self.eq(('deleted', 'root', forkiden), (await core.callStorm(popq))[1])
+
+            await killhook(slowdel)
+            with self.raises(s_exc.SynErr) as cm:
+                await task
+            self.eq(f'A deleted view hook in view {forkiden} was cancelled.', cm.exception.get('mesg'))
+            self.nn(core.getView(forkiden))
+
+            # disabled hooks do not run
+            await core.modViewHook(merging, {'enabled': False})
+            await core.modViewHook(deleted, {'enabled': False})
+
+            await core.callStorm('$lib.view.get().merge()', opts={'view': forkiden})
+            self.len(1, await core.nodes('test:str=hookfail'))
+
+            await core.delView(forkiden)
+            self.none(core.getView(forkiden))
+
+            # killing the task of a slow created hook is logged and a streaming caller completes
+            slowcreate = f'$name=created {HOOKPUT} $lib.time.sleep(30)'
+            await core.modViewHook(created, {'storm': slowcreate})
+
+            forkq = '$lib.view.get().fork() $lib.print(after)'
+            with self.getLoggerStream('synapse.cortex') as stream:
+                task = core.schedCoro(core.stormlist(forkq))
+                _, _, forkiden = (await core.callStorm(popq))[1]
+                await killhook(slowcreate)
+                msgs = await task
+
+            self.stormIsInPrint('after', msgs)
+            self.eq('fini', msgs[-1][0])
+            self.nn(core.getView(forkiden))
+            self.isin(f'A created view hook in view {forkiden} was cancelled.', stream.getvalue())
+
+            await core.delView(forkiden)
+
+            # a created hook exception is logged and the view is kept
+            await core.modViewHook(created, {'storm': '$lib.raise(HookFail, nocreate)'})
+            with self.getLoggerStream('synapse.cortex') as stream:
+                forkiden = (await core.view.fork()).get('iden')
+
+            self.nn(core.getView(forkiden))
+            self.isin(f'Error running created view hook {created} in view {forkiden}', stream.getvalue())
+
+            # lifecycle events from hook storm run hooks
+            hookfork = f'$name=created {HOOKPUT} if ($lib.view.get().parent = "{core.view.iden}") {{ $lib.view.get().fork() }}'
+            await core.modViewHook(created, {'storm': hookfork})
+            forkiden = (await core.view.fork()).get('iden')
+            childiden = [v.iden async for v in core.getView(forkiden).children()]
+            self.len(1, childiden)
+            self.eq([], [v async for v in core.getView(childiden[0]).children()])
+            self.eq([('created', 'root', forkiden), ('created', 'root', childiden[0])], await core.callStorm(HOOKPOP))
+
+            # a runaway hook chain stops at the nesting limit without creating the view over it, and
+            # each level runs in a new task so it nests deeper than one python stack allows
+            await core.modViewHook(created, {'storm': f'$name=created {HOOKPUT} $lib.view.get().fork()'})
+            with mock.patch.object(s_const, 'VIEW_HOOK_MAX_DEPTH', 80):
+                with self.getLoggerStream('synapse.cortex') as stream:
+                    forkiden = (await core.view.fork()).get('iden')
+
+            self.isin('View hooks exceeded the maximum nesting depth of 80.', stream.getvalue())
+            self.len(80, await core.callStorm(HOOKPOP))
+
+            chain = [core.getView(forkiden)]
+            while (kids := [v async for v in chain[-1].children()]):
+                chain.extend(kids)
+
+            self.len(80, chain)
+            for view in reversed(chain):
+                await core.delView(view.iden)
+
+            # a view deleted by a created hook returns its original view definition
+            hookdel = '$lib.view.get().set(desc, hooked) $lib.view.del($lib.view.get().iden)'
+            await core.modViewHook(created, {'storm': hookdel})
+            vdef = await core.view.fork()
+            self.none(vdef.get('desc'))
+            self.none(core.getView(vdef.get('iden')))
+
+            # hooks populate $auto
+            autoput = '$lib.queue.gen(autos).put(($auto.iden, $auto.type, $auto.opts.type))'
+            await core.modViewHook(created, {'storm': autoput})
+            await core.modViewHook(merging, {'storm': autoput, 'enabled': True})
+            await core.modViewHook(deleted, {'storm': autoput, 'enabled': True})
+
+            autopop = 'return($lib.queue.gen(autos).pop(wait=(true)).1)'
+
+            forkiden = (await core.view.fork()).get('iden')
+            self.eq((created, 'view:hook', 'created'), await core.callStorm(autopop))
+
+            await core.callStorm('$lib.view.get().merge()', opts={'view': forkiden})
+            self.eq((merging, 'view:hook', 'merging'), await core.callStorm(autopop))
+
+            await core.delView(forkiden)
+            self.eq((deleted, 'view:hook', 'deleted'), await core.callStorm(autopop))
+            self.eq(0, await core.callStorm('return($lib.queue.gen(autos).size())'))
+
+            await core.modViewHook(merging, {'enabled': False})
+
+            # triggers run by hook storm run view hooks
+            await core.modViewHook(created, {'storm': f'$name=created {HOOKPUT}'})
+
+            trigview = (await core.view.fork()).get('iden')
+            self.eq([('created', 'root', trigview)], await core.callStorm(HOOKPOP))
+
+            trigq = f'''
+                $view = $lib.view.get({core.view.iden}).fork()
+                $lib.queue.gen(trigviews).put($view.iden)
+                $lib.view.del($view.iden)
+            '''
+            tdef = {'cond': 'node:add', 'form': 'test:str', 'storm': trigq}
+            await core.callStorm('$lib.trigger.add($tdef)', opts={'view': trigview, 'vars': {'tdef': tdef}})
+
+            await core.modViewHook(deleted, {'storm': f'''
+                $name=deleted {HOOKPUT}
+                if ($lib.view.get().iden = "{trigview}") {{
+                    [ test:str=hooktrig ]
+                    $lib.queue.gen(hookviews).put($lib.view.get({core.view.iden}).fork().iden)
+                }}
+            '''})
+
+            await core.delView(trigview)
+            self.none(core.getView(trigview))
+
+            trigfork = await core.callStorm('return($lib.queue.gen(trigviews).pop().1)')
+            hookfork = await core.callStorm('return($lib.queue.gen(hookviews).pop().1)')
+            self.none(core.getView(trigfork))
+            self.nn(core.getView(hookfork))
+
+            self.eq([
+                ('deleted', 'root', trigview),
+                ('created', 'root', trigfork),
+                ('deleted', 'root', trigfork),
+                ('created', 'root', hookfork),
+            ], await core.callStorm(HOOKPOP))
+
+            # dmons added by hook storm run view hooks
+            await core.modViewHook(deleted, {'enabled': False})
+            await core.modViewHook(created, {'storm': f'''
+                $name=created {HOOKPUT}
+                $text = $lib.globals.get(hookdmon)
+                if $text {{
+                    $lib.globals.pop(hookdmon)
+                    $lib.dmon.add($text, name=hookdmon)
+                }}
+            '''})
+
+            dmonq = f'''
+                $lib.queue.gen(dmonviews).put($lib.view.get({core.view.iden}).fork().iden)
+                $lib.time.sleep(3600)
+            '''
+            await core.callStorm('$lib.globals.set(hookdmon, $text)', opts={'vars': {'text': dmonq}})
+
+            dmonview = (await core.view.fork()).get('iden')
+            dmonfork = await core.callStorm('return($lib.queue.gen(dmonviews).pop(wait=(true)).1)')
+            self.nn(core.getView(dmonfork))
+
+            self.eq([
+                ('created', 'root', dmonview),
+                ('created', 'root', dmonfork),
+            ], await core.callStorm(HOOKPOP))
+
+            for dmon in await core.getStormDmons():
+                await core.delStormDmon(dmon.get('iden'))
+
+            # package onloads started by hook storm run view hooks
+            await core.modViewHook(created, {'storm': f'''
+                $name=created {HOOKPUT}
+                $pkgdef = $lib.globals.get(hookpkg)
+                if $pkgdef {{
+                    $lib.globals.pop(hookpkg)
+                    $lib.pkg.add($pkgdef)
+                }}
+            '''})
+
+            pkgdef = {
+                'name': 'hookpkg',
+                'version': '0.0.1',
+                'onload': f'$lib.queue.gen(pkgviews).put($lib.view.get({core.view.iden}).fork().iden)',
+            }
+            await core.callStorm('$lib.globals.set(hookpkg, $pkgdef)', opts={'vars': {'pkgdef': pkgdef}})
+
+            pkgview = (await core.view.fork()).get('iden')
+            pkgfork = await core.callStorm('return($lib.queue.gen(pkgviews).pop(wait=(true)).1)')
+            self.nn(core.getView(pkgfork))
+
+            self.eq([
+                ('created', 'root', pkgview),
+                ('created', 'root', pkgfork),
+            ], await core.callStorm(HOOKPOP))
 
     async def test_view_merge_ival(self):
 
@@ -310,7 +756,9 @@ class ViewTest(s_t_utils.SynTest):
 
             # bad type
 
-            await self.asyncraises(s_exc.BadTypeValu, core.nodes('test:str=maxval [ .seen=newp ]', opts=forkopts))
+            with self.raises(s_exc.BadTypeValu):
+                await core.nodes('test:str=maxval [ .seen=newp ]', opts=forkopts)
+
             await core.nodes('test:str=maxval [ .seen?=newp +#foo ]', opts=forkopts)
             self.len(1, await core.nodes('test:str#foo', opts=forkopts))
 
@@ -328,7 +776,7 @@ class ViewTest(s_t_utils.SynTest):
                 'storm': '[ test:str=mainhit ]'
             })
 
-            nodes = await alist(core.eval('[ test:int=11 ]', opts={'view': view2.iden}))
+            nodes = await core.nodes('[ test:int=11 ]', opts={'view': view2.iden})
             self.len(1, nodes)
 
             self.len(0, await core.view.nodes('test:str=mainhit'))
@@ -403,15 +851,6 @@ class ViewTest(s_t_utils.SynTest):
             self.eq(1, count['node'])
             self.eq(2, count['node:edits'])
             self.eq(0, count['node:add'])
-
-            mesgs = await core.stormlist('[test:str=foo2 :hehe=bar]', opts={'editformat': 'splices'})
-            count = collections.Counter(m[0] for m in mesgs)
-            self.eq(1, count['init'])
-            self.eq(1, count['node:add'])
-            self.eq(2, count['prop:set'])  # .created and .hehe
-            self.eq(0, count['node:edits'])
-            self.eq(1, count['node'])
-            self.eq(1, count['fini'])
 
             mesgs = await core.stormlist('[test:str=foo3 :hehe=bar]', opts={'editformat': 'count'})
             count = collections.Counter(m[0] for m in mesgs)
@@ -500,7 +939,7 @@ class ViewTest(s_t_utils.SynTest):
             await core.nodes('inet:ipv4=0 | delnode')
 
             edits = await core.callStorm('''
-                $nodeedits = $lib.list()
+                $nodeedits = ()
                 for ($offs, $edits) in $lib.layer.get().edits(wait=$lib.false) {
                     $nodeedits.extend($edits)
                 }
@@ -512,7 +951,8 @@ class ViewTest(s_t_utils.SynTest):
 
             async with core.getLocalProxy(share=f'*/view/{view}', user='user') as prox:
                 self.eq(0, await prox.getEditSize())
-                await self.asyncraises(s_exc.AuthDeny, prox.storNodeEdits(edits, None))
+                with self.raises(s_exc.AuthDeny):
+                    await prox.storNodeEdits(edits, None)
 
             await user.addRule((True, ('node',)))
 
@@ -520,6 +960,57 @@ class ViewTest(s_t_utils.SynTest):
                 self.none(await prox.storNodeEdits(edits, None))
 
             self.len(1, await core.nodes('ou:org#foo', opts={'view': view}))
+            self.len(1, await core.nodes('test:str=foo', opts={'view': view}))
+
+    async def test_lib_view_savenodeedits_telepath(self):
+
+        async with self.getTestCore() as core:
+
+            unfo = await core.getUserDefByName('root')
+            root = unfo.get('iden')
+
+            view = await core.callStorm('''
+                            $layr = $lib.layer.add().iden
+                            $view = $lib.view.add(($layr,))
+                            return($view.iden)
+                        ''')
+
+            await core.nodes('trigger.add node:add --form test:guid --query {$lib.log.info(`u={$auto.opts.user}`) [+#foo]}', opts={'view': view})
+            await core.nodes('trigger.add node:del --form test:int --query {$lib.log.info(`u={$auto.opts.user}`) [test:str=foo]}', opts={'view': view})
+
+            await core.nodes('[ test:guid=* ]')
+            self.len(0, await core.nodes('test:guid', opts={'view': view}))
+
+            await core.nodes('[ test:int=0 ]')
+            self.len(0, await core.nodes('test:int', opts={'view': view}))
+
+            await core.nodes('test:int | delnode')
+
+            edits = await core.callStorm('''$nodeedits = ()
+                for ($offs, $edits) in $lib.layer.get().edits(wait=$lib.false) {
+                    $nodeedits.extend($edits)
+                }
+                return($nodeedits)''')
+
+            user = await core.auth.addUser('user')
+            await user.addRule((True, ('view', 'read')))
+            guid = s_common.guid()
+
+            async with core.getLocalProxy(share=f'*/view/{view}', user='user') as prox:
+                with self.raises(s_exc.AuthDeny):
+                    await prox.saveNodeEdits(edits, {})
+
+                await core.setUserAdmin(user.iden, True)
+
+                with self.raises(s_exc.BadArg) as cm:
+                    await prox.saveNodeEdits(edits, {})
+                self.eq(cm.exception.get('mesg'), "Meta argument requires user key to be a guid, got user=''")
+
+                with self.getLoggerStream('synapse.storm.log') as stream:
+                    await prox.saveNodeEdits(edits, {'time': s_common.now(), 'user': guid})
+                    await stream.expect(f'u={guid}', timeout=6)
+
+            self.len(1, await core.nodes('test:guid#foo', opts={'view': view}))
             self.len(1, await core.nodes('test:str=foo', opts={'view': view}))
 
     async def test_lib_view_wipeLayer(self):
@@ -565,7 +1056,8 @@ class ViewTest(s_t_utils.SynTest):
             useriden = user['iden']
             opts = {'user': useriden}
 
-            await self.asyncraises(s_exc.AuthDeny, core.nodes('$lib.view.get().wipeLayer()', opts=opts))
+            with self.raises(s_exc.AuthDeny):
+                await core.nodes('$lib.view.get().wipeLayer()', opts=opts)
 
             await core.addUserRule(useriden, (True, ('node', 'del')), gateiden=layr.iden)
             await core.addUserRule(useriden, (True, ('node', 'prop', 'del')), gateiden=layr.iden)
@@ -642,7 +1134,7 @@ class ViewTest(s_t_utils.SynTest):
                 puller_iden, puller_view, puller_layr = await core2.callStorm('''
                     $lyr = $lib.layer.add()
                     $view = $lib.view.add(($lyr.iden,))
-                    $pdef = $lyr.addPull($lib.str.concat($baseurl, "/", $baseiden))
+                    $pdef = $lyr.addPull(`{$baseurl}/{$baseiden}`)
                     return(($pdef.iden, $view.iden, $lyr.iden))
                 ''', opts=opts)
 
@@ -660,7 +1152,7 @@ class ViewTest(s_t_utils.SynTest):
                 opts['vars']['pushiden'] = pushee_layr
                 pushee_iden = await core.callStorm('''
                     $lyr = $lib.layer.get()
-                    $pdef = $lyr.addPush($lib.str.concat($syncurl, "/", $pushiden))
+                    $pdef = $lyr.addPush(`{$syncurl}/{$pushiden}`)
                     return($pdef.iden)
                 ''', opts=opts)
 
@@ -670,7 +1162,7 @@ class ViewTest(s_t_utils.SynTest):
 
                 mirror_catchup = await core2.getNexsIndx() - 1 + 2 + layr.nodeeditlog.size
                 mirror_view, mirror_layr = await core2.callStorm('''
-                    $ldef = $lib.dict(mirror=$lib.str.concat($baseurl, "/", $baseiden))
+                    $ldef = ({'mirror': `{$baseurl}/{$baseiden}`})
                     $lyr = $lib.layer.add(ldef=$ldef)
                     $view = $lib.view.add(($lyr.iden,))
                     return(($view.iden, $lyr.iden))
@@ -692,3 +1184,487 @@ class ViewTest(s_t_utils.SynTest):
 
                 self.true(await core2.getLayer(iden=pushee_layr).waitEditOffs(pushee_offs + 1, timeout=2))
                 self.len(0, await core2.nodes('test:str=chicken', opts={'view': pushee_view}))
+
+    async def test_lib_view_merge_perms(self):
+
+        async with self.getTestCore() as core:
+
+            await core.addTagProp('score', ('int', {}), {})
+
+            baselayr = core.getLayer().iden
+
+            user = await core.addUser('redox')
+            useriden = user['iden']
+            useropts = {'user': useriden}
+
+            await core.addUserRule(useriden, (True, ('view', 'add')))
+
+            forkview = await core.callStorm('return($lib.view.get().fork().iden)', opts=useropts)
+            viewopts = {**useropts, 'view': forkview}
+
+            q = '''
+            [ test:str=foo
+                .seen = now
+                +#seen:score = 5
+                <(refs)+ { [ test:str=bar ] }
+            ]
+            $node.data.set(foo, bar)
+            '''
+            await core.nodes(q, opts=viewopts)
+
+            with self.raises(s_exc.AuthDeny) as cm:
+                await core.nodes('$lib.view.get().merge()', opts=viewopts)
+            self.eq('node.prop.set.syn:tag.base', cm.exception.errinfo['perm'])
+
+            await core.addUserRule(useriden, (True, ('node', 'prop', 'set')), gateiden=baselayr)
+
+            with self.raises(s_exc.AuthDeny) as cm:
+                await core.nodes('$lib.view.get().merge()', opts=viewopts)
+            self.eq('node.add.syn:tag', cm.exception.errinfo['perm'])
+
+            await core.addUserRule(useriden, (True, ('node', 'add')), gateiden=baselayr)
+
+            with self.raises(s_exc.AuthDeny) as cm:
+                await core.nodes('$lib.view.get().merge()', opts=viewopts)
+            self.eq('node.tag.add.seen', cm.exception.errinfo['perm'])
+
+            await core.addUserRule(useriden, (True, ('node', 'tag', 'add')), gateiden=baselayr)
+
+            with self.raises(s_exc.AuthDeny) as cm:
+                await core.nodes('$lib.view.get().merge()', opts=viewopts)
+            self.eq('node.data.set.foo', cm.exception.errinfo['perm'])
+
+            await core.addUserRule(useriden, (True, ('node', 'data', 'set')), gateiden=baselayr)
+
+            with self.raises(s_exc.AuthDeny) as cm:
+                await core.nodes('$lib.view.get().merge()', opts=viewopts)
+            self.eq('node.edge.add.refs', cm.exception.errinfo['perm'])
+
+            await core.addUserRule(useriden, (True, ('node', 'edge', 'add')), gateiden=baselayr)
+
+            await core.nodes('$lib.view.get().merge()', opts=viewopts)
+
+            nodes = await core.nodes('test:str=foo $node.data.load(foo)')
+            self.len(1, nodes)
+            self.nn(nodes[0].props.get('.seen'))
+            self.nn(nodes[0].tags.get('seen'))
+            self.nn(nodes[0].tagprops.get('seen'))
+            self.nn(nodes[0].tagprops['seen'].get('score'))
+            self.nn(nodes[0].nodedata.get('foo'))
+
+            await core.delUserRule(useriden, (True, ('node', 'tag', 'add')), gateiden=baselayr)
+
+            await core.addUserRule(useriden, (True, ('node', 'tag', 'add', 'rep', 'foo')), gateiden=baselayr)
+
+            await core.nodes('test:str=foo [ -#seen +#rep.foo ]', opts=viewopts)
+
+            await core.nodes('$lib.view.get().merge()', opts=viewopts)
+            nodes = await core.nodes('test:str=foo')
+            self.nn(nodes[0].get('#rep.foo'))
+
+            await core.nodes('test:str=foo [ -#rep ]')
+
+            await core.nodes('test:str=foo | merge --apply', opts=viewopts)
+            nodes = await core.nodes('test:str=foo')
+            self.nn(nodes[0].get('#rep.foo'))
+
+            await core.nodes('test:str=foo [ -#rep ]')
+            await core.nodes('test:str=foo [ +#rep=now ]', opts=viewopts)
+
+            with self.raises(s_exc.AuthDeny) as cm:
+                await core.nodes('$lib.view.get().merge()', opts=viewopts)
+
+    async def test_view_insert_parent_fork(self):
+
+        async with self.getTestCore() as core:
+
+            role = await core.auth.addRole('ninjas')
+            visi = await core.auth.addUser('visi')
+            asvisi = {'user': visi.iden}
+
+            view00 = core.getView()
+            view02 = core.getView((await view00.fork())['iden'])
+            view03 = core.getView((await view02.fork())['iden'])
+
+            self.eq(view02.parent, view00)
+
+            self.len(2, view02.layers)
+            self.len(3, view03.layers)
+
+            await view00.nodes('[ inet:fqdn=vertex.link ]')
+            await view02.nodes('inet:fqdn=vertex.link [ +#foo ]')
+
+            await view02.nodes('auth.user.addrule visi node --gate $lib.view.get().iden')
+            await view02.nodes('auth.user.mod visi --admin $lib.true --gate $lib.view.get().iden')
+            userrules = visi.getRules(gateiden=view02.iden)
+
+            await view02.nodes('auth.role.addrule ninjas node.add --gate $lib.view.get().iden')
+            rolerules = role.getRules(gateiden=view02.iden)
+
+            msgs = await core.stormlist('auth.user.addrule visi node --gate $lib.view.get().layers.0.iden')
+            self.stormHasNoWarnErr(msgs)
+
+            opts = {'vars': {'role': role.iden}}
+            quorum = await core.callStorm('return($lib.view.get().set(quorum, ({"count": 1, "roles": [$role]})))', opts=opts)
+
+            forkopts = {'view': view02.iden}
+            await core.callStorm('return($lib.view.get().setMergeRequest(comment=woot))', opts=forkopts)
+
+            merging = 'return($lib.view.get().getMergingViews()) '
+            self.eq([view02.iden], await core.callStorm(merging))
+
+            q = 'return($lib.view.get().insertParentFork(name=staging).iden)'
+            newiden = await core.callStorm(q, opts=forkopts)
+
+            self.eq([], await core.callStorm(merging))
+
+            view01 = core.getView(newiden)
+
+            self.ne(view02.parent, view00)
+            self.eq(view03.parent, view02)
+            self.eq(view02.parent, view01)
+            self.eq(view01.parent, view00)
+
+            self.len(2, view01.layers)
+            self.len(3, view02.layers)
+            self.len(4, view03.layers)
+            self.isin(view01.layers[0], view02.layers)
+            self.isin(view01.layers[0], view03.layers)
+
+            self.eq(userrules, visi.getRules(gateiden=view01.iden))
+            self.eq(rolerules, role.getRules(gateiden=view01.iden))
+
+            nodes = await view01.nodes('inet:fqdn=vertex.link')
+            self.none(nodes[0].getTag('foo'))
+
+            await core.nodes('merge --diff --apply', opts=forkopts)
+
+            nodes = await core.nodes('inet:fqdn=vertex.link')
+            self.none(nodes[0].getTag('foo'))
+
+            nodes = await view01.nodes('inet:fqdn=vertex.link')
+            self.nn(nodes[0].getTag('foo'))
+
+            with self.raises(s_exc.BadState):
+                await view00.insertParentFork(visi.iden)
+
+            with self.raises(s_exc.BadState):
+                await core.callStorm('return($lib.view.get().insertParentFork().iden)')
+
+            pname = view01.parent.info.get('name')
+            vdef = await view01.insertParentFork(visi.iden)
+            self.eq(vdef.get('name'), f'inserted fork of {pname}')
+
+            piden = view03.parent.iden
+            vdef = await view03.insertParentFork(visi.iden)
+            self.eq(vdef.get('name'), f'inserted fork of {piden}')
+
+            # a view which is merging may not be re-parented
+            view03.merging = True
+            with self.raises(s_exc.BadState):
+                await view03.insertParentFork(visi.iden)
+
+            view03.merging = False
+
+            # nor may one whose merge started after the request was validated
+            push = view03._push
+
+            async def mergingpush(*args):
+                view03.merging = True
+                return await push(*args)
+
+            with mock.patch.object(view03, '_push', mergingpush):
+                with self.raises(s_exc.BadState):
+                    await view03.insertParentFork(visi.iden)
+
+            view03.merging = False
+            self.eq(piden, view03.parent.parent.iden)
+
+            # created hooks run in an inserted parent fork
+            root = core.auth.rootuser.iden
+            await core.addViewHook({'name': 'created', 'type': 'created', 'creator': root,
+                                    'storm': f'$name=created {HOOKPUT} $lib.view.get().set(desc, hooked)'})
+
+            vdef = await view03.insertParentFork(visi.iden)
+            self.eq(vdef.get('iden'), view03.parent.iden)
+            self.eq('hooked', vdef.get('desc'))
+            self.eq([('created', 'root', vdef.get('iden'))], await core.callStorm(HOOKPOP))
+
+            # a merging hook exception rejects a quorum merge request
+            hdef = await core.addViewHook({'name': 'merging', 'type': 'merging',
+                                           'storm': '$lib.raise(HookFail, nomerge)', 'creator': root})
+
+            forkiden = (await view00.fork()).get('iden')
+            forkview = core.getView(forkiden)
+            self.eq([('created', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            setmerge = 'return($lib.view.get().setMergeRequest(comment=woot))'
+            with self.raises(s_exc.StormRaise):
+                await core.callStorm(setmerge, opts={'view': forkiden})
+
+            self.none(forkview.getMergeRequest())
+
+            await core.modViewHook(hdef.get('iden'), {'storm': f'$name=merging {HOOKPUT}'})
+            await core.callStorm(setmerge, opts={'view': forkiden})
+            self.nn(forkview.getMergeRequest())
+            self.eq([('merging', 'root', forkiden)], await core.callStorm(HOOKPOP))
+
+            # the delete which completes a quorum merge does not run deleted hooks
+            await core.addViewHook({'name': 'deleted', 'type': 'deleted', 'storm': f'$name=deleted {HOOKPUT}',
+                                    'creator': root})
+
+            ninja = await core.auth.addUser('ninja')
+            await ninja.grant(role.iden)
+            await ninja.allow(('view', 'read'))
+
+            await core.nodes('[ test:str=quorumhook ]', opts={'view': forkiden})
+            vote = 'return($lib.view.get().setMergeVote())'
+            await core.callStorm(vote, opts={'view': forkiden, 'user': ninja.iden})
+
+            self.true(await forkview.waitfini(timeout=5))
+            self.none(core.getView(forkiden))
+            self.len(1, await core.nodes('test:str=quorumhook'))
+            self.eq([], await core.callStorm(HOOKPOP))
+
+    async def test_view_insert_child_fork(self):
+
+        with self.getTestDir() as dirn:
+
+            async with self.getTestCore(dirn=dirn) as core:
+
+                role = await core.auth.addRole('ninjas')
+                visi = await core.auth.addUser('visi')
+                asvisi = {'user': visi.iden}
+
+                view00 = core.getView()
+                viewa = core.getView((await view00.fork())['iden'])
+                viewb = core.getView((await view00.fork())['iden'])
+                viewa2 = core.getView((await viewa.fork())['iden'])
+
+                await view00.nodes('[ inet:fqdn=vertex.link ]')
+                await viewa.nodes('inet:fqdn=vertex.link [ +#foo ]')
+
+                opts = {'vars': {'role': role.iden}}
+                await core.callStorm('return($lib.view.get().set(quorum, ({"count": 1, "roles": [$role]})))', opts=opts)
+
+                aopts = {'view': viewa.iden}
+                await core.callStorm('return($lib.view.get().setMergeRequest(comment=woot))', opts=aopts)
+
+                merging = 'return($lib.view.get().getMergingViews()) '
+                self.eq([viewa.iden], await core.callStorm(merging))
+
+                ninja = await core.auth.addUser('ninja')
+                await ninja.grant(role.iden)
+                await ninja.allow(('view', 'read'))
+
+                veto = 'return($lib.view.get().setMergeVote(approved=(false)))'
+                await core.callStorm(veto, opts=aopts | {'user': ninja.iden})
+
+                await core.nodes('auth.role.addrule ninjas node.add --gate $lib.view.get().iden')
+                rolerules = role.getRules(gateiden=view00.iden)
+
+                await core.nodes('auth.role.addrule ninjas node --gate $lib.view.get().layers.0.iden')
+                await core.nodes('auth.user.addrule visi node.tag --gate $lib.view.get().layers.0.iden')
+                layrroleiden = view00.layers[0].iden
+                layrrolerules = role.getRules(gateiden=layrroleiden)
+                layruserrules = visi.getRules(gateiden=layrroleiden)
+
+                q = 'return($lib.view.get().insertChildFork(name=staging).iden)'
+
+                # admin on the view is required, but not on its children
+                with self.raises(s_exc.AuthDeny) as cm:
+                    await core.callStorm(q, opts=asvisi)
+
+                self.none(cm.exception.get('perm'))
+                self.isin('admin', cm.exception.get('mesg'))
+
+                await core.nodes('auth.user.mod visi --admin $lib.true --gate $lib.view.get().iden')
+                userrules = visi.getRules(gateiden=view00.iden)
+
+                with self.raises(s_exc.AuthDeny) as cm:
+                    await core.callStorm(q, opts=asvisi)
+
+                self.eq('view.add', cm.exception.get('perm'))
+
+                await core.nodes('auth.user.addrule visi view.add')
+
+                # a read-only write layer on the view holds its forks' merge requests
+                await core.callStorm('$lib.layer.get().set(readonly, (true))')
+                with self.raises(s_exc.BadState):
+                    await viewa.isMergeReady()
+
+                newiden = await core.callStorm(q, opts=asvisi)
+                viewd = core.getView(newiden)
+
+                self.eq('staging', viewd.info.get('name'))
+                self.eq(visi.iden, viewd.info.get('creator'))
+
+                self.eq(view00, viewd.parent)
+                self.eq(viewd, viewa.parent)
+                self.eq(viewd, viewb.parent)
+                self.eq(viewa, viewa2.parent)
+
+                self.eq([viewd.iden], [v.iden async for v in view00.children()])
+                self.sorteq([viewa.iden, viewb.iden], [v.iden async for v in viewd.children()])
+
+                self.len(2, viewd.layers)
+                self.len(3, viewa.layers)
+                self.len(3, viewb.layers)
+                self.len(4, viewa2.layers)
+                self.eq(viewd.layers[0], viewa.layers[1])
+                self.eq(viewd.layers[0], viewb.layers[1])
+                self.eq(viewd.layers[0], viewa2.layers[2])
+                self.eq([lyr.iden for lyr in viewa2.layers], viewa2.info.get('layers'))
+                self.sorteq([viewd.iden, viewa.iden, viewb.iden, viewa2.iden],
+                            [v.iden for v in core.viewsbylayer[viewd.layers[0].iden]])
+
+                # the pending merge request and its votes now target the new view,
+                # which carries the quorum of the view it was inserted below
+                self.eq(view00.info.get('quorum'), viewd.info.get('quorum'))
+                self.eq([], await core.callStorm(merging))
+                self.eq([viewa.iden], await core.callStorm(merging, opts={'view': newiden}))
+                self.nn(viewa.getMergeRequest())
+                self.eq([ninja.iden], [vote['user'] async for vote in viewa.getMergeVotes()])
+
+                # the request now answers to the new view, whose write layer is not read-only
+                self.true(view00.layers[0].readonly)
+                self.false(viewd.layers[0].readonly)
+                self.false(await viewa.isMergeReady())
+
+                await core.callStorm('$lib.layer.get().set(readonly, (false))')
+
+                self.eq(userrules, visi.getRules(gateiden=viewd.iden))
+                self.eq(rolerules, role.getRules(gateiden=viewd.iden))
+                self.true(visi.isAdmin(gateiden=viewd.iden))
+                self.false(visi.isAdmin(gateiden=viewa.iden))
+
+                # the write layer gate is copied too, and the creator stays admin on it
+                self.eq(layrrolerules, role.getRules(gateiden=viewd.layers[0].iden))
+                self.eq(layruserrules, visi.getRules(gateiden=viewd.layers[0].iden))
+                self.true(visi.isAdmin(gateiden=viewd.layers[0].iden))
+                self.false(visi.isAdmin(gateiden=layrroleiden))
+
+                nodes = await viewa2.nodes('inet:fqdn=vertex.link')
+                self.nn(nodes[0].getTag('foo'))
+
+                await core.nodes('merge --diff --apply', opts=aopts)
+
+                nodes = await viewd.nodes('inet:fqdn=vertex.link')
+                self.nn(nodes[0].getTag('foo'))
+
+                nodes = await core.nodes('inet:fqdn=vertex.link')
+                self.none(nodes[0].getTag('foo'))
+
+                # a child which is merging stays put, so its merge completes into its parent
+                viewa.merging = True
+                vdef = await viewd.insertChildFork(visi.iden)
+                viewa.merging = False
+
+                viewe = core.getView(vdef.get('iden'))
+                self.eq(viewd, viewe.parent)
+                self.eq(viewd, viewa.parent)
+                self.eq(viewe, viewb.parent)
+                self.len(4, viewb.layers)
+                self.len(3, viewa.layers)
+                self.len(4, viewa2.layers)
+
+                # a view which is merging may not gain a child
+                viewd.merging = True
+                with self.raises(s_exc.BadState):
+                    await viewd.insertChildFork(visi.iden)
+
+                viewd.merging = False
+
+                # nor may one whose merge started after the request was validated
+                push = viewd._push
+
+                async def mergingpush(*args):
+                    viewd.merging = True
+                    return await push(*args)
+
+                with mock.patch.object(viewd, '_push', mergingpush):
+                    with self.raises(s_exc.BadState):
+                        await viewd.insertChildFork(visi.iden)
+
+                viewd.merging = False
+
+                # the failed request left the tree untouched
+                self.sorteq([viewe.iden, viewa.iden], [v.iden async for v in viewd.children()])
+
+                # a view with no children gets a plain fork
+                vdef = await viewa2.insertChildFork(visi.iden)
+                self.eq(vdef.get('name'), f'inserted fork of {viewa2.iden}')
+                self.eq(viewa2.iden, vdef.get('parent'))
+                self.eq([vdef.get('iden')], [v.iden async for v in viewa2.children()])
+
+                await viewb.setViewInfo('name', 'bview')
+                vdef = await viewb.insertChildFork(visi.iden)
+                self.eq(vdef.get('name'), 'inserted fork of bview')
+
+                # a fork owner whose node rules are scoped to the parent's write layer can
+                # still merge once a view is inserted, since the new layer gets those rules
+                raz = await core.auth.addUser('raz')
+                razopts = {'user': raz.iden, 'view': viewa2.iden}
+                await core.nodes('''
+                    auth.user.addrule raz view.add |
+                    auth.user.addrule raz view.read --gate $lib.view.get().iden |
+                    auth.user.addrule raz view.fork --gate $lib.view.get().iden |
+                    auth.user.addrule raz node --gate $lib.view.get().layers.0.iden
+                ''', opts={'view': viewa2.iden})
+
+                raziden = await core.callStorm('return($lib.view.get().fork().iden)', opts=razopts)
+                razview = core.getView(raziden)
+                await core.nodes('[ test:str=raz ]', opts={'user': raz.iden, 'view': raziden})
+
+                vdef = await viewa2.insertChildFork(visi.iden)
+                self.eq(vdef.get('iden'), razview.parent.iden)
+                self.false(raz.isAdmin(gateiden=vdef['layers'][0]['iden']))
+
+                await core.callStorm('$lib.view.get().merge()', opts={'user': raz.iden, 'view': raziden})
+
+                self.len(1, await core.nodes('test:str=raz', opts={'view': vdef.get('iden')}))
+                self.len(0, await core.nodes('test:str=raz', opts={'view': viewa2.iden}))
+
+                # created hooks run in an inserted child fork
+                await core.addViewHook({'name': 'created', 'type': 'created', 'creator': core.auth.rootuser.iden,
+                                        'storm': f'$name=created {HOOKPUT} $lib.view.get().set(desc, hooked)'})
+
+                vdef = await viewb.insertChildFork(visi.iden)
+                self.eq('hooked', vdef.get('desc'))
+                self.eq([('created', 'root', vdef.get('iden'))], await core.callStorm(HOOKPOP))
+
+                layridens = [lyr.iden for lyr in viewa2.layers]
+
+            async with self.getTestCore(dirn=dirn) as core:
+
+                viewa2 = core.getView(viewa2.iden)
+                self.eq(newiden, viewa2.parent.parent.iden)
+                self.eq(view00.iden, viewa2.parent.parent.parent.iden)
+                self.eq(layridens, [lyr.iden for lyr in viewa2.layers])
+
+                nodes = await viewa2.nodes('inet:fqdn=vertex.link')
+                self.nn(nodes[0].getTag('foo'))
+
+    async def test_view_children(self):
+
+        async with self.getTestCore() as core:
+
+            view00 = core.getView()
+            view01 = core.getView((await view00.fork())['iden'])
+            view02 = core.getView((await view01.fork())['iden'])
+            view03 = core.getView((await view01.fork())['iden'])
+
+            q = '''
+            $kids = ([])
+            for $child in $lib.view.get($iden).children() { $kids.append($child.iden) }
+            return($kids)
+            '''
+
+            opts = {'vars': {'iden': view00.iden}}
+            self.eq([view01.iden], await core.callStorm(q, opts=opts))
+
+            opts['vars']['iden'] = view01.iden
+            self.eq([view02.iden, view03.iden], await core.callStorm(q, opts=opts))
+
+            opts['vars']['iden'] = view02.iden
+            self.eq([], await core.callStorm(q, opts=opts))
